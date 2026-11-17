@@ -1,7 +1,7 @@
 # rpi-streamer
 
 Purpose-built Raspberry Pi appliance image: a music streamer (cliamp +
-HiFiBerry DAC2 Pro) that boots from a cold power cut to audible music in
+Raspberry Pi DAC+ HAT) that boots from a cold power cut to audible music in
 under 10 seconds and survives hard power-cuts indefinitely.
 
 - Product requirements: [docs/PRD.md](docs/PRD.md)
