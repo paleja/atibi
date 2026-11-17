@@ -554,8 +554,14 @@ $(cat "$STAGE/fat.log")"
 log "firmware partition passes fsck.fat"
 
 e2fsck -fy "${LOOP}p2" >/dev/null || die "the root partition fails e2fsck"
-tune2fs -C 0 -T never "${LOOP}p2" >/dev/null
-log "root partition passes e2fsck"
+# Reset the forced-check bookkeeping so the first real boot is not the one that
+# decides to fsck: -C 0 clears the mount counter, -i 0 disables the periodic
+# check interval, -T now stamps the superblock as just checked. (`-T never` is
+# not a thing: `never` is only a keyword for -c/-i, and e2fsprogs 1.47.4 takes
+# the usage line and exits non-zero on it.)
+tune2fs -C 0 -i 0 -T now "${LOOP}p2" >/dev/null \
+    || die "tune2fs could not reset the root partition's check counters"
+log "root partition passes e2fsck, forced-check counters reset"
 
 # Read the patched files back through a fresh mount: what matters is what the
 # Pi firmware will read, not what this script thinks it wrote.
