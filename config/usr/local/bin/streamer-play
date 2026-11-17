@@ -102,7 +102,7 @@ case "$kind" in
         # it adds, whatever was loaded before. The path is escaped for JSON the
         # slow way because there is no jq on the card.
         esc=$(printf '%s' "$target" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
-        if ! cliamp queue "$target"; then
+        if ! cliamp remote call url.load --params "{\"path\":\"$esc\",\"play\":true}" --wait; then
             echo "could not start: $target" >&2
             log_boot "FAIL url.load $target"
             exit 1
@@ -239,6 +239,7 @@ while :; do
             'BEGIN{ d=a-e; if (d<0) d=-d; print (d > s+0.02) ? 1 : 0 }')
         if [ "$moved" = 1 ]; then
             echo "volume was set elsewhere to $after dB, ramp stops"
+            log_boot "volume set elsewhere to $after dB, ramp stops"
             now=$after
             break
         fi

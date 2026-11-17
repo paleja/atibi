@@ -277,9 +277,24 @@ startup are slower on Cortex-A72.
   `STREAMER_VOL_MAX` (+6) clamps both ends, so a stale progress file can neither
   silence the box nor ask for full power. All of it goes through cliamp's dB, so
   there is still exactly one volume path.
+- **The ramp cannot outlive the boot, and it yields to a hand on the volume.**
+  Three guards, all of them writing one line to `boot.log` so the reason is
+  legible after the fact:
+  *a level that will not move* — if a step leaves the reported level unchanged,
+  the output device has its own limit and continuing would be a loop that ends
+  only when the unit's start timeout kills it, so the ramp stops where the
+  device stops it;
+  *a step budget* (`STREAMER_RAMP_MAX_STEPS`, 16, which covers the floor-to-
+  ceiling worst case inside the 10 s boot budget) as the backstop for anything
+  else;
+  *a level set elsewhere* — if the reported level lands more than one ramp step
+  away from where the boot's own adjustment left it, somebody used the bar
+  panel or an SSH session, their setting wins, and the boot does not climb back
+  over it. A level that was already there before the boot began is not this
+  case: that is simply the level the ramp starts from.
 - **A saved level at or below the floor counts as a parked control, not a
-  preference** (§8.3): the volume control bottoms out at the floor, so replaying
-  it means a permanently inaudible box after the next power cycle. That level is
+  preference**: the volume control bottoms out at the floor, so replaying it
+  means a permanently inaudible box after the next power cycle. That level is
   replaced by the configured default, and the substitution is written to
   `boot.log`. Deliberately quiet is `streamer stop`, which is a different thing.
 - **Pi 5 note:** the IQaudIO/RPi DAC+ driver had a real Pi 5 bug (designware-i2s
@@ -512,14 +527,28 @@ These criteria are not all verified the same way, and the distinction matters
 when reading a green result:
 
 - **Script level** (automated, on the build host, no root, no Pi):
-  `tests/appliance-scripts.sh`, eleven scenarios — ramp from the floor, resume at a
-  saved row/position/level, the save round-trip, boot-count rollback, recording
-  a known-good config, `mode=stop`, volume clamped at the ceiling, a player that
-  never comes up, the `streamer` command's reporting, the jack/dac splice, and a
-  saved level parked at the floor.
+  `tests/appliance-scripts.sh`, fourteen scenarios and 93 assertions — ramp from
+  the floor (including that the floor reaches the player *before* anything is
+  told to make a sound), resume at a saved row/position/level, the save
+  round-trip, boot-count rollback, recording a known-good config, `mode=stop`,
+  volume clamped at the ceiling, a player that never comes up, the `streamer`
+  command's reporting (including `stations` pairing names with `stream`, never
+  `tracks_url`), the jack/dac splice, a saved level parked at the floor, a saved
+  row that no longer exists, and the three ramp guards of §6.4.
   It runs the real scripts with only their paths redirected, against a stand-in
-  for the player's IPC and stubs for `systemctl`/`mount`. Covers criteria 2 (the
+  for the player's IPC and stubs for `systemctl`/`mount`/`curl`. The stand-in's
+  volume ceiling is deliberately *above* `STREAMER_VOL_MAX`, so a script that
+  forgot to clamp is caught rather than hidden. Covers criteria 2 (the
   logic), 7 (the logic), 8 and 9 (the mechanics).
+- **Meta level** (automated): `tests/mutation-check.py` breaks one shipped
+  behaviour at a time (ten: the floor, the parked-level rule, the ceiling,
+  `url.load` versus plain queueing, the refused-row position reset, the
+  `"stream"` key, both ramp guards, the set-elsewhere guard, the rollback
+  threshold) and requires the suite to go red on the check that owns that
+  behaviour. A mutation that hangs the suite counts as caught — an unbounded
+  loop in the boot script is exactly what those guards prevent. This is what
+  makes a green suite mean something: without it, a passing check is only as
+  good as its ability to fail.
 - **On-device** (M1+): partition layout, `ro` root, systemd ordering, the
   first-boot grow-and-reboot, real cliamp IPC, timing, dithering, the relay.
   Nothing in the script suite stands in for these; they are criterion 1, 3, 5, 6

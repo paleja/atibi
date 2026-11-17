@@ -45,6 +45,10 @@ jnum() { # jnum <key>: number for that key in the stand-in player's state.
         awk '{ printf "%g", $1 }'; }
 jstr() { # jstr <key>: string value for that key
     sed -n 's/.*"'"$1"'":"\([^"]*\)".*/\1/p' "$T/state.json" | head -1; }
+pln() { # pln <pattern>: line number of the first transcript entry that matches,
+        # or 0 if the boot never asked for it. Lets a check be about the order
+        # the player gets told things in, not only about what it ends up as.
+    grep -n -- "$1" "$T/player.log" 2>/dev/null | head -1 | cut -d: -f1; }
 jrow() { # jrow <n>: the n-th row of the live playlist, as the stub spells it
     python3 -c 'import json,sys
 d = json.load(open(sys.argv[1]))
@@ -77,8 +81,25 @@ def load():
         d = json.load(open(S))
         for key, value in fresh().items():   # a hand-seeded state stays valid
             d.setdefault(key, value)
+        elsewhere(d)
         return d
     return fresh()
+def elsewhere(d):
+    # Somebody reached for the volume a moment after the boot started turning it
+    # up: the bar panel, an SSH session, a remote. The marker holds a dB figure.
+    # It takes effect only once the boot has made its first adjustment, because
+    # that is the window the guard exists for. A level set before the boot began
+    # is simply the level the boot ramps from, and climbing on from there to the
+    # saved setting is the correct thing to do. What matters is that mid-ramp,
+    # the person who actually touched the volume wins: the boot stops rather
+    # than arguing with them.
+    if d.get("adjustments", 0) < 1:
+        return
+    p = os.path.join(os.environ["TESTROOT"], "set-elsewhere")
+    if os.path.exists(p) and not d.get("elsewhere_applied"):
+        d["volume"] = float(open(p).read().strip())
+        d["elsewhere_applied"] = True
+        save(d)
 def save(d): json.dump(d, open(S, "w"), separators=(",", ":"))
 def out(d): sys.stdout.write(json.dumps(d, separators=(",", ":")) + "\n")
 def stuck_at():
@@ -90,9 +111,13 @@ def stuck_at():
         return float(open(p).read().strip())
     return None
 def cap(d, v):
-    # cliamp has its own ceiling; the stuck-at file stands in for one further
-    # down, which is the situation a real output device gets you into.
-    top = min(6.0, v)
+    # cliamp has its own ceiling, and it is deliberately above the appliance's
+    # STREAMER_VOL_MAX: if the stand-in clamped at the same figure the appliance
+    # aims for, a boot script that forgot its own ceiling would still look
+    # correct, and the check would be about the stand-in rather than the script.
+    # The stuck-at file stands in for a limit further down still, which is what
+    # an output device with a ceiling of its own gets you into.
+    top = min(12.0, v)
     s = stuck_at()
     if s is not None:
         top = min(top, s)
@@ -107,6 +132,12 @@ def sarg(name):
     if not m: sys.exit("fake cliamp: no %s in params" % name)
     return m.group(1)
 a = sys.argv[1:]
+# Order matters as much as the commands themselves: the boot has to make the
+# level quiet before it makes any sound. So every call gets recorded, apart from
+# the harness setting up the state of play.
+if a[:1] != ["--default-state"]:
+    with open(os.path.join(os.environ["TESTROOT"], "player.log"), "a") as f:
+        f.write(" ".join(a) + "\n")
 if a[:1] == ["--daemon"]: sys.exit(0)
 if a[:1] == ["--version"]: print("fake-cliamp 9.9.9"); sys.exit(0)
 if a[:1] == ["--default-state"]: out(fresh()); sys.exit(0)
@@ -142,7 +173,10 @@ if a[:1] == ["play"]:
         d["index"] = 0
     d["state"] = "playing"; save(d); sys.exit(0)
 if a[:3] == ["remote", "call", "volume.adjust"]:
-    d = load(); d["volume"] = cap(d, d["volume"] + num("value")); save(d); sys.exit(0)
+    d = load()
+    d["volume"] = cap(d, d["volume"] + num("value"))
+    d["adjustments"] = d.get("adjustments", 0) + 1
+    save(d); sys.exit(0)
 if a[:3] == ["remote", "call", "queue.list"]:
     d = load()
     out({"ok": True, "index": d["index"], "total": len(d.get("queue", []))}); sys.exit(0)
@@ -229,6 +263,7 @@ reset() { # a clean /data/streamer, a player as a live daemon has it, fresh boot
     rm -rf "$T"/data/streamer/* "$T/state.json"
     mkdir -p "$T/data/streamer/last-good"
     "$T/bin/cliamp" --default-state >"$T/state.json"
+    rm -f "$T/player.log"
     fw_seed jack
     # The counter file exists after any boot, good or bad, so a sandbox that
     # pretends to be a running system has one. Most scenarios want to start from
@@ -255,12 +290,19 @@ export HOME=$T/home TESTROOT=$T PATH=$T/bin:$PATH STREAMER_SUDO=1
 sock=$HOME/.config/cliamp/cliamp.sock
 socket_on() { # the player is up: streamer-play only checks that the socket is there
     rm -f "$sock"
+    # Detached from the harness's own stdout/stderr, and watching for its own
+    # socket to vanish: a leftover listener holding the output pipes open would
+    # keep a caller reading long after the scenarios finished, and a scenario
+    # that forgets socket_off would otherwise sit here for two minutes.
     python3 -c 'import os, socket, time
 p = os.path.expandvars("$HOME/.config/cliamp/cliamp.sock")
 try: os.unlink(p)
 except FileNotFoundError: pass
 s = socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1)
-time.sleep(120)' &
+for _ in range(300):          # 60 s at most, and gone as soon as the file is
+    if not os.path.exists(p): break
+    time.sleep(0.2)
+' </dev/null >"/dev/null" 2>&1 &
     socketpid=$!
     i=0
     while [ ! -S "$sock" ] && [ $i -lt 40 ]; do sleep 0.05; i=$((i + 1)); done
@@ -271,6 +313,8 @@ socket_off() {
     socketpid=
     return 0
 }
+# Whatever a scenario forgets, the fake player must not outlive the harness.
+trap 'socket_off' EXIT
 fw_hash() { # the way streamer-bootcount hashes the boot partition
     { cat "$T/fw/config.txt"; [ -f "$T/fw/cmdline.txt" ] && cat "$T/fw/cmdline.txt"; } |
         sha256sum | cut -d' ' -f1
@@ -302,6 +346,8 @@ run() { # run <scenario number>
         ck_eq "the target URL got a row of its own" "$(jrow 5)" "http://localhost/x.mp3"
         ck_eq "that row is the one playing, not row 0" "$(jnum index)" "5"
         ck_eq "playing" "$(jstr state)" "playing"
+        ck "the boot floor is set on the player, and set before it makes a sound" \
+            "[ $(pln 'volume -30') -gt 0 ] && [ $(pln 'volume -30') -lt $(pln 'url.load') ]"
         ck_eq "ramped to the fallback level" "$(jnum volume)" "-20"
         ck_in "boot.log records the play" "$T/data/streamer/boot.log" "OK url http://localhost/x.mp3"
         ck_in "boot.log records the level it reached" "$T/data/streamer/boot.log" "(target -20)"
@@ -542,7 +588,32 @@ run() { # run <scenario number>
         socket_off
         ck_eq "the boot still ends cleanly" "$rc" "0"
         ck_eq "two steps of 3 dB above the floor" "$(jnum volume)" "-24"
-        ck_in "boot.log says the budget ran out" "$T/data/streamer/boot.log" "ramp budget of 2 steps exhausted at -24.0 dB" ;;
+        ck_in "boot.log says the budget ran out" "$T/data/streamer/boot.log" "ramp budget of 2 steps exhausted at -24.0 dB"
+        # The sandbox conf is written once for the whole run, so put the shipped
+        # budget back: a two-step limit leaking into the scenarios after this one
+        # makes them fail for a reason that has nothing to do with what they are
+        # about.
+        sed -i 's/^STREAMER_RAMP_MAX_STEPS=.*$/STREAMER_RAMP_MAX_STEPS=16/' "$T/streamer.conf" ;;
+    14) note "14. volume moved elsewhere mid-ramp: the person wins, the ramp backs off"
+        reset; socket_on
+        # The boot is climbing from the floor toward the saved -9 dB, and a
+        # moment after the music starts somebody reaches for the volume and
+        # takes it down to -40. That is a jump of far more than one ramp step,
+        # which is how the boot tells it apart from its own adjustment. The
+        # mistake being guarded against is the boot deciding it knows better and
+        # climbing straight back over a level someone has just set by hand.
+        printf -- '-40\n' >"$T/set-elsewhere"
+        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
+        printf 'position=0\nindex=0\nvolume=-9\n' >"$T/data/streamer/progress"
+        if "$T/streamer-play" >"$T/logs/s14" 2>&1; then rc=0; else rc=$?; fi
+        sed 's/^/  /' "$T/logs/s14"; player
+        socket_off; rm -f "$T/set-elsewhere"
+        ck_eq "the boot still ends cleanly" "$rc" "0"
+        ck_eq "the level the person actually set is what plays" "$(jnum volume)" "-40"
+        ck_eq "the ramp did not climb to the saved target" "$(jnum volume)" "-40"
+        ck_eq "and it got there in a single step, not by arguing" "$(jnum adjustments)" "1"
+        ck_in "boot.log says the level came from elsewhere" "$T/data/streamer/boot.log" "volume set elsewhere to -40.0 dB, ramp stops"
+        ck_in "boot.log still records the play" "$T/data/streamer/boot.log" "OK playlist Late Night" ;;
     *) echo "no scenario $1" >&2; return 2 ;;
     esac
     log_tail
@@ -552,7 +623,7 @@ echo "sandbox: $T"
 if [ $# -gt 0 ]; then
     for n in "$@"; do run "$n"; done
 else
-    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13; do run "$n"; done
+    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do run "$n"; done
 fi
 
 printf '\n%d checks, %d failed\n' "$((pass + fail))" "$fail"
