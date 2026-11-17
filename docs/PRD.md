@@ -232,14 +232,15 @@ startup are slower on Cortex-A72.
   `config.txt` makes it. Pinning card 0 by number is the fragile option — the
   number depends on probe order — so it stays out unless the default turns out
   to be wrong on real hardware.
-- **The sound stack is PipeWire + WirePlumber** (confirmed in the base image:
-  both are present), not bare ALSA. That matters for debugging, because there are
-  two volumes in the chain and they are not the same control: PipeWire's own sink
-  volume and mute, and the PCM512x `Digital` control underneath it. A silent
-  output with a visible card can be either one. M1 check on the bench:
-  `wpctl status` / `wpctl inspect <sink>` for the sink PipeWire picked and its
-  volume/mute, then `amixer` for the codec. Only after both are known good is
-  `unmute_amp` worth trying.
+- **The sound stack is bare ALSA on the delivered card** (verified on the first
+  real card, 2026-11-18: no PipeWire, no WirePlumber, no `pactl` in
+  `raspios_lite_arm64-2026-10-06`; nothing audio-related runs at boot;
+  cliamp logs one harmless `pactl: executable file not found` probe line and
+  falls through to ALSA). That is one volume path, not two — cliamp's dB on
+  top, the codec's ALSA control underneath. The earlier "PipeWire confirmed in
+  the base image" note was wrong (the grep must have hit config fragments, not
+  installed binaries). If PipeWire ever shows up (desktop-based image, §12),
+  re-derive this: the chain would gain a sink volume in between.
 - **Volume path (decided):** all volume via cliamp's dB control so
   `playerctl`/bar panel is the single path; the card's ALSA control (PCM512x
   `Digital`) stays at 0 dB. Default driver behaviour already caps it at 0 dB —

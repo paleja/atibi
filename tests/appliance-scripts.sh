@@ -614,6 +614,28 @@ run() { # run <scenario number>
         ck_eq "and it got there in a single step, not by arguing" "$(jnum adjustments)" "1"
         ck_in "boot.log says the level came from elsewhere" "$T/data/streamer/boot.log" "volume set elsewhere to -40.0 dB, ramp stops"
         ck_in "boot.log still records the play" "$T/data/streamer/boot.log" "OK playlist Late Night" ;;
+    15) note "15. tool contract: every blockdev option the payload uses really exists"
+        # A flag that *looks* obvious but does not exist survives every green
+        # sandbox run, because no stub validates flags, and dies only on real
+        # hardware. That is exactly how `blockdev --getstart` reached the first
+        # real card: streamer-firstboot crashed before laying out /data, and
+        # every unit with Requires=data.mount reported 'Dependency failed'.
+        # The build host runs the same util-linux family as the card (2.41.x),
+        # so blockdev --help here is the truth the scripts have to match.
+        used=$(grep -rhoE 'blockdev --[a-z]+' "$CFG/usr/local/bin" |
+            sed 's/.*blockdev --//' | sort -u | tr '\n' ' ')
+        missing=""
+        for o in $used; do
+            blockdev --help 2>&1 | grep -qF -- "--$o" || missing="$missing --$o"
+        done
+        echo "  blockdev options used:$used"
+        ck "the payload really calls blockdev (the check is not vacuous)" \
+            "[ -n \"$used\" ]"
+        ck "every blockdev option used exists on a real util-linux" \
+            "[ -z \"$missing\" ]"
+        # And the one real start-sector source: sysfs, not a blockdev flag.
+        ck_in "the firstboot start sector comes from sysfs" \
+            "$CFG/usr/local/bin/streamer-firstboot" "/sys/class/block/" ;;
     *) echo "no scenario $1" >&2; return 2 ;;
     esac
     log_tail
@@ -623,7 +645,7 @@ echo "sandbox: $T"
 if [ $# -gt 0 ]; then
     for n in "$@"; do run "$n"; done
 else
-    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do run "$n"; done
+    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do run "$n"; done
 fi
 
 printf '\n%d checks, %d failed\n' "$((pass + fail))" "$fail"

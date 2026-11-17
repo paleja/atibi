@@ -56,7 +56,15 @@ case "$PART" in ''|*[!0-9]*) echo "cannot read the partition number from $part_n
 
 disk_sectors=$(blockdev --getsz "$DISK_DEV")
 part_sectors=$(blockdev --getsz "$DATA_DEV")
-part_start=$(blockdev --getstart "$DATA_DEV")
+# The kernel already knows where the partition starts: /sys/class/block/<name>/start
+# is in sectors, for mmcblk0p3 and sda3 alike. (blockdev has no --getstart; it
+# is one of those options that looks obvious and does not exist. Everything
+# else this script takes from blockdev -- getro, getsz, flushbufs -- really is
+# there.)
+part_start=$(cat "/sys/class/block/$part_name/start" 2>/dev/null || true)
+case "$part_start" in ''|*[!0-9]*)
+    echo "cannot read the start sector of $DATA_DEV from sysfs" >&2; exit 1 ;;
+esac
 
 # A card that is larger than the image this table was written from leaves the
 # last partition short. Everything before it stays where it is.

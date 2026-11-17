@@ -32,10 +32,16 @@ JOURNAL = Path("/tmp/opencode/rpi-streamer-mutation.journal")
 PLAY = "config/usr/local/bin/streamer-play"
 CTRL = "config/usr/local/bin/streamer"
 BOOTCOUNT = "config/usr/local/bin/streamer-bootcount"
+FIRSTBOOT = "config/usr/local/bin/streamer-firstboot"
 
 # what gets broken, which file, the anchor, the replacement, and the check label
 # that has to go red
 MUTATIONS = [
+    ("firstboot invents a blockdev flag again", FIRSTBOOT,
+     'disk_sectors=$(blockdev --getsz "$DISK_DEV")',
+     'disk_sectors=$(blockdev --getstart "$DISK_DEV")',
+     "every blockdev option used exists on a real util-linux"),
+
     ("a parked volume is replayed verbatim", PLAY,
      r"""elif awk -v l="$level" -v f="$STREAMER_VOL_FLOOR" 'BEGIN{ exit (l+0 <= f+0) ? 0 : 1 }'; then""",
      "elif false; then",
