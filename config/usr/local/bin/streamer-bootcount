@@ -1,0 +1,75 @@
+#!/bin/sh
+# streamer-bootcount - early boot accounting, and the self-healing path.
+#
+# It runs before normal services, while /data and /boot/firmware are already
+# mounted. It counts consecutive boots that never reached the multi-user phase
+# (streamer-booted resets the count). If the same broken boot configuration
+# fails RECOVERY_AT times in a row, the last known-good config.txt and
+# cmdline.txt are copied back and the box reboots. After GIVEUP_AT attempts it
+# stops rebooting and boots the current configuration, so a hard-to-diagnose
+# fault can never turn into a reboot loop.
+set -eu
+
+. /etc/streamer.conf
+
+log_boot() { # log_boot <one line>
+    /usr/local/bin/streamer-bootlog "$1"
+}
+
+boot_dir=/boot/firmware
+# Hashed over exactly the same inputs, in the same order, as streamer-booted,
+# or the two would never compare equal. cmdline.txt is optional in both places:
+# a Raspberry Pi OS image always has one, but a broken edit might remove it, and
+# this script must not itself die over it.
+cur_hash=$({ cat "$boot_dir/config.txt"
+             [ -f "$boot_dir/cmdline.txt" ] && cat "$boot_dir/cmdline.txt"; } |
+    sha256sum | cut -d' ' -f1)
+
+prev_n=0
+prev_hash=""
+if [ -f "$STREAMER_ATTEMPT" ]; then
+    prev_n=$(sed -n 's/^attempt=//p' "$STREAMER_ATTEMPT")
+    prev_hash=$(sed -n 's/^config=//p' "$STREAMER_ATTEMPT")
+fi
+case "$prev_n" in ''|*[!0-9]*) prev_n=0 ;; esac
+
+# Same configuration as the failed attempt: keep counting. A new configuration
+# starts a fresh count, so an experiment never gets rolled back for old reasons.
+if [ "$prev_hash" = "$cur_hash" ]; then
+    n=$((prev_n + 1))
+else
+    n=1
+fi
+
+tmp="$STREAMER_ATTEMPT.tmp"
+printf 'attempt=%d\nconfig=%s\n' "$n" "$cur_hash" >"$tmp"
+mv -f "$tmp" "$STREAMER_ATTEMPT"
+sync
+
+echo "boot attempt $n for config $cur_hash" >&2
+# The hash is written short: boot.log is meant to be read by eye, and the full
+# value is still in /data/streamer/attempt for anything that compares it.
+log_boot "boot attempt $n config $(printf '%.16s' "$cur_hash")"
+
+good_hash=""
+[ -f "$STREAMER_LASTGOOD/hash" ] && good_hash=$(cat "$STREAMER_LASTGOOD/hash")
+
+if [ "$n" -ge "$RECOVERY_AT" ] && [ "$n" -lt "$GIVEUP_AT" ] \
+        && [ -f "$STREAMER_LASTGOOD/config.txt" ] && [ "$good_hash" != "$cur_hash" ]; then
+    echo "boot config $cur_hash failed $n times: restoring last-good config $good_hash" >&2
+    # Both the attempt and the restore go to boot.log: this is the one moment
+    # the box changes its own boot configuration, and after a power cut the
+    # journal will not remember it.
+    log_boot "boot config $(printf '%.16s' "$cur_hash") failed $n times, restoring last-good $(printf '%.16s' "$good_hash")"
+    if mount -o remount,rw "$boot_dir" 2>/dev/null; then
+        cp "$STREAMER_LASTGOOD/config.txt" "$boot_dir/config.txt"
+        [ -f "$STREAMER_LASTGOOD/cmdline.txt" ] &&
+            cp "$STREAMER_LASTGOOD/cmdline.txt" "$boot_dir/cmdline.txt"
+        sync
+        mount -o remount,ro "$boot_dir" 2>/dev/null || true
+        exec systemctl --no-block reboot
+    fi
+    echo "could not make $boot_dir writable, booting the current config" >&2
+fi
+
+exit 0

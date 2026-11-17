@@ -1,0 +1,25 @@
+[Unit]
+Description=Set up the streamer data partition
+Documentation=file:/etc/streamer.conf
+# Runs before /data is mounted, because rewriting a partition table and making
+# a filesystem is something nothing else may be holding. ConditionFirstBoot is
+# not used: it is tied to an uninitialised /etc, and this box has already
+# consumed that first boot before the appliance ever starts.
+DefaultDependencies=no
+After=systemd-udevd.service local-fs-pre.target
+Before=local-fs.target data.mount
+ConditionPathExists=!/etc/streamer/provisioned
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/streamer-firstboot
+TimeoutStartSec=600
+# The appliance has no screen of its own, but if one is attached while the card
+# is being brought up for the first time, this is the output worth seeing.
+StandardOutput=journal+console
+StandardError=journal+console
+SyslogIdentifier=streamer-firstboot
+
+[Install]
+WantedBy=sysinit.target

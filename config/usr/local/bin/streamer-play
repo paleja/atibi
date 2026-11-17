@@ -1,0 +1,267 @@
+#!/bin/sh
+# streamer-play - bring up playback for this boot, then ramp the volume.
+#
+# Started by streamer-play.service. It is the only thing that starts audio, so
+# the volume floor and the ramp cannot be bypassed. It reads /etc/streamer.conf
+# and the appliance state, so whatever played before the last power cut plays
+# again.
+set -eu
+
+. /etc/streamer.conf
+
+log_boot() { # log_boot <one line>
+    /usr/local/bin/streamer-bootlog "$1"
+}
+
+mode=last
+kind="$STREAMER_START_KIND"
+target="$STREAMER_START_TARGET"
+saved_vol=""
+saved_pos=0
+saved_idx=-1
+# Intent and progress are separate files: intent is written by the streamer
+# command, progress by streamer-save.timer, and neither one has to know what
+# the other keeps.
+if [ -f "$STREAMER_STATE" ]; then
+    mode=$(sed -n 's/^mode=//p' "$STREAMER_STATE" 2>/dev/null || true)
+    kind=$(sed -n 's/^kind=//p' "$STREAMER_STATE" 2>/dev/null || true)
+    target=$(sed -n 's/^target=//p' "$STREAMER_STATE" 2>/dev/null || true)
+fi
+if [ -f "$STREAMER_PROGRESS" ]; then
+    saved_pos=$(sed -n 's/^position=//p' "$STREAMER_PROGRESS" 2>/dev/null || true)
+    saved_idx=$(sed -n 's/^index=//p' "$STREAMER_PROGRESS" 2>/dev/null || true)
+    saved_vol=$(sed -n 's/^volume=//p' "$STREAMER_PROGRESS" 2>/dev/null || true)
+fi
+[ -n "$mode" ] || mode=last
+[ -n "$kind" ] || kind=url
+case "$saved_pos" in ''|*[!0-9]*) saved_pos=0 ;; esac
+case "$saved_idx" in ''|-*|*[!0-9]*) saved_idx=-1 ;; esac
+case "$saved_vol" in ''|*[!0-9.-]*) saved_vol= ;; esac
+[ "$mode" = stop ] && { echo "appliance is in stop mode, staying quiet"; log_boot "stop mode, nothing started"; exit 0; }
+[ -n "$target" ] || { echo "nothing to play" >&2; log_boot "FAIL no target to play"; exit 1; }
+
+# The daemon starts in parallel; wait for its IPC socket.
+sock="${HOME:-/home/pi}/.config/cliamp/cliamp.sock"
+i=0
+while [ ! -S "$sock" ]; do
+    i=$((i + 1))
+    [ "$i" -gt "$((STREAMER_SOCKET_WAIT * 4))" ] && {
+        echo "cliamp socket never appeared: $sock" >&2
+        log_boot "FAIL no cliamp socket after ${STREAMER_SOCKET_WAIT}s"
+        exit 1
+    }
+    sleep 0.25
+done
+
+# A stream needs name resolution. Rather than pulling in network-online.target
+# and the two second stall that comes with it, check the one thing the target
+# actually needs.
+host=$(printf '%s' "$target" | sed -n 's#^[a-zA-Z]*://\([^/:]*\).*#\1#p')
+if [ -n "$host" ]; then
+    i=0
+    until getent hosts "$host" >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -gt "$((STREAMER_NET_WAIT * 4))" ] && {
+            echo "cannot resolve $host" >&2
+            log_boot "FAIL cannot resolve $host for $kind $target"
+            exit 1
+        }
+        sleep 0.25
+    done
+fi
+
+status() { cliamp status --json 2>/dev/null || true; }
+pick() { # pick <json> <key>
+    printf '%s' "$1" | sed -n "s/.*\"$2\":\(-\{0,1\}[0-9][0-9.]*\).*/\1/p"
+}
+
+# Hard floor, set before anything can reach the speakers. The daemon was
+# already started at this level; setting it again is cheap, and it is what
+# makes the floor true even if the daemon restored an old session on its own.
+if ! cliamp volume "$STREAMER_VOL_FLOOR"; then
+    echo "could not set the volume floor of $STREAMER_VOL_FLOOR dB" >&2
+    log_boot "FAIL volume floor $STREAMER_VOL_FLOOR"
+    exit 1
+fi
+
+case "$kind" in
+    playlist)
+        # The same name the --playlist flag and the TUI use. cliamp load waits
+        # up to five minutes for a big playlist, which is why this unit gets its
+        # own generous TimeoutStartSec.
+        if ! cliamp load "$target"; then
+            echo "could not load playlist: $target" >&2
+            log_boot "FAIL load '$target'"
+            exit 1
+        fi
+        ;;
+    url|file)
+        # NOT `cliamp queue <url>`: a live daemon already has the cliamp radio
+        # channels loaded, and queue only appends, so play would then start row
+        # 0, which is a different channel. url.load with play set starts the row
+        # it adds, whatever was loaded before. The path is escaped for JSON the
+        # slow way because there is no jq on the card.
+        esc=$(printf '%s' "$target" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        if ! cliamp queue "$target"; then
+            echo "could not start: $target" >&2
+            log_boot "FAIL url.load $target"
+            exit 1
+        fi
+        ;;
+    *) echo "unknown state kind: $kind" >&2; log_boot "FAIL unknown kind $kind"; exit 1 ;;
+esac
+
+# A saved row or position only means something for a playlist or a provider
+# library. For a URL or file, url.load has already picked the row it added.
+resumable=0
+case "$kind" in playlist|provider) resumable=1 ;; esac
+
+if [ "$resumable" = 1 ]; then
+    # Wait for the load to finish. queue.list is the probe, not status: the
+    # playlist has rows long before any row is current, and status reports no
+    # index at all until then.
+    total=0
+    i=0
+    while :; do
+        total=$(pick "$(cliamp remote call queue.list)" total)
+        case "$total" in ''|*[!0-9]*) total=0 ;; esac
+        [ "$total" -gt 0 ] && break
+        i=$((i + 1))
+        [ "$i" -gt $((STREAMER_PLAY_WAIT * 2)) ] && {
+            echo "$kind $target produced no live playlist: check $HOME/.config/cliamp/cliamp.log" >&2
+            log_boot "FAIL no playlist for $kind $target"
+            exit 1
+        }
+        sleep 0.5
+    done
+
+    # queue.play both selects the row and starts it. The row to jump back to is
+    # the one that was saved, not row 0: jumping is what gets the album back to
+    # where it was. queue.play bounds-checks the row, so a saved row that no
+    # longer exists fails the call instead of silently doing nothing, and the
+    # fallback starts the top of the list rather than leaving the box silent.
+    if [ "$saved_idx" -ge 0 ]; then
+        if cliamp remote call queue.play --params "{\"index\":$saved_idx}" --wait >/dev/null 2>&1; then
+            log_boot "resumed at row $saved_idx"
+        else
+            echo "could not jump to row $saved_idx, starting from the top" >&2
+            log_boot "FAIL queue.play index=$saved_idx"
+            # The saved position belongs to the row that is gone, so it is
+            # dropped with it: seeking into row 0 by the number of seconds some
+            # other row had reached would start that track half over for no
+            # reason.
+            saved_pos=0
+            cliamp remote call queue.play --params '{"index":0}' --wait >/dev/null 2>&1 ||
+                { echo "nothing would play from $target" >&2
+                  log_boot "FAIL queue.play index=0"; exit 1; }
+        fi
+    else
+        cliamp remote call queue.play --params '{"index":0}' --wait >/dev/null 2>&1 ||
+            { echo "nothing would play from $target" >&2
+              log_boot "FAIL queue.play index=0"; exit 1; }
+    fi
+fi
+
+i=0
+while :; do
+    json=$(status)
+    # Not a sed on one key: status --json can report other things with a state
+    # of their own, and "playing" anywhere is the signal that audio is running.
+    case "$json" in *'"state":"playing"'*|*'"state": "playing"'*) break ;; esac
+    i=$((i + 1))
+    [ "$i" -gt $((STREAMER_PLAY_WAIT * 2)) ] && {
+        state=$(printf '%s' "$json" | sed -n 's/.*"state":"\([a-z]*\)".*/\1/p')
+        echo "no playback within ${STREAMER_PLAY_WAIT}s (state=${state:-unknown})" >&2
+        log_boot "FAIL no playing state within ${STREAMER_PLAY_WAIT}s"
+        exit 1
+    }
+    sleep 0.5
+done
+
+# The position inside that row, same rule as the row: it only means something
+# for a file or a playlist, never for a live stream.
+if [ "$resumable" = 1 ] && [ "$saved_pos" -gt 0 ]; then
+    if ! cliamp remote call seek.absolute --params "{\"value\":$saved_pos}" --wait >/dev/null 2>&1; then
+        echo "could not seek to ${saved_pos}s" >&2
+        log_boot "FAIL seek.absolute value=$saved_pos"
+    fi
+fi
+
+# Where the ramp ends: the level the previous session was at, or the default in
+# /etc/streamer.conf if nothing was saved. Clamped, because the floor has to be
+# the last word: a stale progress file can never make the first sample loud.
+#
+# A saved level at or below the floor is a special case. The volume control
+# bottoms out at the floor, so a user who parks it there and then pulls the
+# power gets the floor back at every boot after that — silence, with no way to
+# tell that the box is not broken. That is a mistake, not a preference worth
+# keeping, so it falls back to the configured default and says so. To get a
+# genuinely quiet box, use `streamer stop`.
+level=${saved_vol:-}
+if [ -z "$level" ]; then
+    level=$STREAMER_VOL_TARGET
+    echo "no saved volume, ramping to the default $level dB"
+elif awk -v l="$level" -v f="$STREAMER_VOL_FLOOR" 'BEGIN{ exit (l+0 <= f+0) ? 0 : 1 }'; then
+    echo "saved volume $level dB is at or below the $STREAMER_VOL_FLOOR dB floor, treating it as parked: ramping to $STREAMER_VOL_TARGET"
+    log_boot "saved volume $level at the floor, using $STREAMER_VOL_TARGET"
+    level=$STREAMER_VOL_TARGET
+fi
+level=$(awk -v l="$level" -v f="$STREAMER_VOL_FLOOR" -v h="$STREAMER_VOL_MAX" \
+    'BEGIN{ if (l+0 < f+0) l=f+0; if (l+0 > h+0) l=h+0; printf "%g", l }')
+
+# Ramp. Nothing jumps: the amplifier's relay is already closed by now, and a
+# step would be the one thing it could not absorb.
+#
+# Two guards keep this loop from outliving the boot. A volume that does not move
+# at all means the player will not go where it is asked, usually because the
+# output device has its own limit, so continuing would be a loop that sleeps
+# until the unit's start timeout kills it. And the step budget is the backstop
+# for anything else: the ramp is worth at most so much of the boot budget.
+sleep "$STREAMER_RAMP_START"
+now=$(pick "$(status)" volume)
+[ -n "$now" ] || now=$STREAMER_VOL_FLOOR
+steps=0
+while :; do
+    below=$(awk -v n="$now" -v t="$level" 'BEGIN{ print (n+0 < t+0 - 0.01) ? 1 : 0 }')
+    [ "$below" = 1 ] || break
+
+    step=$(awk -v n="$now" -v t="$level" -v s="$STREAMER_RAMP_STEP" \
+        'BEGIN{ d=t-n; if (s+0 > d) s=d; printf "%g", s }')
+    cliamp remote call volume.adjust --params "{\"value\":$step}" --wait >/dev/null 2>&1 || break
+    expected=$(awk -v n="$now" -v s="$step" 'BEGIN{ printf "%g", n+s }')
+
+    # If cliamp reports a level more than one step away from where this ramp
+    # left it, that was somebody else: their setting wins, and the ramp stops
+    # rather than arguing with it.
+    after=$(pick "$(status)" volume)
+    if [ -n "$after" ]; then
+        moved=$(awk -v a="$after" -v e="$expected" -v s="$step" \
+            'BEGIN{ d=a-e; if (d<0) d=-d; print (d > s+0.02) ? 1 : 0 }')
+        if [ "$moved" = 1 ]; then
+            echo "volume was set elsewhere to $after dB, ramp stops"
+            now=$after
+            break
+        fi
+        if awk -v a="$after" -v n="$now" \
+            'BEGIN{ d=a-n; if (d<0) d=-d; exit (d < 0.01) ? 0 : 1 }'; then
+            echo "volume is not moving past $after dB, ramp stops" >&2
+            log_boot "volume stuck at $after dB, ramp stops"
+            now=$after
+            break
+        fi
+        now=$after
+    else
+        now=$expected
+    fi
+
+    steps=$((steps + 1))
+    if [ "$steps" -ge "$STREAMER_RAMP_MAX_STEPS" ]; then
+        echo "ramp used its whole budget at $now dB, giving up" >&2
+        log_boot "ramp budget of $steps steps exhausted at $now dB"
+        break
+    fi
+    sleep "$STREAMER_RAMP_DELAY"
+done
+
+echo "playing $kind:$target at $now dB (target $level dB, floor $STREAMER_VOL_FLOOR dB)"
+log_boot "OK $kind $target at $now dB (target $level)"

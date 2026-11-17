@@ -1,0 +1,23 @@
+[Unit]
+Description=Start appliance playback and ramp the volume
+Documentation=file:/etc/streamer.conf
+Requires=streamer-cliamp.service
+After=streamer-cliamp.service
+RequiresMountsFor=/data
+ConditionPathExists=/data/.ready
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=pi
+Group=pi
+Environment=HOME=/home/pi
+Environment=LANG=C.UTF-8
+ExecStart=/usr/local/bin/streamer-play
+TimeoutStartSec=120
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=streamer-play
+
+[Install]
+WantedBy=streamer.target

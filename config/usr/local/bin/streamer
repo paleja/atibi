@@ -1,0 +1,225 @@
+#!/bin/sh
+# streamer [command] - the control for the appliance, meant to be used over SSH.
+# The command list below is what `streamer nonsense` prints, so keep it current.
+#
+#   streamer                    same as: streamer status
+#   streamer status             what is playing now, and what plays next boot
+#   streamer play               play the saved target again, with the ramp
+#   streamer pause | toggle     transport
+#   streamer stop               stop now, and stay quiet after the next boot
+#   streamer next | prev        skip
+#   streamer vol -12            set the level to -12 dB (cliamp scale)
+#   streamer up 3 | down 3      move the level by N dB
+#   streamer station <url>      play this stream from now on, next boot too
+#   streamer playlist <name>    play a saved cliamp playlist from now on
+#   streamer stations           list the built-in radio endpoints
+#   streamer last               what the appliance will play on next boot
+#   streamer mode [last|stop]   resume-on-boot behaviour
+#   streamer forget             drop the saved playback position
+#   streamer log                this boot's player log
+#   streamer boots              the durable boot log, the one that survives a cut
+#   streamer reload             restart daemon and playback
+#   streamer audio [jack|dac]   show or switch the audio output
+#   streamer rw | ro            make / writable, then read-only again
+#   streamer save               record the current boot config as known-good
+set -eu
+
+. /etc/streamer.conf
+
+usage() { # the command list at the top of this file, which is its own help text
+    awk 'NR == 1 { next } /^set -eu/ { exit } { sub(/^# ?/, ""); print }' "$0"
+}
+
+# Some of these need root: systemctl on system units, the read-only root, the
+# boot partition. The first boot installs /etc/sudoers.d/streamer for exactly
+# this, so ssh in as the normal user and the command says what it is doing
+# rather than failing with an access error. STREAMER_SUDO marks the second pass,
+# so a sudo that cannot escalate (before the first boot has run, or without the
+# sudoers drop-in) reports the failure instead of re-running itself forever.
+needs_root() { # needs_root <command> [argument]
+    case "$1" in
+        play|station|playlist|reload|rw|ro|save) return 0 ;;
+        audio) [ -n "${2:-}" ] && return 0 ; return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Atomically replace the appliance intent. It lives on /data, so a power cut
+# between here and the next boot loses at most nothing: mode=stop keeps the box
+# silent until it is told to play again.
+save_state() {
+    mkdir -p "$(dirname "$STREAMER_STATE")"
+    tmp="$STREAMER_STATE.tmp"
+    printf 'mode=%s\nkind=%s\ntarget=%s\n' "$1" "$2" "$3" >"$tmp"
+    mv -f "$tmp" "$STREAMER_STATE"
+    sync
+    # The journal is volatile, so intent changes worth reading about a week later
+    # belong in the durable log too.
+    /usr/local/bin/streamer-bootlog "intent set: mode=$1 kind=$2 target=$3"
+}
+
+mode=$(sed -n 's/^mode=//p' "$STREAMER_STATE" 2>/dev/null || true)
+kind=$(sed -n 's/^kind=//p' "$STREAMER_STATE" 2>/dev/null || true)
+cur=$(sed -n 's/^target=//p' "$STREAMER_STATE" 2>/dev/null || true)
+mode=${mode:-last}
+kind=${kind:-$STREAMER_START_KIND}
+cur=${cur:-$STREAMER_START_TARGET}
+
+cmd=${1:-status}
+shift || true
+
+if [ "$(id -u)" != 0 ] && needs_root "$cmd" "${1:-}" && [ -z "${STREAMER_SUDO:-}" ]; then
+    # One attempt only. A sudo that cannot escalate - before the first boot has
+    # installed the sudoers drop-in, say - then fails on its own merits at the
+    # operation that needs root, rather than re-running this command forever.
+    echo "$cmd needs root: re-running with sudo" >&2
+    STREAMER_SUDO=1 exec sudo -E "$0" "$cmd" "$@"
+fi
+
+case "$cmd" in
+    status)
+        cliamp status
+        printf 'boot mode:   %s\n' "$mode"
+        printf 'boot target: %s %s\n' "$kind" "$cur"
+        ;;
+    last)
+        printf '%s %s\n' "$kind" "$cur"
+        ;;
+    mode)
+        case "${1:-}" in
+            last|stop) save_state "$1" "$kind" "$cur" ;;
+            "")        ;;
+            *)         echo "usage: streamer mode [last|stop]" >&2; exit 2 ;;
+        esac
+        printf 'boot mode: %s\n' "${1:-$mode}"
+        ;;
+    play)
+        save_state last "$kind" "$cur"
+        systemctl restart streamer-play.service
+        ;;
+    station)
+        url=${1:?usage: streamer station <url>}
+        save_state last url "$url"
+        rm -f "$STREAMER_PROGRESS"
+        systemctl restart streamer-play.service
+        ;;
+    playlist)
+        name=${1:?usage: streamer playlist <name>}
+        save_state last playlist "$name"
+        rm -f "$STREAMER_PROGRESS"
+        systemctl restart streamer-play.service
+        ;;
+    stations)
+        # The list belongs to the radio service, not to this box, so this needs
+        # the network. Extracting pairs with grep rather than a JSON parser: the
+        # body may come back on one line or spread over many, and there is no jq
+        # on a lite image. The shape radio.cliamp.stream actually serves keys a
+        # station's stream URL as "stream", and also has "tracks_url", which the
+        # quoted pattern below deliberately does not match.
+        if out=$(curl -fsS --max-time 10 "$STREAMER_STATION_LIST" 2>/dev/null) && [ -n "$out" ]; then
+            names=$(printf '%s' "$out" | grep -o '"name":"[^"]*"' | sed 's/^"name":"//; s/"$//')
+            urls=$(printf '%s' "$out" | grep -o '"stream":"[^"]*"' | sed 's/^"stream":"//; s/"$//')
+            if [ -n "$names" ] && [ -n "$urls" ]; then
+                tmpd=$(mktemp -d)
+                printf '%s\n' "$names" >"$tmpd/names"
+                printf '%s\n' "$urls" >"$tmpd/urls"
+                paste "$tmpd/names" "$tmpd/urls"
+                rm -rf "$tmpd"
+            else
+                # Not the shape expected: show the body instead of hiding it.
+                printf '%s\n' "$out" | tr ',' '\n' | sed -n '1,60p'
+            fi
+        else
+            echo "could not read $STREAMER_STATION_LIST" >&2
+        fi
+        echo "then: streamer station <url>"
+        ;;
+    forget)
+        rm -f "$STREAMER_PROGRESS"
+        /usr/local/bin/streamer-bootlog "playback position forgotten"
+        echo "playback position forgotten"
+        ;;
+    stop)
+        cliamp stop || true
+        save_state stop "$kind" "$cur"
+        ;;
+    pause|toggle|next|prev)
+        cliamp "$cmd"
+        ;;
+    vol|volume)
+        db=${1:?usage: streamer vol <dB>}
+        case "$db" in -[0-9]*|[0-9]*) ;; *) echo "not a dB value: $db" >&2; exit 2 ;; esac
+        cliamp volume "$db"
+        ;;
+    up|down)
+        n=${1:-3}
+        case "$n" in ''|*[!0-9.]) echo "not a dB amount: $n" >&2; exit 2 ;; esac
+        sign=
+        [ "$cmd" = down ] && sign=-
+        cliamp remote call volume.adjust --params "{\"value\":$sign$n}" --wait >/dev/null
+        ;;
+    save)
+        /usr/local/bin/streamer-booted
+        echo "boot config recorded as known-good"
+        ;;
+    log)
+        journalctl -u streamer-cliamp.service -u streamer-play.service -b --no-pager
+        ;;
+    boots)
+        # The journal is volatile: it only covers the boot you are in. This is
+        # the record that survives a power cut.
+        [ -f "$STREAMER_BOOTLOG" ] && tail -n 20 "$STREAMER_BOOTLOG" || echo "no boot log yet"
+        ;;
+    reload)
+        systemctl restart streamer-cliamp.service streamer-play.service
+        ;;
+    audio)
+        want=${1:-}
+        case "$want" in
+            "")
+                sed -n '/# --- streamer audio begin ---/,/# --- streamer audio end ---/p' \
+                    /boot/firmware/config.txt
+                echo "switch with: streamer audio jack|dac"
+                ;;
+            jack|dac)
+                frag=/etc/streamer/audio-$want.txt
+                [ -f "$frag" ] || { echo "no fragment $frag" >&2; exit 1; }
+                mount -o remount,rw /boot/firmware
+                awk -v f="$frag" '
+                    /^# --- streamer audio begin ---$/ {
+                        print; while ((getline l < f) > 0) print l; skip = 1; next
+                    }
+                    /^# --- streamer audio end ---$/   { skip = 0; print; next }
+                    !skip                              { print }
+                ' /boot/firmware/config.txt >/boot/firmware/config.txt.new
+                mv -f /boot/firmware/config.txt.new /boot/firmware/config.txt
+                sync
+                mount -o remount,ro /boot/firmware 2>/dev/null || true
+                /usr/local/bin/streamer-bootlog "audio output set to $want, rebooting"
+                echo "audio output is now $want; rebooting"
+                systemctl --no-block reboot
+                ;;
+            *)
+                echo "usage: streamer audio [jack|dac]" >&2; exit 2 ;;
+        esac
+        ;;
+    rw)
+        mount -o remount,rw /
+        /usr/local/bin/streamer-bootlog "/ made writable"
+        echo "/ is writable. Undo with: streamer ro"
+        ;;
+    ro)
+        sync
+        mount -o remount,ro /
+        /usr/local/bin/streamer-bootlog "/ made read-only again"
+        echo "/ is read-only"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "unknown command: $cmd" >&2
+        usage >&2
+        exit 2
+        ;;
+esac

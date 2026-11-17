@@ -1,0 +1,29 @@
+#!/bin/sh
+# streamer-bootlog - append one durable line about this boot.
+#
+# The journal on this appliance is deliberately volatile (see
+# /etc/journald.conf.d/streamer.conf): a journal file on /data would be left
+# dirty at exactly the moment a hard power cut happens. So the scripts that run
+# at boot say what they did here instead, one line per event, on the writable
+# partition. It is append-only and kept to the last STREAMER_BOOTLOG_KEEP lines.
+#
+#   streamer-bootlog <one line>
+#
+# It never fails: a streamer script must not die because its logging did.
+set -eu
+
+. /etc/streamer.conf
+
+umask 022
+dir=$(dirname "$STREAMER_BOOTLOG")
+mkdir -p "$dir" 2>/dev/null || true
+
+printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$STREAMER_BOOTLOG" 2>/dev/null ||
+    exit 0
+
+lines=$(wc -l <"$STREAMER_BOOTLOG" 2>/dev/null || echo 0)
+case "$lines" in ''|*[!0-9]*) lines=0 ;; esac
+if [ "$lines" -gt "$STREAMER_BOOTLOG_KEEP" ]; then
+    tail -n "$STREAMER_BOOTLOG_KEEP" "$STREAMER_BOOTLOG" >"$STREAMER_BOOTLOG.tmp" 2>/dev/null &&
+        mv -f "$STREAMER_BOOTLOG.tmp" "$STREAMER_BOOTLOG" || rm -f "$STREAMER_BOOTLOG.tmp"
+fi

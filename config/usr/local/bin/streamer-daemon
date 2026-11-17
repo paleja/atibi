@@ -1,0 +1,23 @@
+#!/bin/sh
+# streamer-daemon - start the cliamp headless daemon.
+# Started by streamer-cliamp.service. Playback is NOT started here: only
+# streamer-play starts audio, which is what makes the floor and the ramp
+# impossible to bypass.
+set -eu
+
+. /etc/streamer.conf
+
+# The pinned ffmpeg the build installed lives in /usr/local/bin, and cliamp
+# needs it for the AAC/Opus/ALAC/HLS streams most internet radio stations use.
+# /data/bin is searched first, so dropping a newer build there (on the writable
+# partition, no remount needed) replaces it:
+#   streamer rw is not needed; scp the binary to /data/bin/ffmpeg instead.
+PATH=/data/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# Start at the boot floor. If anything reaches the speakers before
+# streamer-play runs, it cannot be louder than that.
+exec cliamp --daemon \
+    --vol "$STREAMER_VOL_FLOOR" \
+    --buffer-ms "$STREAMER_BUFFER_MS" \
+    --sample-rate "$STREAMER_SAMPLE_RATE"

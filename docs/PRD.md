@@ -31,16 +31,22 @@ files). The remaining problems to engineer around:
 A reproducible custom Raspberry Pi OS image containing:
 
 - Trimmed Raspberry Pi OS Lite (Debian) base with the boot-time tuning of §6.
-- Read-only root + overlay (§7) — safe to pull the plug at any moment.
+- Read-only root + a separate writable `/data` partition (§7) — safe to pull the
+  plug at any moment.
 - `cliamp` in headless daemon mode, autostarted via systemd, auto-play and
   resume of the last-played source; radio favorites baked into the image.
   No service credentials in the image — providers are logged in on first use
   over SSH (§8.2).
-- Correct audio bring-up for the Pi DAC+ HAT (§5, §6.4).
-- Wired Ethernet only, SSH enabled for maintenance.
-- Image build is scripted (repo-based, e.g. `raspi-imager` customization /
-  unattended post-install script), so a fresh SD card can be rebuilt from
-  this repo.
+- Correct audio bring-up for the IQaudIO Pi-DAC+ HAT (§5, §6.4), with the 3.5mm
+  jack as a build-time alternative and a runtime switch between the two, so the
+  software can be proven before the HAT arrives.
+- Wired Ethernet only, SSH enabled for maintenance, key-only login: no password
+  in the image to guess.
+- Image build is scripted (`image/build.sh`, hash-pinned inputs), so a fresh SD
+  card can be rebuilt from this repo.
+- Maintenance without reflashing: the audio output, the playback target, the
+  volume and the CLIAMP config all live on writable storage, and a newer binary
+  dropped on `/data/bin` takes precedence over the one in the root (§7).
 
 Secondary deliverables: a desktop-side control path (bar widget or script) and
 a maintenance story (config updates without reflashing).
@@ -182,23 +188,35 @@ startup are slower on Cortex-A72.
 - `dtparam=audio=off`, `dtoverlay=vc4-kms-v3d,noaudio`
 
 ### 6.3 Kernel / systemd
-- `cmdline.txt`: `quiet log_level=3`, single line.
-- Mask Bluetooth, CUPS/avahi if unused, `systemd-networkd-wait-online` as a
-  global gate; order the cliamp unit against `network-online.target` itself.
-- No initramfs if booting plain ext4+squashfs directly is viable; otherwise
-  zstd-compressed minimal initramfs.
+- `cmdline.txt`: one line, the stock one, with `resize` stripped and `ro`
+  appended (matches what `streamer-firstboot` puts in fstab). The build script
+  prints the resulting line so it can be eyeballed.
+- Wifi and Bluetooth are turned off in `config.txt` (`dtoverlay=disable-wifi`,
+  `disable-bt`) rather than by masking units: the firmware overlay is cheaper and
+  the kernel modules never appear. The `userconfig.service` symlink (the
+  Raspberry Pi OS first-boot reconfigure job) is removed; the unit file itself is
+  left in place. No `network-online.target` gate — the cliamp unit orders itself
+  against the interfaces it needs.
+- No initramfs work: the image boots plain ext4, which is what the stock image
+  already does. Any boot-time gain from an initramfs rewrite is deferred until
+  after the first measurement.
 - Method: measure with `systemd-analyze critical-chain` (not `blame`), change
   one unit at a time, 5 cold boots per config, report median.
 
-### 6.4 Audio bring-up (Raspberry Pi DAC+ / IQaudIO Pi-DAC+)
-- **Two overlay names for one electrically identical board.** Green
-  Raspberry Pi-branded boards use `dtoverlay=rpi-dacplus`; black
-  IQaudIO-branded stock uses `dtoverlay=iqaudio-dacplus`. Both exist in the
-  kernel overlay catalogue; the EEPROM contents differ, which is what selects
-  between them. Elecom's listing is labelled IQaudIO but carries the Raspberry
-  Pi MPN/EAN, so the branding of the shipped unit is unresolved.
-  **M1 task:** `cat /proc/device-tree/hat/product vendor` on the bench unit and
-  pin the matching overlay in the image rather than relying on auto-detect.
+### 6.4 Audio bring-up (IQaudIO Pi-DAC+, bought)
+- **Board is settled: black IQaudIO Pi-DAC+ (MPN SC2078, elecom.sk, delivered by
+  20.11.2026) → `dtoverlay=iqaudio-dacplus`.** The listing carried the Raspberry
+  Pi MPN/EAN as well, and electrically the two boards are the same PCM5122 part,
+  so `rpi-dacplus` would almost certainly work too. Pinning the IQaudIO overlay
+  is the choice; auto-detect is off anyway (`force_eeprom_read=0`).
+  **Still worth one check on real hardware:**
+  `cat /proc/device-tree/hat/product` to confirm what the EEPROM actually says.
+- The audio output is a **runtime switch**, not a rebuild:
+  `/etc/streamer/audio-{jack,dac}.txt` are spliced by `streamer audio jack|dac`
+  into the `# --- streamer audio begin/end ---` block at the end of
+  `config.txt`, so the jack variant can be converted to the HAT over SSH without
+  reflashing. `build.sh --audio jack|dac` only picks which fragment is live on
+  first boot.
 - `force_eeprom_read=0` + explicit overlay (same rule as before: HAT EEPROM
   misdetection is a documented failure mode, and skipping the firmware 1-wire
   read is also boot-time budget, §6.2).
@@ -207,8 +225,21 @@ startup are slower on Cortex-A72.
   its RCA mute is the headphone-detect switch, not a GPIO amp enable — but if
   the bench unit comes up silent with the card visible in `aplay -l`, that
   parameter is the first thing to try.
-- ALSA default = card 0 via `/etc/asound.conf` (`type hw card 0`), or rely on
-  cliamp's own device selection (`cliamp device ...`).
+- **Output device:** nothing is pinned. The payload ships no `asound.conf` and
+  passes no `audio_device` to cliamp: on this image the device is whatever the
+  system default sink is, which is the 3.5mm jack in the jack build and the
+  PCM512x card in the DAC build, because that is what the overlay in
+  `config.txt` makes it. Pinning card 0 by number is the fragile option — the
+  number depends on probe order — so it stays out unless the default turns out
+  to be wrong on real hardware.
+- **The sound stack is PipeWire + WirePlumber** (confirmed in the base image:
+  both are present), not bare ALSA. That matters for debugging, because there are
+  two volumes in the chain and they are not the same control: PipeWire's own sink
+  volume and mute, and the PCM512x `Digital` control underneath it. A silent
+  output with a visible card can be either one. M1 check on the bench:
+  `wpctl status` / `wpctl inspect <sink>` for the sink PipeWire picked and its
+  volume/mute, then `amixer` for the codec. Only after both are known good is
+  `unmute_amp` worth trying.
 - **Volume path (decided):** all volume via cliamp's dB control so
   `playerctl`/bar panel is the single path; the card's ALSA control (PCM512x
   `Digital`) stays at 0 dB. Default driver behaviour already caps it at 0 dB —
@@ -237,6 +268,20 @@ startup are slower on Cortex-A72.
   position. Bounded, not speaker-abusing. The cost is that the first second or
   two is quiet-to-inaudible at a normal dial position before the ramp — that is
   the trade being accepted, and it is the safe side of it.
+- **The floor is not bypassable, and the ramp target is the saved level, not
+  0 dB** (implemented): `streamer-play` is the only thing that starts audio; it
+  sets `STREAMER_VOL_FLOOR` (−30) with a failure check before playback, then
+  ramps in steps from 1 s after audio starts toward the volume the previous
+  session saved (`volume=` in `/data/streamer/progress`).
+  `STREAMER_VOL_TARGET` (−20) is only the fallback when nothing was saved, and
+  `STREAMER_VOL_MAX` (+6) clamps both ends, so a stale progress file can neither
+  silence the box nor ask for full power. All of it goes through cliamp's dB, so
+  there is still exactly one volume path.
+- **A saved level at or below the floor counts as a parked control, not a
+  preference** (§8.3): the volume control bottoms out at the floor, so replaying
+  it means a permanently inaudible box after the next power cycle. That level is
+  replaced by the configured default, and the substitution is written to
+  `boot.log`. Deliberately quiet is `streamer stop`, which is a different thing.
 - **Pi 5 note:** the IQaudIO/RPi DAC+ driver had a real Pi 5 bug (designware-i2s
   "Missing dma channel", LP #2060240) on non-Raspberry-Pi-OS kernels; it worked
   on Bookworm-based Raspberry Pi OS. Pi 5 stays bench-only (§12.3), so this is
@@ -244,37 +289,89 @@ startup are slower on Cortex-A72.
 
 ## 7. Storage & power-cut safety
 
-- Read-only squashfs/EROFS root + writable overlay (official `raspi-config`
-  overlay FS option is the baseline implementation; a custom EROFS build is the
-  optimization stage).
-- Consequences: no fsck, no journal replay, no SD corruption on cold cut,
-  boot-time win from skipping fsck entirely.
-- Writable content that must survive (lives on the overlay partition):
-  cliamp config (`~/.config/cliamp/`), provider credentials incl.
-  `tidal_credentials.json`, radio favorites, resume-state (what to auto-play,
-  §8.3), recent-play state, logs (tmpfs where possible).
-- Factory reset = wipe overlay partition, reboot → back to first-boot state
-  (providers logged out, defaults restored).
+Architecture as built (the overlayroot/EROFS idea was dropped: it hides which
+partition is writable at exactly the moment you need to know, and it gets
+corruptable itself if the cut lands mid-overlay-writeback):
+
+- **p1** vfat `/boot/firmware`, mounted read-write (it has to be: the firmware
+  reads it). **p2** ext4 `/`, mounted `ro`. **p3** ext4 `/data`, the only
+  writable filesystem with state in it. `build.sh` writes the p3 *partition
+  table entry only*; `streamer-firstboot` grows it to the end of the card, makes
+  the filesystem, seeds `/data/{streamer,bin,cliamp}` and `/data/.ready`,
+  appends `,ro` to the root fstab line and installs the sudoers drop-in, then
+  reboots once.
+- The `/data` fstab entry is derived, not copied: `build.sh` takes the
+  `label-id` from `sfdisk -d`, appends `-03`, and dies if that disagrees with the
+  stock root line (`PARTUUID=<8hex>-02`). It uses `nofail` and fsck fields `0 0`.
+- Writable content that must survive a cut, all on `/data`: cliamp config and
+  credentials (`/data/cliamp`, symlinked from `~/.config/cliamp`), the appliance
+  intent (`/data/streamer/state`: `mode`/`kind`/`target`, written only by the
+  `streamer` command), playback position (`/data/streamer/progress`:
+  `position=`/`index=`/`volume=`, written by `streamer-save` on a 1-minute
+  timer), boot self-healing (`/data/streamer/attempt` + `last-good`) and
+  `/data/streamer/boot.log`.
+- **journald stays deliberately volatile** (`Storage=volatile`,
+  `RuntimeMaxUse=32M` in `/etc/journald.conf.d/streamer.conf`). A durable journal
+  on `/data` would be left dirty at exactly the instant of a hard cut — the one
+  thing this design is supposed to avoid — and journald running before
+  `local-fs.target` cannot reach a `/data` bind mount anyway. The durable record
+  is `boot.log`: one line per event, appended and trimmed by the single writer
+  `streamer-bootlog`, read back with `streamer boots`.
+- **Boot self-healing**: every boot hashes `config.txt` + `cmdline.txt` and
+  counts attempts in `/data/streamer/attempt`. Three failed boots of the same
+  hash roll both files back to the last known-good copy kept in
+  `/data/streamer/last-good`, which `streamer-booted` writes once the player is
+  actually up. So a bad `streamer audio dac` on a box with no screen attached is
+  self-correcting rather than a brick, and the counter resets on the next good
+  boot.
+- Nothing is deleted from the base image that merely looks unused:
+  cloud-init, wifi/bt and the resize units are neutralised by config
+  (`disable-wifi`/`disable-bt` overlays, `resize` stripped from `cmdline.txt`)
+  rather than removed, because a stock unit that turns out to matter is cheaper
+  to keep than to debug. `rpi-resize.service` was verified to be
+  `ExecStart=/usr/bin/true` plus self-disable.
+- **Updating a binary without remounting:** `/usr/local/bin` holds the pinned
+  `cliamp` and `ffmpeg` that came from the image, and the daemon's `PATH` puts
+  `/data/bin` in front of it. So `scp new-ffmpeg pi@streamer.local:/data/bin/`
+  is enough to try a newer one, with the image copy as the fallback, and nothing
+  ever needs `streamer rw` except the rare edit to the root filesystem itself.
+- Factory reset = `mkfs.ext4` p3 (or `streamer forget` + wipe), reboot → back to
+  first-boot state: providers logged out, defaults restored.
 
 ## 8. Player software
 
 `cliamp` (github.com/bjarneo/cliamp), Go TUI player. Key integration facts:
 
 - **Daemon mode**: `cliamp --daemon` — headless, same engine, owns the IPC
-  socket; no tmux/screen needed. Unit: `ExecStart=cliamp --daemon` with
-  resume policy per §8.3.
+  socket; no tmux/screen needed. The unit's `ExecStart` is
+  `/usr/local/bin/streamer-daemon`, a four-line wrapper that pins
+  `--vol "$STREAMER_VOL_FLOOR"`, buffer and sample rate and exports the PATH
+  that finds ffmpeg (§7). It deliberately does **not** start playback: only
+  `streamer-play` does, which is what makes the floor and the ramp
+  unbypassable.
 - **IPC**: newline-delimited JSON over `~/.config/cliamp/cliamp.sock`; verbs
   `play/pause/toggle/next/prev/status --json/volume/seek/load/eq/device`,
-  v2 `remote state|capabilities|events`. This is the integration surface.
+  v2 `remote state|capabilities|events`. This is the integration surface. The
+  socket path is capped at 107 characters, which is why a short config dir can
+  matter (`CLIAMP_CONFIG_DIR`); here the path is `/data/cliamp/cliamp.sock`
+  behind the symlink, comfortably short.
 - **No HTTP frontend.** Player control is socket+MPRIS only. (`cliamp-server`
   is a radio broadcast server, unrelated.)
-- **MPRIS2 on D-Bus** (`org.mpris.MediaPlayer2.cliamp`) → `playerctl` works.
-  Needs a D-Bus session bus in the systemd unit (`User=`,
-  `Type=dbus`/`Restart=` policy TBD).
+- **MPRIS2 on D-Bus** (`org.mpris.MediaPlayer2.cliamp`) is published by the
+  daemon *when a session bus exists*. On this appliance it does not: the daemon
+  is a system service with `User=pi` and no login session, so `playerctl` is
+  not expected to work and nothing in the design depends on it. If it is ever
+  wanted, `DBusSessionMode=up` on `streamer-cliamp.service` is the one-line
+  experiment (PRD §9.2). Control from the desktop goes through the socket.
 
 ### 8.1 Radio
 - Radio Browser directory + custom stations in
-  `~/.config/cliamp/radios.toml`. Favorites baked into the image.
+  `~/.config/cliamp/radios.toml`. Nothing is baked into the image here: the
+  box starts from one default station (`STREAMER_START_TARGET` in
+  `/etc/streamer.conf`, the built-in `https://radio.cliamp.stream/lofi/stream`)
+  and `streamer station <url>` records what you actually want, on `/data`.
+  `streamer stations` reads the built-in list at `STREAMER_STATION_LIST`
+  rather than duplicating it in the image, so the two cannot drift.
 - `yt-dlp` (YouTube/YouTube-Music extras) is **excluded from the Pi 4 image**:
   slow on Cortex-A72, it's the fattest optional dependency (Python stack), and
   it rots on a monthly cadence against a pinned read-only root. Radio, Tidal
@@ -284,11 +381,11 @@ startup are slower on Cortex-A72.
   not eliminate it — **search** runs desktop-side (Omarchy ships yt-dlp, only
   URLs cross the wire), but **playback resolves on the Pi** with the Pi's own
   yt-dlp. If YouTube becomes a requirement: install the official
-  `yt-dlp_linux_aarch64` binary to `~/.local/bin/yt-dlp` on the **overlay
-  partition** (looked up before PATH), self-updatable without touching the
-  read-only root, rather than the stale apt package. Expect multi-second
-  resolution per track on the Pi 4 and accept upstream breakage as a support
-  cost.
+  `yt-dlp_linux_aarch64` binary to `/data/bin/` on the **writable partition**,
+  which `streamer-daemon` already searches before PATH (§7), so it is
+  self-updatable without touching the read-only root — rather than the stale
+  apt package. Expect multi-second resolution per track on the Pi 4 and accept
+  upstream breakage as a support cost.
 
 ### 8.2 Tidal
 - Device-code OAuth (`link.tidal.com`). **Credentials are never part of the
@@ -303,64 +400,144 @@ startup are slower on Cortex-A72.
 - Risk: Tidal periodically revokes shared OAuth client IDs; config supports
   `client_id`/`client_secret` override as escape hatch.
 
-### 8.3 Auto-play & resume policy (decided)
+### 8.3 Auto-play & resume policy (implemented)
 - Requirement: every cold boot resumes what was playing at last power-off —
-  same provider context, station/playlist, shuffle/repeat/volume state.
-  Live stream position is not applicable; for finite tracks/albums, resuming
-  mid-track is best-effort, acceptable to restart the track.
-- Implementation is cliamp-capability-dependent: verify whether session
-  restore is built in (status/state persistence across daemon restarts). If
-  not sufficient, the systemd unit captures `cliamp status --json` on
-  shutdown/hangup (via `ExecStop` or a pre-poweroff hook) and replays it at
-  boot through IPC (`cliamp load` + play). Spike this in M1/M2 — flagged as
-  the main unknown of the software stack.
+  same provider context, station/playlist, volume state. Live stream position is
+  not applicable; for finite tracks/albums, resuming mid-track is best-effort,
+  acceptable to restart the track.
+- cliamp's own resume state (`~/.config/cliamp/resume.json`) is **not** enough:
+  a headless radio start bypasses it (`main.go:113-118`), so the appliance keeps
+  its own two files on `/data` and replays them — `state` for *what* to play,
+  `progress` for *where* it was and at what level.
+- **Resume order matters, and is the one thing that was got wrong in design
+  review:** loading a source parks cliamp on row 0, so the live `index` is only
+  a "something is loaded" gate. What actually restores an album is
+  `queue.play {"index": <saved row>}` and *then*
+  `seek.absolute {"value": <saved position>}`. Seeking before selecting the row,
+  or trusting the live index, plays track one from the top.
 - Volume interacts with the boot floor (§6.4) on purpose: start at −30 dBFS,
-  then apply the resumed session volume a second after audio starts rather than
+  then ramp toward the saved level from a second after audio starts rather than
   instantly, so a power-cut can never produce a full-power first sample even
-  when the saved level was loud. Resume must not bypass the floor.
+  when the saved level was loud. Resume must not, and cannot, bypass the floor.
+- What each boot did is recorded in `/data/streamer/boot.log`, written by the
+  single appender `streamer-bootlog`: an `OK <kind> <target> at N dB (target M)`
+  line or a `FAIL …` line, read back with `streamer boots`. It is also where
+  intent changes and audio-output switches are logged, so the file reads as the
+  box's history rather than only its failures.
 
 ## 9. Control surface
 
-- Day 1: SSH + `cliamp <verb>` IPC commands; `playerctl` over SSH.
-- Day 1 (desktop): Omarchy bar panel `omarchy-remote-cliamp`
-  (github.com/orsa86/omarchy-remote-cliamp) — SSH tunnel to the Pi's cliamp
-  socket; search, transport, volume from the desktop. Requires
-  passwordless SSH from the desktop and cliamp ≥1.63 on the Pi.
-- Later (stretch): thin HTTP→socket bridge (~50 lines, documented v2 protocol
-  in `docs/remote-control.md`) for phone/room control, plus physical power:
-  consider a soft-latch power button or a Wake-on-LAN-style policy instead of a
-  dumb strip. Out of scope for v1.
+### 9.1 On the box (`streamer`, over SSH)
+
+One command, and its own help text is the reference: `streamer help`. The
+groups: transport (`play`/`pause`/`toggle`/`next`/`prev`/`stop`), level
+(`vol <dB>`, `up`/`down <N>`, all going through cliamp's dB — §6.4), what to
+play (`station <url>`, `playlist <name>`, `stations`, `last`, `mode
+last|stop`, `forget`), diagnostics (`status`, `log`, `boots`), maintenance
+(`reload`, `audio [jack|dac]`, `rw`/`ro`, `save`). The privileged ones
+re-run themselves under sudo and say so; the first boot installs the sudoers
+drop-in that makes that passwordless.
+
+### 9.2 From the desktop (day 1)
+
+Omarchy bar panel `omarchy-remote-cliamp`
+(github.com/orsa86/omarchy-remote-cliamp): one `ssh -N -L` tunnel to the Pi's
+cliamp socket, search + transport + volume from the desktop. Requirements:
+passwordless `ssh -o BatchMode=yes` from the desktop, cliamp ≥1.63 on the Pi.
+Two things to set in the widget's entry in `~/.config/omarchy/shell.json`,
+because this image is not a stock pip user install:
+
+```json
+{ "id": "orsa.remote-cliamp",
+  "servers": [ { "label": "streamer", "sshTarget": "pi@streamer.local",
+                 "remoteCliamp": "/usr/local/bin/cliamp" } ] }
+```
+
+- `remoteCliamp`: the panel looks in `~/.local/bin/cliamp` by default; this
+  image keeps the binary at `/usr/local/bin/cliamp` in the read-only root.
+- `remoteSocket`: leave it alone. The panel probes a path relative to the remote
+  home, and `~/.config/cliamp` is a symlink to `/data/cliamp` (§7), so
+  `.config/cliamp/cliamp.sock` resolves. The M1 check is that it does.
+- YouTube search from the panel needs a recent `yt-dlp` **on the Pi**; that is
+  deliberately out of v1 (§8.1) — the panel works without it.
+- The desktop may pull the level to +6 dB, which this box treats as a legal but
+  loud setting; the panel's "urgent above 0 dB" warning is the user's cue.
+
+`playerctl`/MPRIS: cliamp does expose MPRIS when the daemon runs, but that is a
+D-Bus **session** bus thing and this daemon starts from a system unit with no
+login session, so it is not expected to work out of the box. Not a requirement —
+every control above rides the socket — and if MPRIS turns out to be wanted,
+`DBusSessionMode=up` on the unit is the one-line experiment.
+
+### 9.3 Later (stretch)
+
+Thin HTTP→socket bridge (~50 lines, documented v2 protocol in
+`docs/remote-control.md`) for phone/room control, plus physical power: consider
+a soft-latch power button or a Wake-on-LAN-style policy instead of a dumb strip.
+Out of scope for v1.
 
 ## 10. Acceptance criteria
 
-1. Fresh flash → first boot: reaches playing radio station with **≤ 10 s**
+1. Fresh flash → **second** boot reaches a playing source in **≤ 10 s**
    power-on-to-audio (cold boot, measured with a stopwatch at 5V application;
-   log `systemd-analyze` + firmware timestamps as evidence).
+   log `systemd-analyze` + firmware timestamps as evidence). The first boot is
+   excluded by design: it lays out `/data`, makes `/` read-only and reboots
+   (§7), so it is setup, not runtime.
 2. 20 consecutive hard power-cuts (strip off, any moment after boot): 21st
    boot succeeds, **auto-plays the source that was playing before the first
-   cut**, and favorites/credentials are intact.
-3. `cliamp toggle` / `playerctl play-pause` over SSH works from the desktop
-   with no interactive prompts (key auth).
+   cut**, and favorites/credentials are intact. If the saved position cannot be
+   read, the fallback is the saved intent, never silence, and
+   `streamer boots` says which happened.
+3. `streamer toggle` and `cliamp toggle` over SSH work from the desktop with no
+   interactive prompts (key auth), and the bar panel drives the Pi instance.
 4. Bar panel controls the Pi instance (search + transport + volume).
 5. First-boot Tidal login via SSH completes, and the album plays start-to-
-   finish with correct hi-res where the master allows; credentials persist
-   across a reflash of the read-only root.
+   finish with correct hi-res where the master allows; credentials live on
+   `/data`, so they survive any change to the read-only root (a full-card
+   reflash, by contrast, is a factory reset — §7).
 6. Rebuilding the image from this repo by a scripted path reproduces a
    working card on a second SD of the same size.
 7. Boot behavior (§8.3) is deterministic: the same source resumes after every
-   cut, verified over the §10.2 torture sequence.
+   cut, verified over the §10.1 torture sequence.
+8. `streamer audio jack` ↔ `streamer audio dac` changes the audio output on a
+   running box with no reflash, leaves the rest of `config.txt` untouched, and
+   is idempotent: switching to the output already in use changes nothing.
+9. A deliberately broken `config.txt` (a bad audio line) is rolled back to the
+   last known-good copy after three failed boots, and the rollback is visible
+   in `streamer boots`.
+
+### 10.1 Test tiers
+
+These criteria are not all verified the same way, and the distinction matters
+when reading a green result:
+
+- **Script level** (automated, on the build host, no root, no Pi):
+  `tests/appliance-scripts.sh`, eleven scenarios — ramp from the floor, resume at a
+  saved row/position/level, the save round-trip, boot-count rollback, recording
+  a known-good config, `mode=stop`, volume clamped at the ceiling, a player that
+  never comes up, the `streamer` command's reporting, the jack/dac splice, and a
+  saved level parked at the floor.
+  It runs the real scripts with only their paths redirected, against a stand-in
+  for the player's IPC and stubs for `systemctl`/`mount`. Covers criteria 2 (the
+  logic), 7 (the logic), 8 and 9 (the mechanics).
+- **On-device** (M1+): partition layout, `ro` root, systemd ordering, the
+  first-boot grow-and-reboot, real cliamp IPC, timing, dithering, the relay.
+  Nothing in the script suite stands in for these; they are criterion 1, 3, 5, 6
+  and the on-hardware half of 2, 7 and 9.
+- **Torture** (M4): the 20 hard cuts of criterion 2, cut at arbitrary moments
+  including mid-write of the progress file, plus the rollback of criterion 9.
 
 ## 11. Risks & mitigations
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| ≤10s not reached on stock-Debian userspace (Pi 4 SD I/O) | Goal miss | Critical-chain work is incremental; fallback ladder: faster SD → USB3 SSD → custom EROFS/minimal-init image, in that order, before considering Buildroot |
-| Resume-last (§8.3) not natively supported by cliamp | Feature gap | Capture/replay via IPC in systemd unit (designed in §8.3); spike in M1 so the cost is known early |
+| ≤10s not reached on stock-Debian userspace (Pi 4 SD I/O) | Goal miss | Critical-chain work is incremental; fallback ladder: faster SD → USB3 SSD → trimmed userspace, in that order, before considering Buildroot. A2 microSD is the starting point; the SSD is bought only if the first five-boot median misses |
+| Resume-last (§8.3) not natively supported by cliamp | Feature gap | Built and tested here: the appliance keeps its own `state`/`progress` files and replays them through IPC. What M1 still has to confirm is the IPC shape — that `cliamp load <name>` resolves a playlist by name and `queue.play {"index":N}` takes a row number (`cliamp remote call capabilities` lists the parameter hints) |
 | Tidal revokes shared OAuth client IDs | Provider breakage | `client_id`/`client_secret` override in config; re-login path documented; alert on status code in logs |
 | cliamp updates change socket protocol (1.x → 2.x was a breaking change) | Control breakage | Pin cliamp version in image; upgrade deliberately via reflash/overlay update |
-| HAT EEPROM misdetection, or green/black board variant picking the wrong overlay | No audio | `force_eeprom_read=0` + explicit overlay matched to the board after reading `/proc/device-tree/hat` in M1 (§6.4) |
+| HAT EEPROM misdetection | No audio | `force_eeprom_read=0` plus an explicit `dtoverlay=iqaudio-dacplus` matched to the black board bought (§6.4); `/proc/device-tree/hat/product` confirms it on first boot, and `streamer audio jack` is one command away if it is wrong |
 | Ground-loop hum Pi→amp (a 1993 amp bonding the Pi's SMPS earth into its own analog ground) | Audible defect | Quality PSU; test before buying a galvanic isolator; isolate only if present. Note the cheap fix (inline 1:1 transformer) rolls off bass below ~40 Hz, so with full-range speakers the acceptable remedies are a proper isolator or breaking the loop at the PSU/mains side |
-| Overlay partition wear (state/resume writes) | SD wear-out | tmpfs for logs; resume-state written on clean shutdown/power-loss hook, not continuously; image is cheap to replace |
+| `/data` wear from state writes | SD wear-out | State is written on intent change and once a minute by `streamer-save` (a few bytes, ≈4 MB/day worst case); the journal is volatile, so nothing else is written to the card at all (§7) |
 | Loud surprise at power-on: the amp's volume knob is a physical setting that survives a hard power cut | UX / possible speaker damage | Boot volume floor −30 dBFS (§6.4) bounds the worst case at ≤13 W even with the knob at maximum. The amp's own speaker-protection delay closes before the Pi produces audio, so there are no relay-clipped first seconds (§5.2) |
 | cliamp's software volume is undithered truncation, raising the hiss floor at low listening levels | Sound quality | Measured in M1 (§6.4); fallback is the codec's dithered digital volume driven from the same control surface |
 
@@ -376,17 +553,32 @@ startup are slower on Cortex-A72.
 
 ## 13. Milestones
 
-- **M1 — Bench bring-up (Pi 4 + Pi DAC+, stock OS)**: audio out (including
-  resolving the `rpi-dacplus` vs `iqaudio-dacplus` EEPROM/overlay question,
-  §6.4), cliamp daemon, SSH, IPC. Establish baseline boot number. Measure the
-  amp's speaker-relay close time and characterise cliamp's volume implementation
-  (§5.2, §6.4). **Spike: resume-last capability of cliamp (§8.3).**
-- **M2 — Boot tuning (Pi 4)**: §6 applied, overlay FS on, measure to ≤10s;
-  confirm the −30 dBFS boot floor is unobtrusive at the reference dial position
-  and tune the ramp to the resumed level.
-- **M3 — Appliance hardening**: power-cut torture test incl. resume-last,
-  factory-reset, scripted image build, first-boot provider login flow.
-- **M4 — Control**: bar panel wired up; stretch: HTTP bridge.
+- **M0 — Image build (done on the build host, not on a Pi)**: pinned base image,
+  cliamp and ffmpeg fetched and hash-verified, appliance payload installed, boot
+  files patched, both filesystems checked. The payload's logic is covered by
+  `tests/appliance-scripts.sh`, a regression suite that runs the real scripts
+  against a stand-in player and a sandbox for `/data` and `/boot/firmware`.
+  Not covered by it: anything that touches real block devices, systemd, or real
+  cliamp — that is M1.
+- **M1 — Bench bring-up (Pi 4, 3.5mm jack first)**: write the card, let
+  `streamer-firstboot` lay out `/data`, confirm `ro` root and SSH-by-key, and get
+  music out of the jack while the HAT is in the post. Then, on the bench:
+  `cliamp remote call capabilities` to confirm the IPC forms the resume code
+  assumes (§8.3); what `cliamp radio --list` and the station list actually print;
+  whether cliamp's dB is dithered at 16-bit output (§6.4); the −30 dBFS floor and
+  ramp at a reference dial position; the amp's speaker-relay close time
+  (§5.2). Measure the baseline boot number here, before any tuning.
+- **M2 — I2S bring-up (Pi-DAC+, arrives 20.11.2026)**: `streamer audio dac` on
+  the running box (or `build.sh --audio dac` for a fresh card), confirm the HAT
+  in `/proc/device-tree/hat/product` and `aplay -l`, `unmute_amp` only if the
+  card enumerates but is silent, then check the 58×65 mm outline against the case.
+- **M3 — Boot tuning (Pi 4)**: §6 applied, one unit at a time, 5 cold boots per
+  config, median ≤10s; decide SD vs USB SSD on that number (§12.1).
+- **M4 — Appliance hardening**: power-cut torture test incl. resume-last
+  (§10.1), factory reset, the boot-failure rollback on real hardware,
+  first-boot provider login flow.
+- **M5 — Control**: bar panel wired up (`omarchy-remote-cliamp`); stretch: HTTP
+  bridge, `yt-dlp` on `/data` (§8.1).
 
 ## 14. References
 

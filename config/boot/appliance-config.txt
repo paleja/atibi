@@ -1,0 +1,24 @@
+[all]
+
+# --- streamer appliance ---
+# Written by image/build.sh; edit it there, or make your own changes below the
+# streamer audio end marker at the bottom of this file.
+
+# No rainbow screen, no blur: the box has no screen attached.
+disable_splash=1
+
+# Wired Ethernet only, so the wifi and bluetooth stacks have nothing to wait
+# for at boot.
+dtoverlay=disable-wifi
+dtoverlay=disable-bt
+
+# The boot order is fixed in the EEPROM, so skip the I2C read of it: about a
+# second saved on a Pi 4. Remove this line if you ever need to net- or
+# USB-boot this card.
+force_eeprom_read=0
+
+# --- streamer audio begin ---
+# Replaced by `streamer audio jack|dac`. The stock dtparam=audio=on and
+# dtoverlay=vc4-kms-v3d lines above are commented out by image/build.sh, so
+# whatever is here is the whole audio setup.
+# --- streamer audio end ---

@@ -1,0 +1,13 @@
+[Unit]
+Description=Save the playback position once a minute
+Documentation=file:/etc/streamer.conf
+# A hard power cut then costs at most a minute of a local playlist. Live radio
+# is not affected: the station, not the position, is what comes back.
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

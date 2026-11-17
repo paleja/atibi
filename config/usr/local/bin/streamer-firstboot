@@ -1,0 +1,141 @@
+#!/bin/sh
+# streamer-firstboot - one-time provisioning of the data partition.
+#
+# It runs before /data is mounted, which is the only safe moment to lay out a
+# filesystem on the last partition. The image ships that partition as a
+# partition table entry with no filesystem: its real size is only known once
+# the card it was written to is known.
+#
+# In order:
+#   1. grow the last partition to the end of the card, if the card is bigger
+#      than the image the partition table was written from
+#   2. make an ext4 filesystem on it, unless one is already there
+#   3. build the appliance directories, and seed the cliamp config
+#   4. switch the root filesystem to read-only in /etc/fstab, and allow sudo
+#      without a password (the only way in is an SSH key; see docs/PRD.md)
+#   5. write the marker that keeps this script from running again, and reboot
+set -eu
+
+# The kernel command line says ro, and this script has to write /etc/fstab,
+# /etc/sudoers.d and the marker in /etc/streamer. Ask for a writable root
+# instead of hoping something else already did it.
+mount -o remount,rw / || { echo "cannot make the root filesystem writable" >&2; exit 1; }
+
+# /data is named the way fstab names it, which is usually a PARTUUID and not a
+# device name, so translate it before anything tries to use it as a path.
+spec=$(awk '$1 !~ /^#/ && $2 == "/data" {print $1; exit}' /etc/fstab)
+[ -n "$spec" ] || { echo "no /data line in /etc/fstab" >&2; exit 1; }
+case $spec in
+    PARTUUID=*)  DATA_DEV=/dev/disk/by-partuuid/${spec#PARTUUID=} ;;
+    PARTLABEL=*) DATA_DEV=/dev/disk/by-partlabel/${spec#PARTLABEL=} ;;
+    UUID=*)      DATA_DEV=/dev/disk/by-uuid/${spec#UUID=} ;;
+    LABEL=*)     DATA_DEV=/dev/disk/by-label/${spec#LABEL=} ;;
+    /dev/*)      DATA_DEV=$spec ;;
+    *) echo "do not know how to find a partition named $spec" >&2; exit 1 ;;
+esac
+
+# It is a brand-new partition entry: give udev a moment to notice it.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e "$DATA_DEV" ] && break
+    udevadm settle
+    sleep 0.2
+done
+[ -b "$DATA_DEV" ] || { echo "data partition $spec ($DATA_DEV) is missing" >&2; exit 1; }
+DATA_DEV=$(readlink -f "$DATA_DEV")
+
+# mmcblk0p3 and sda3 both say which disk they live on; lsblk is the only tool
+# that knows how the partition suffix is spelled.
+part_name=$(basename "$DATA_DEV")
+DISK=$(lsblk -no PKNAME -n "$DATA_DEV" 2>/dev/null | tr -d ' ')
+[ -n "$DISK" ] || { echo "cannot find the disk holding $DATA_DEV" >&2; exit 1; }
+DISK_DEV="/dev/$DISK"
+[ -b "$DISK_DEV" ] || { echo "data partition is on $DISK_DEV, which is not a block device" >&2; exit 1; }
+PART=${part_name#"$DISK"}
+PART=${PART#p}
+case "$PART" in ''|*[!0-9]*) echo "cannot read the partition number from $part_name" >&2; exit 1 ;; esac
+
+disk_sectors=$(blockdev --getsz "$DISK_DEV")
+part_sectors=$(blockdev --getsz "$DATA_DEV")
+part_start=$(blockdev --getstart "$DATA_DEV")
+
+# A card that is larger than the image this table was written from leaves the
+# last partition short. Everything before it stays where it is.
+avail=$((disk_sectors - part_start))
+if [ "$part_sectors" -lt $((avail - 8192)) ]; then
+    echo "data partition holds $part_sectors of $avail sectors: growing $DISK_DEV p$PART" >&2
+    if ! printf 'start=%s, size=%s, type=83\n' "$part_start" "$avail" |
+            sfdisk -q -f -u=S -N "$PART" "$DISK_DEV"; then
+        # Some sfdisk versions will not take an exact end-of-disk size. The
+        # default size means exactly the same thing: to the end of the device.
+        echo "sfdisk refused size=$avail, asking for the rest of the card instead" >&2
+        printf 'start=%s, type=83\n' "$part_start" |
+            sfdisk -q -f -u=S -N "$PART" "$DISK_DEV"
+    fi
+    udevadm settle
+    part_sectors=$(blockdev --getsz "$DATA_DEV")
+    if [ "$part_sectors" -lt $((avail - 8192)) ]; then
+        echo "still $part_sectors of $avail sectors: carrying on with a small /data" >&2
+    fi
+fi
+
+if [ "$(blkid -o value -s TYPE "$DATA_DEV" 2>/dev/null)" != "ext4" ]; then
+    echo "making ext4 on $DATA_DEV ($part_sectors sectors)" >&2
+    mkfs.ext4 -q -F -L streamer-data -m 0 "$DATA_DEV"
+    udevadm settle
+fi
+
+mnt=/mnt/streamer-data
+mkdir -p "$mnt"
+mount -o noatime "$DATA_DEV" "$mnt"
+trap 'umount "$mnt" 2>/dev/null || true' EXIT INT TERM
+
+mkdir -p "$mnt/streamer" "$mnt/bin" "$mnt/cliamp"
+printf 'provisioned=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$mnt/.ready"
+chmod 2775 "$mnt/streamer"
+chown -R 1000:1000 "$mnt/streamer" "$mnt/cliamp" "$mnt/bin"
+
+if [ ! -f "$mnt/cliamp/config.toml" ]; then
+    # Written once. Everything after that belongs to the user: the Tidal
+    # credentials, the playlists, and cliamp's own state all live on /data.
+    cat >"$mnt/cliamp/config.toml" <<'EOF'
+# cliamp configuration for the streamer appliance. This file is created by
+# streamer-firstboot; edit it, then run `streamer reload` to restart the
+# player. Credentials and history are kept in this directory too.
+
+volume = 0
+
+# The lowest level cliamp will go to, in dB. The appliance starts each boot at
+# the floor in /etc/streamer.conf and ramps up from there.
+volume_min = -50
+EOF
+    chown 1000:1000 "$mnt/cliamp/config.toml"
+fi
+
+umount "$mnt"
+rmdir "$mnt" 2>/dev/null || true
+trap - EXIT INT TERM
+
+# Read-only root from the next boot on, by systemd-remount-fs.service.
+if ! grep -q 'streamer-ro-root' /etc/fstab 2>/dev/null; then
+    sed -i -E 's#^([^ ]+[[:space:]]+/[[:space:]]+ext4[[:space:]]+)([^ ,]+)(.*)#\1\2,ro\3#' /etc/fstab
+    printf '# streamer-ro-root: / is remounted read-only at boot. Undo with\n' >>/etc/fstab
+    printf '#   sudo sed -i s/,ro// /etc/fstab\n' >>/etc/fstab
+fi
+
+# Password-free sudo. There is no password anywhere in this image: SSH is
+# key-only, so anyone who can run sudo already has the key.
+# Group, not user name: the stock first-boot user setup can rename uid 1000, and a
+# name-based rule would stop working the moment it does.
+printf '%%1000 ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/streamer
+chmod 440 /etc/sudoers.d/streamer
+visudo -cf /etc/sudoers.d/streamer
+
+mkdir -p /etc/streamer
+printf 'provisioned=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >/etc/streamer/provisioned
+sync
+blockdev --flushbufs "$DATA_DEV" 2>/dev/null || true
+
+echo "data partition ready: $DATA_DEV" >&2
+echo "rebooting into the read-only appliance" >&2
+systemctl --no-block reboot
+exit 0

@@ -1,0 +1,26 @@
+[Unit]
+Description=cliamp headless player daemon
+Documentation=file:/data/cliamp/cliamp.log
+After=network.target
+RequiresMountsFor=/data
+ConditionPathExists=/data/.ready
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+Environment=HOME=/home/pi
+# System services get no locale from PAM; without this, non-ASCII station and
+# track names come out mangled in the journal.
+Environment=LANG=C.UTF-8
+ExecStart=/usr/local/bin/streamer-daemon
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=streamer-cliamp
+
+[Install]
+WantedBy=streamer.target

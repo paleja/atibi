@@ -1,0 +1,7 @@
+[Unit]
+Description=Music streamer appliance
+# Pulled up by multi-user.target. Both members are gated on /data/.ready,
+# so an incomplete first boot stays silent instead of half-starting.
+
+[Install]
+WantedBy=multi-user.target
