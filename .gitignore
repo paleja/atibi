@@ -1,0 +1,14 @@
+# Everything image/build.sh produces or downloads. None of it belongs in git:
+# .cache/ is 2.9 GB of hash-verified upstream artefacts (the base image, the
+# unpacked raw.img, cliamp, ffmpeg, plus stage/) and it is rebuilt on demand by
+# the pinned hashes in build.sh.
+.cache/
+
+# The finished image goes here, and so do the SSH keypairs build.sh generates
+# with --new-key (output/keys/). The private half of those must never be
+# committed, which is the real reason this entry is not optional.
+output/
+
+# Belt and braces for images written anywhere else in the tree.
+*.img
+*.img.xz
