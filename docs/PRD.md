@@ -165,8 +165,19 @@ startup are slower on Cortex-A72.
 - Radio Browser directory + custom stations in
   `~/.config/cliamp/radios.toml`. Favorites baked into the image.
 - `yt-dlp` (YouTube/YouTube-Music extras) is **excluded from the Pi 4 image**:
-  slow on Cortex-A72 and it's the fattest optional dependency. Revisit only if
-  actually wanted.
+  slow on Cortex-A72, it's the fattest optional dependency (Python stack), and
+  it rots on a monthly cadence against a pinned read-only root. Radio, Tidal
+  and local files need only ffmpeg.
+- Deferred YouTube path, documented here so re-adding it is a decision, not a
+  discovery: the omarchy-remote-cliamp control path splits the work but does
+  not eliminate it — **search** runs desktop-side (Omarchy ships yt-dlp, only
+  URLs cross the wire), but **playback resolves on the Pi** with the Pi's own
+  yt-dlp. If YouTube becomes a requirement: install the official
+  `yt-dlp_linux_aarch64` binary to `~/.local/bin/yt-dlp` on the **overlay
+  partition** (looked up before PATH), self-updatable without touching the
+  read-only root, rather than the stale apt package. Expect multi-second
+  resolution per track on the Pi 4 and accept upstream breakage as a support
+  cost.
 
 ### 8.2 Tidal
 - Device-code OAuth (`link.tidal.com`). **Credentials are never part of the
