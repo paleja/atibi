@@ -42,6 +42,7 @@ JOURNAL = Path("/tmp/opencode/rpi-streamer-mutation.journal")
 PLAY = "config/usr/local/bin/streamer-play"
 CTRL = "config/usr/local/bin/streamer"
 BOOTLOG = "config/usr/local/bin/streamer-bootlog"
+HTTP = "config/usr/local/bin/streamer-http"
 BUILD = "image/build.sh"
 FSTAB_AWK = "image/fstab-ro.awk"
 
@@ -144,6 +145,36 @@ MUTATIONS = [
      'while [ ! -f "$sync_flag" ]; do',
      "while false; do",
      "the warning says the clock is what was missing"),
+
+    # The LAN control server: its guarantees are the token, the scheme guards
+    # around anything that reaches the player or the boot intent, and the fact
+    # that the intent file is only ever written by the streamer command.
+    ("the LAN server lets anyone on the network drive it", HTTP,
+     """    def check_token(self, candidate):
+        return bool(candidate) and hmac.compare_digest(""",
+     """    def check_token(self, candidate):
+        return True or hmac.compare_digest(""",
+     "no token: the API says no"),
+    ("the token is left readable by everyone on the card", HTTP,
+     "os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)",
+     "os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)",
+     "the token file is readable only by its owner"),
+    ("the station guard lets any string become next boot's target", HTTP,
+     'if not target.startswith(("http://", "https://")):',
+     "if False:",
+     "a non-http station target is refused before anything is written"),
+    ("the url.load guard stops checking the scheme", HTTP,
+     'if not url.startswith(("http://", "https://")):',
+     "if False:",
+     "a non-http url.load is refused too"),
+    ("the intent route skips the sanctioned writer", HTTP,
+     'out = run_streamer("station", target)',
+     'out = ""',
+     "the intent file says the new station plays next boot"),
+    ("the build stops checking payload interpreters against the base image", BUILD,
+     'die "$(basename "$script") runs python3, which this base image does not ship: "',
+     'log "$(basename "$script") is probably fine"',
+     "the build cross-checks every unit's interpreter against the base image"),
 
     # fstab-ro.awk is the one program the build runs against a file whose whole
     # job is to keep the root read-only, which is the thing that makes pulling

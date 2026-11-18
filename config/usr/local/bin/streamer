@@ -190,7 +190,7 @@ case "$cmd" in
         echo "it is playing the default station; sign in to Tidal again with: cliamp"
         ;;
     log)
-        journalctl -u streamer-cliamp.service -u streamer-play.service -b --no-pager
+        journalctl -u streamer-cliamp.service -u streamer-play.service -u streamer-http.service -b --no-pager
         ;;
     boots)
         # The journal is volatile: it only covers the boot you are in. This is

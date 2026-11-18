@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""streamer-http - the appliance's LAN control server.
+
+One small HTTP server on the card so a phone or any other computer can drive
+the player without SSH, without a client binary, and without Omarchy: it
+carries its own web page, so the browser is the whole client.
+
+Design rules this file keeps to, and why:
+
+- The server holds no state of its own. Playback facts live in the cliamp
+  daemon (read and written over its IPC socket); boot intent lives in the
+  appliance state file, and is written ONLY by shelling out to `streamer
+  station|playlist|mode`, never by touching the state file directly. That
+  keeps one writer for the file, keeps the durable boot.log entries honest,
+  and keeps the volume floor and ramp of streamer-play impossible to bypass:
+  a boot intent set from the phone goes through exactly the same path as one
+  set over SSH.
+- cliamp IPC version 2, newline-delimited JSON over the daemon's Unix
+  socket: the same protocol the panel widget and `cliamp remote` use. One
+  connection per request under one lock keeps that traffic ordered without
+  needing any reconnect logic, and requests are tiny, so connection churn
+  costs nothing next to a TLS stream start.
+- Everything under /api needs the token. The page itself is plain HTML and
+  needs nothing. With a token in hand the root URL redirects straight to the
+  app with the token in the URL, because typing a 32-character secret on a
+  phone is not a plan; from there the page keeps it in localStorage and
+  sends it as an X-Token header. A cross-site form cannot set a custom
+  header, so the header requirement is also the CSRF defence.
+- Python 3 stdlib only: the card has python3 because RasPiOS Lite ships it,
+  and nothing here may assume a package install on a read-only root.
+
+Environment overrides (used by the test suite; systemd sets none):
+  STREAMER_CONF       where the knobs live   (default /etc/streamer.conf)
+  STREAMER_HTTP_PORT  TCP port               (default streamer.conf, then 8077)
+  STREAMER_HTTP_TOKEN token file path        (default streamer.conf, then <data>/streamer/http.token)
+  STREAMER_CLIAMP_SOCKET  the daemon socket  (default $HOME/.config/cliamp/cliamp.sock)
+  STREAMER_EXECUTABLE the streamer command   (default /usr/local/bin/streamer)
+  STREAMER_HTTP_PIDFILE   write our pid here (test harness only; setsid detaches)
+  STREAMER_HTTP_TEST_NO_LISTEN  print the config and exit 0 (packaging checks)
+"""
+
+import errno
+import hmac
+import http.server
+import json
+import os
+import re
+import secrets
+import socket
+import subprocess
+import sys
+import threading
+import urllib.parse
+
+CONF_PATH_DEFAULT = "/etc/streamer.conf"
+IPC_LOCK = threading.Lock()
+PROVIDERS_CACHE = {"at": 0.0, "data": []}
+
+
+def read_conf(path):
+    """The few key=value lines this server needs. Same file every streamer-*
+    script sources, so the knob set (port, token path) lives in one place."""
+    conf = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"^([A-Z_][A-Z0-9_]*)=(\S+)", line)
+                if m:
+                    conf[m.group(1)] = m.group(2)
+    except FileNotFoundError:
+        pass
+    return conf
+
+
+def expand(value, conf):
+    """streamer.conf uses $STREAMER_DATA inside later values; the shell would
+    expand that when sourcing, here we resolve just that one variable."""
+    return value.replace("$STREAMER_DATA", conf.get("STREAMER_DATA", "/data"))
+
+
+class Config:
+    def __init__(self):
+        conf = read_conf(os.environ.get("STREAMER_CONF", CONF_PATH_DEFAULT))
+        self.port = int(os.environ.get(
+            "STREAMER_HTTP_PORT", conf.get("STREAMER_HTTP_PORT", "8077")))
+        token = os.environ.get("STREAMER_HTTP_TOKEN") or expand(
+            conf.get("STREAMER_HTTP_TOKEN",
+                     "$STREAMER_DATA/streamer/http.token"), conf)
+        self.token_path = token
+        home = os.environ.get("HOME", "")
+        self.socket_path = os.environ.get(
+            "STREAMER_CLIAMP_SOCKET",
+            os.path.join(home, ".config", "cliamp", "cliamp.sock"))
+        self.streamer = os.environ.get("STREAMER_EXECUTABLE",
+                                       "/usr/local/bin/streamer")
+
+    def token(self):
+        """The LAN secret, made once and kept on /data. Printed to the journal
+        the time it is created so the owner can read it off `streamer log`
+        without any client configured yet."""
+        try:
+            with open(self.token_path, encoding="utf-8") as f:
+                return f.read().strip()
+        except FileNotFoundError:
+            pass
+        token = secrets.token_hex(16)
+        os.makedirs(os.path.dirname(self.token_path), exist_ok=True)
+        tmp = self.token_path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(token + "\n")
+        os.replace(tmp, self.token_path)
+        print("http.token created; the control URL is "
+              "http://<this card>:%d/?token=%s" % (self.port, token),
+              flush=True)
+        return token
+
+    def check_token(self, candidate):
+        return bool(candidate) and hmac.compare_digest(
+            candidate, self.token())
+
+
+CFG = Config()
+
+
+# --- cliamp IPC v2 ------------------------------------------------------------
+
+class IpcError(Exception):
+    pass
+
+
+def _recv_line(sock_file):
+    line = sock_file.readline()
+    if not line:
+        raise IpcError("the player closed the connection")
+    return line
+
+
+def ipc(method, params=None, id_hint="h"):
+    """One V2 request/reply, no job waiting: for the reads (state.get,
+    provider.*) whose replies carry the whole answer inline."""
+    req = {"version": 2, "id": id_hint, "method": method}
+    if params is not None:
+        req["params"] = params
+    with IPC_LOCK:
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            s.connect(CFG.socket_path)
+            f = s.makefile("rwb")
+            f.write((json.dumps(req) + "\n").encode())
+            f.flush()
+            while True:
+                reply = json.loads(_recv_line(f))
+                # Only a subscribe pushes unsolicited events, and this server
+                # never subscribes; matching the id anyway costs nothing and
+                # keeps a stray frame from being read as an answer.
+                if reply.get("id") == id_hint:
+                    return reply
+        except (OSError, ValueError) as exc:
+            raise IpcError(str(exc)) from exc
+        finally:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def _job_wait(job, hint_base):
+    """operation.submit answers with a job that may still be running. Poll it
+    the way `cliamp remote call --wait` does: slow is fine (a Tidal playlist
+    load is exactly the case), silent failure is not."""
+    final = {"succeeded", "failed", "canceled"}
+    tries = 0
+    while job.get("state") not in final:
+        tries += 1
+        if tries > 40:  # 40 * 0.5 s = 20 s, then the caller gets an error
+            raise IpcError("job %s did not finish in time" % job.get("id"))
+        reply = ipc("job.get", {"job_id": job["id"]}, id_hint=hint_base + ".j%d" % tries)
+        if not reply.get("ok"):
+            raise IpcError(reply.get("error", "job vanished"))
+        job = reply.get("job", job)
+    return job
+
+
+def ipc_op(operation, params=None):
+    """One V2 operation, waited. Returns the job's result, or raises."""
+    req_params = params if params is not None else {}
+    reply = ipc("operation.submit",
+                {"operation": operation, "params": req_params}, id_hint="h")
+    if not reply.get("ok"):
+        raise IpcError(reply.get("error", "operation refused"))
+    job = _job_wait(reply.get("job", {}), "h")
+    if job.get("state") != "succeeded":
+        detail = job.get("result", {}).get("detail") or job["state"]
+        raise IpcError("%s: %s" % (operation, detail))
+    return job.get("result", {})
+
+
+# --- the appliance side: boot intent goes through streamer, never around it ---
+
+def run_streamer(*args):
+    try:
+        out = subprocess.run([CFG.streamer, *args], capture_output=True,
+                             text=True, timeout=30)
+    except OSError as exc:
+        raise IpcError("streamer: %s" % exc) from exc
+    if out.returncode != 0:
+        raise IpcError((out.stderr or out.stdout or "streamer failed").strip())
+    return (out.stdout or "").strip()
+
+
+def read_intent():
+    state_path = None
+    conf = read_conf(os.environ.get("STREAMER_CONF", CONF_PATH_DEFAULT))
+    data = conf.get("STREAMER_DATA", "/data")
+    state_path = conf.get("STREAMER_STATE", data + "/streamer/state")
+    state_path = state_path.replace("$STREAMER_DATA", data)
+    intent = {"mode": "", "kind": "", "target": ""}
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            for line in f:
+                k, _, v = line.strip().partition("=")
+                if k in intent:
+                    intent[k] = v
+    except FileNotFoundError:
+        pass
+    return intent
+
+
+# --- HTTP ---------------------------------------------------------------------
+
+TRANSPORT_OPS = {"play", "pause", "toggle", "next", "prev", "stop"}
+MODE_OPS = {"shuffle", "repeat"}
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "streamer-http/1"
+
+    def log_message(self, fmt, *args):
+        print("%s %s" % (self.address_string(), fmt % args), flush=True)
+
+    # -- helpers --
+
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json_out(self, obj, code=200):
+        self._send(code, json.dumps(obj, separators=(",", ":")))
+
+    def _authorized(self):
+        given = self.headers.get("X-Token", "")
+        if not given:
+            given = urllib.parse.urlparse(self.path).query
+            given = urllib.parse.parse_qs(given).get("token", [""])[0]
+        return CFG.check_token(given)
+
+    def _body(self):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length else b""
+        try:
+            return json.loads(raw or b"{}")
+        except ValueError:
+            return {}
+
+    # -- routes --
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path, query = parsed.path, urllib.parse.parse_qs(parsed.query)
+        if path == "/":
+            token = query.get("token", [""])[0]
+            if token and CFG.check_token(token):
+                # A 302 with no body: Location goes out before _send ends the
+                # headers, because end_headers must run exactly once.
+                self.send_response(302)
+                self.send_header("Location", "/app?token=" + token)
+                self.send_header("Content-Length", "0")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+            self._send(200, PAGE, "text/html; charset=utf-8")
+            return
+        if not self._authorized():
+            self._json_out({"ok": False, "error": "unauthorized"}, 401)
+            return
+        try:
+            self._route_get(path, query)
+        except IpcError as exc:
+            self._json_out({"ok": False, "error": str(exc)}, 502)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path, query = parsed.path, urllib.parse.parse_qs(parsed.query)
+        if not self._authorized():
+            self._json_out({"ok": False, "error": "unauthorized"}, 401)
+            return
+        body = self._body()
+        try:
+            self._route_post(path, body)
+        except IpcError as exc:
+            self._json_out({"ok": False, "error": str(exc)}, 502)
+
+    def _route_get(self, path, query):
+        if path in ("/app", "/app/"):
+            self._send(200, PAGE, "text/html; charset=utf-8")
+            return
+        if path == "/api/status":
+            snap = ipc("state.get").get("snapshot", {})
+            keep = ("state", "track", "logical_track", "position", "duration",
+                    "seekable", "volume", "playlist", "index", "total",
+                    "shuffle", "repeat", "stream_error")
+            out = {k: snap[k] for k in keep if k in snap}
+            out["intent"] = read_intent()
+            self._json_out({"ok": True, **out})
+            return
+        if path == "/api/providers":
+            self._json_out({"ok": True,
+                            "providers": self._providers(),
+                            "intent": read_intent()})
+            return
+        if path == "/api/playlists":
+            provider = query.get("provider", [""])[0]
+            if not provider:
+                self._json_out({"ok": False, "error": "provider= required"}, 400)
+                return
+            res = ipc("operation.submit",
+                      {"operation": "provider.playlists",
+                       "params": {"provider": provider, "limit": 100}},
+                      id_hint="h")
+            job = _job_wait(res.get("job", {}), "h")
+            items = job.get("result", {}).get("playlists", [])
+            self._json_out({"ok": True, "playlists": items})
+            return
+        if path == "/api/search":
+            provider = query.get("provider", [""])[0]
+            q = query.get("q", [""])[0]
+            if not provider or not q:
+                self._json_out({"ok": False, "error": "provider= and q= required"}, 400)
+                return
+            res = ipc("operation.submit",
+                      {"operation": "provider.search",
+                       "params": {"provider": provider, "query": q,
+                                  "limit": 30}},
+                      id_hint="h")
+            job = _job_wait(res.get("job", {}), "h")
+            tracks = job.get("result", {}).get("tracks", [])
+            self._json_out({"ok": True, "tracks": tracks})
+            return
+        if path == "/api/queue":
+            res = ipc("operation.submit",
+                      {"operation": "queue.list", "params": {"limit": 200}},
+                      id_hint="h")
+            job = _job_wait(res.get("job", {}), "h")
+            self._json_out({"ok": True,
+                            "tracks": job.get("result", {}).get("tracks", [])})
+            return
+        self._json_out({"ok": False, "error": "not found"}, 404)
+
+    def _route_post(self, path, body):
+        if path == "/api/op/shuffle":
+            self._json_out(self._op("shuffle", {"name": body.get("name", "toggle")}))
+            return
+        if path == "/api/op/repeat":
+            self._json_out(self._op("repeat", {"name": body.get("name", "cycle")}))
+            return
+        if path in {"/api/op/" + op for op in TRANSPORT_OPS}:
+            self._json_out(self._op(path.rsplit("/", 1)[1], {}))
+            return
+        if path == "/api/op/volume":
+            try:
+                db = float(body.get("value"))
+            except (TypeError, ValueError):
+                self._json_out({"ok": False, "error": "value must be a dB number"}, 400)
+                return
+            self._json_out(self._op("volume", {"value": db}))
+            return
+        if path == "/api/op/seek":
+            try:
+                where = float(body.get("value"))
+            except (TypeError, ValueError):
+                self._json_out({"ok": False, "error": "value must be seconds"}, 400)
+                return
+            self._json_out(self._op("seek.absolute", {"value": where}))
+            return
+        if path == "/api/load/playlist":
+            provider = str(body.get("provider", ""))
+            pid = str(body.get("id", ""))
+            if not provider or not pid:
+                self._json_out({"ok": False, "error": "provider and id required"}, 400)
+                return
+            ipc_op("provider.load", {"provider": provider, "playlist": pid})
+            self._json_out({"ok": True})
+            return
+        if path == "/api/load/url":
+            url = str(body.get("url", ""))
+            if not url.startswith(("http://", "https://")):
+                self._json_out({"ok": False,
+                                "error": "url must be http(s)"}, 400)
+                return
+            ipc_op("url.load", {"path": url, "play": True})
+            self._json_out({"ok": True})
+            return
+        if path == "/api/play":
+            track = body.get("track")
+            if not isinstance(track, dict):
+                self._json_out({"ok": False, "error": "track object required"}, 400)
+                return
+            ipc_op("track.play", {"track": track})
+            self._json_out({"ok": True})
+            return
+        if path == "/api/intent":
+            # Straight to the streamer command: the only sanctioned writer of
+            # the intent file, sudo escalation and boot.log entry included.
+            kind = body.get("kind")
+            target = str(body.get("target", ""))
+            if kind == "station":
+                if not target.startswith(("http://", "https://")):
+                    self._json_out({"ok": False,
+                                    "error": "station target must be http(s)"}, 400)
+                    return
+                out = run_streamer("station", target)
+            elif kind == "playlist":
+                if not target:
+                    self._json_out({"ok": False, "error": "playlist name required"}, 400)
+                    return
+                out = run_streamer("playlist", target)
+            elif kind == "mode":
+                if target not in ("last", "stop"):
+                    self._json_out({"ok": False, "error": "mode last|stop"}, 400)
+                    return
+                out = run_streamer("mode", target)
+            else:
+                self._json_out({"ok": False,
+                                "error": "kind station|playlist|mode required"}, 400)
+                return
+            self._json_out({"ok": True, "streamer": out,
+                            "intent": read_intent()})
+            return
+        self._json_out({"ok": False, "error": "not found"}, 404)
+
+    @staticmethod
+    def _op(operation, params):
+        ipc_op(operation, params)
+        return {"ok": True}
+
+    @staticmethod
+    def _providers():
+        import time
+        now = time.monotonic()
+        if now - PROVIDERS_CACHE["at"] < 15 or not PROVIDERS_CACHE["data"]:
+            res = ipc("operation.submit",
+                      {"operation": "provider.list", "params": {}}, id_hint="h")
+            job = _job_wait(res.get("job", {}), "h")
+            PROVIDERS_CACHE["at"] = now
+            PROVIDERS_CACHE["data"] = job.get("result", {}).get("providers", [])
+        return PROVIDERS_CACHE["data"]
+
+
+PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>streamer</title>
+<style>
+:root{color-scheme:dark;--bg:#101418;--card:#1a2028;--fg:#dde3ea;--dim:#7f8b99;
+--acc:#4ec9a0;--bad:#e2655f}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:16px/1.4 system-ui,sans-serif;padding-bottom:env(safe-area-inset-bottom)}
+main{max-width:560px;margin:0 auto;padding:12px}
+.card{background:var(--card);border-radius:12px;padding:14px;margin-bottom:12px}
+h1{font-size:15px;margin:0 0 6px;color:var(--dim);font-weight:600}
+.title{font-size:20px;font-weight:650;min-height:28px}
+.sub{color:var(--dim);font-size:14px;min-height:20px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+button{background:#243040;border:0;color:var(--fg);border-radius:10px;
+padding:12px 14px;font-size:16px;cursor:pointer}
+button:active{background:#2e3c50}
+button.big{font-size:26px;flex:1;padding:16px}
+input[type=range]{flex:1;accent-color:var(--acc)}
+.tabs{display:flex;gap:8px;margin-bottom:12px}
+.tabs button{flex:1}
+.tabs button.on{background:var(--acc);color:#08110c}
+ul{list-style:none;margin:0;padding:0}
+li{display:flex;justify-content:space-between;gap:10px;align-items:center;
+padding:10px 4px;border-bottom:1px solid #232b35}
+li .what{min-width:0}
+li b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+li small{color:var(--dim)}
+.dim{color:var(--dim)}
+.err{color:var(--bad);min-height:20px;font-size:14px}
+.bar{height:4px;background:#232b35;border-radius:2px;margin:8px 0}
+.bar i{display:block;height:4px;background:var(--acc);border-radius:2px}
+select,input[type=search]{background:#243040;border:0;color:var(--fg);
+border-radius:10px;padding:12px;font-size:16px;flex:1}
+.hidden{display:none}
+a{color:var(--acc)}
+</style></head><body><main>
+<div class="card">
+ <div class="title" id="t">…</div>
+ <div class="sub" id="s"></div>
+ <div class="bar"><i id="p" style="width:0"></i></div>
+ <div class="row">
+  <button class="big" onclick="op('prev')">⏮</button>
+  <button class="big" id="pp" onclick="op('toggle')">⏯</button>
+  <button class="big" onclick="op('next')">⏭</button>
+ </div>
+ <div class="row" style="margin-top:10px">
+  <span class="dim">vol</span>
+  <input type="range" id="v" min="-50" max="0" step="1" onchange="setVol()">
+  <span id="vd" class="dim"></span>
+ </div>
+ <div class="row" style="margin-top:8px">
+  <button onclick="op('shuffle')">shuffle</button>
+  <button onclick="op('repeat')">repeat</button>
+  <button onclick="intentMode()">boot: <span id="mode">?</span></button>
+ </div>
+ <div class="err" id="err"></div>
+</div>
+
+<div class="tabs">
+ <button id="tab-now" class="on" onclick="tab('now')">playing</button>
+ <button id="tab-browse" onclick="tab('browse')">browse</button>
+</div>
+
+<div id="now" class="card">
+ <h1>boot station</h1>
+ <div id="intent" class="sub"></div>
+ <div class="row" style="margin-top:8px">
+  <button onclick="intentStation()">use current stream as boot station</button>
+ </div>
+ <h1 style="margin-top:14px">queue</h1>
+ <ul id="queue"></ul>
+</div>
+
+<div id="browse" class="hidden">
+ <div class="card">
+  <h1>source</h1>
+  <div class="row">
+   <select id="prov" onchange="provChanged()"></select>
+  </div>
+  <div class="row" style="margin-top:8px">
+   <input type="search" id="q" placeholder="search this source">
+   <button onclick="doSearch()">search</button>
+  </div>
+  <div class="dim" style="margin-top:6px">lists load now; search rows play one track or album.</div>
+ </div>
+ <div class="card"><h1>lists</h1><ul id="lists"></ul></div>
+ <div class="card hidden" id="results-card"><h1>results</h1><ul id="results"></ul></div>
+</div>
+</main><script>
+let TOKEN=new URLSearchParams(location.search).get('token')||localStorage.getItem('streamer-token')||'';
+if(new URLSearchParams(location.search).get('token'))localStorage.setItem('streamer-token',TOKEN);
+if(!TOKEN)TOKEN=prompt('card token (from: sudo cat /data/streamer/http.token)')||'';
+let playing=false,tick=0,pos=0,dur=0,timer=null;
+const $=id=>document.getElementById(id);
+async function api(path,body){
+  const opt=body?{method:'POST',headers:{'Content-Type':'application/json','X-Token':TOKEN},body:JSON.stringify(body)}
+                 :{headers:{'X-Token':TOKEN}};
+  const r=await fetch(path,opt);
+  if(r.status===401){TOKEN=prompt('card token rejected, re-enter')||TOKEN;localStorage.setItem('streamer-token',TOKEN);}
+  return r.json();
+}
+function fail(m){$('err').textContent=m||'';if(m)setTimeout(()=>{if($('err').textContent==m)$('err').textContent=''},6000);}
+function op(name){api('/api/op/'+name,{}).then(d=>{if(!d.ok)fail(d.error);poll();});}
+function setVol(){api('/api/op/volume',{value:Number($('v').value)}).then(d=>{if(!d.ok)fail(d.error);poll();});}
+function render(s){
+  const t=s.track||s.logical_track||{};
+  $('t').textContent=t.title||'nothing playing';
+  $('s').textContent=[t.artist,t.station&&('· '+t.station),s.playlist&&('· '+s.playlist)].filter(Boolean).join(' ');
+  playing=s.state==='playing';$('pp').textContent=playing?'⏸':'▶';
+  pos=s.position||0;dur=s.duration||0;
+  $('vd').textContent=(s.volume===undefined?'':s.volume+' dB');
+  if(document.activeElement!==$('v')&&s.volume!==undefined)$('v').value=Math.max(-50,Math.min(0,Math.round(s.volume)));
+  const m=s.intent||{};$('mode').textContent=m.mode||'last';
+  $('intent').textContent=(m.kind==='playlist'?'playlist: ':'')+ (m.target||'(default)');
+}
+function paintBar(){if(dur>0)$('p').style.width=Math.min(100,100*tick/dur)+'%';}
+async function poll(){
+  if(document.hidden)return;
+  const d=await api('/api/status');if(!d.ok&&d.error)fail(d.error);else{render(d);tick=d.position||0;}
+}
+setInterval(()=>{if(playing){tick+=0.5;paintBar();}},500);
+timer=setInterval(poll,2000);poll();
+function tab(name){
+  for(const t of['now','browse']){$('tab-'+t).classList.toggle('on',t===name);$(t).classList.toggle('hidden',t!==name);}
+  if(name==='browse')loadProviders();
+  if(name==='now')loadQueue();
+}
+async function loadProviders(){
+  const d=await api('/api/providers');if(!d.ok){fail(d.error);return;}
+  const sel=$('prov');const cur=sel.value;
+  sel.innerHTML='';
+  for(const p of d.providers){const o=document.createElement('option');o.value=p.key;o.textContent=p.name;sel.append(o);}
+  if(cur)sel.value=cur;
+  loadLists();
+}
+async function loadLists(){
+  const d=await api('/api/playlists?provider='+encodeURIComponent($('prov').value));
+  const ul=$('lists');ul.innerHTML='';
+  if(!d.ok){fail(d.error);return}
+  for(const p of d.playlists){
+    const li=document.createElement('li');
+    li.innerHTML=`<div class="what"><b></b><small></small></div>`;
+    li.querySelector('b').textContent=p.name;
+    li.querySelector('small').textContent=[p.section,p.track_count!==undefined?p.track_count+' tracks':''].filter(Boolean).join(' · ');
+    const b=document.createElement('button');b.textContent='play';
+    b.onclick=()=>api('/api/load/playlist',{provider:$('prov').value,id:p.id}).then(r=>{if(!r.ok)fail(r.error);tab('now');});
+    li.append(b);ul.append(li);
+  }
+}
+function provChanged(){loadLists();}
+async function doSearch(){
+  const q=$('q').value.trim();if(!q)return;
+  const d=await api('/api/search?provider='+encodeURIComponent($('prov').value)+'&q='+encodeURIComponent(q));
+  const ul=$('results');ul.innerHTML='';$('results-card').classList.remove('hidden');
+  if(!d.ok){fail(d.error);return}
+  for(const t of d.tracks){
+    const li=document.createElement('li');
+    li.innerHTML=`<div class="what"><b></b><small></small></div>`;
+    li.querySelector('b').textContent=t.title;
+    li.querySelector('small').textContent=[t.artist,t.album].filter(Boolean).join(' · ');
+    const b=document.createElement('button');b.textContent='play';
+    b.onclick=()=>api('/api/play',{track:t}).then(r=>{if(!r.ok)fail(r.error);tab('now');});
+    li.append(b);ul.append(li);
+  }
+}
+async function loadQueue(){
+  const d=await api('/api/queue');const ul=$('queue');ul.innerHTML='';
+  if(!d.ok)return;
+  for(const t of d.tracks.slice(0,30)){
+    const li=document.createElement('li');
+    li.innerHTML=`<div class="what"><b></b><small></small></div>`;
+    li.querySelector('b').textContent=t.title||t.path||'';
+    li.querySelector('small').textContent=[t.artist,t.station].filter(Boolean).join(' · ');
+    ul.append(li);
+  }
+}
+function intentStation(){
+  api('/api/status').then(s=>{
+    const t=s.logical_track||s.track||{};
+    if(!t.path){fail('nothing playing that has a URL');return;}
+    api('/api/intent',{kind:'station',target:t.path}).then(r=>{if(!r.ok)fail(r.error);poll();});
+  });
+}
+function intentMode(){
+  api('/api/status').then(s=>{
+    const m=(s.intent&&s.intent.mode)==='stop'?'last':'stop';
+    api('/api/intent',{kind:'mode',target:m}).then(r=>{if(!r.ok)fail(r.error);poll();});
+  });
+}
+loadQueue();
+</script></body></html>
+"""
+
+
+def main():
+    if pidfile := os.environ.get("STREAMER_HTTP_PIDFILE"):
+        # setsid detaches this process from whoever started it, and a detached
+        # process is only killable by the person who knows its pid. The test
+        # harness asks for one; systemd never sets this knob.
+        with open(pidfile, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()) + "\n")
+    if os.environ.get("STREAMER_HTTP_TEST_NO_LISTEN"):
+        print("port=%d token=%s socket=%s streamer=%s" %
+              (CFG.port, CFG.token_path, CFG.socket_path, CFG.streamer))
+        return 0
+    CFG.token()   # makes the token on the first run, and says so in the journal
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", CFG.port), Handler)
+    print("streamer-http: token-guarded, on :%d, player socket %s" %
+          (CFG.port, CFG.socket_path), flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

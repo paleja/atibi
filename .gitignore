@@ -4,6 +4,9 @@
 # the pinned hashes in build.sh.
 .cache/
 
+# Keys
+.env/
+
 # The finished image goes here, and so do the SSH keypairs build.sh generates
 # with --new-key (output/keys/). The private half of those must never be
 # committed, which is the real reason this entry is not optional.
@@ -12,3 +15,6 @@ output/
 # Belt and braces for images written anywhere else in the tree.
 *.img
 *.img.xz
+
+# Python cache
+__pycache__

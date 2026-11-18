@@ -43,7 +43,8 @@ boot.
     and the ramp, where the state files live, and the user and group that own
     them
   - `etc/systemd/system/` — the units: the player daemon, the boot-time play, the
-    position-save timer, and the target that ties them together
+    position-save timer, the LAN control server, and the target that ties them
+    together
   - `etc/streamer/audio-{jack,dac}.txt` — the two audio setups (3.5mm jack, I2S
     DAC HAT); `streamer audio jack|dac` swaps one into `config.txt`
   - `boot/appliance-config.txt` — the block appended to `/boot/firmware/config.txt`
@@ -52,6 +53,10 @@ boot.
     boot-time play, and the position save
   - `usr/local/bin/streamer-bootlog` — one durable line per event; it is the only
     record that outlives a power cut
+  - `usr/local/bin/streamer-http` — the LAN control server: a token-guarded
+    HTTP API and a phone-sized web page on port 8077, talking to the player
+    over its own IPC socket. Boot intent still only ever goes through the
+    `streamer` command, so the floor, the ramp and boot.log stay unavoidable
 
   Things `build.sh` writes into the root itself, so they have no file here: the
   `/etc/fstab` changes (read-only root and boot partition, plus a `/data` line
@@ -60,7 +65,7 @@ boot.
   volatile, on purpose), the hostname and timezone if you ask for them, the SSH
   `authorized_keys`, a fresh machine-id and SSH host keys for this build, and the
   `systemctl enable` symlinks for the units above.
-- `tests/appliance-scripts.sh` — the regression suite for those scripts: fifteen
+- `tests/appliance-scripts.sh` — the regression suite for those scripts: seventeen
   scenarios, each one asserting rather than merely running. It checks the
   boot-time ramp from the floor (including that the floor is set before the
   player is told to make a sound), resuming at a saved row and position and
@@ -70,17 +75,19 @@ boot.
   moved mid-ramp), the jack/dac switch leaving the rest of `config.txt` alone,
   the `streamer` command's reporting, the factory reset, the packaging
   (every script that systemd starts names its interpreter, and every unit points
-  at a file that exists), and the image recipe itself: the real `sfdisk`,
-  `mkfs.ext4 -d`, `e2fsck`, `tune2fs`, `blkid`, `dumpe2fs` and `dd`, run without
-  root on an image file, plus the fstab editor run against a real fstab. No root,
-  no Pi and no real cliamp: a stand-in covers the parts of the player the scripts
-  talk to, and a sandbox stands in for `/data` and `/boot/firmware`. The scripts
-  under test are the real ones, only their paths are redirected. The verdict is
-  the last line, `N checks, M failed`, and the exit status;
-  `bash tests/appliance-scripts.sh` runs all of them, or pass scenario numbers to
-  run a few.
+  at a file that exists), the LAN control server (token-guarded, browsing and
+  searching providers through the player's own socket, and writing boot intent
+  only through the `streamer` command), and the image recipe itself: the real
+  `sfdisk`, `mkfs.ext4 -d`, `e2fsck`, `tune2fs`, `blkid`, `dumpe2fs` and `dd`,
+  run without root on an image file, plus the fstab editor run against a real
+  fstab. No root, no Pi and no real cliamp: a stand-in covers the parts of the
+  player the scripts talk to, and a sandbox stands in for `/data` and
+  `/boot/firmware`. The scripts under test are the real ones, only their paths
+  are redirected. The verdict is the last line, `N checks, M failed`, and the
+  exit status; `bash tests/appliance-scripts.sh` runs all of them, or pass
+  scenario numbers to run a few.
 - `tests/mutation-check.py` — the test of the tests. It deliberately breaks one
-  shipped behaviour at a time (twenty-one of them) and requires the suite to go
+  shipped behaviour at a time (twenty-nine of them) and requires the suite to go
   red on the check that cares about that behaviour; anything it misses is a check
   that looks meaningful and is not. `python3 tests/mutation-check.py`, a few
   minutes, and it restores every file it touched even if a scenario hangs.
@@ -142,3 +149,14 @@ so a hard power cut never wakes an amp at full volume, resuming whatever was
 playing when the power was last pulled. `streamer reset --yes` wipes `/data` and
 puts back exactly the tree the card shipped with, which is the same tree a fresh
 card starts from; it stops the player first and asks you to mean it.
+
+The card also serves a control page to anything on the LAN: open
+`http://streamer.local:8077/` and the page asks for the token. The token is made
+once, kept at `/data/streamer/http.token` (owner-readable only), and printed to
+the journal exactly the one time it is created, so `streamer log` shows the full
+signed-in URL (`?token=...`) for the first phone that connects. From that page:
+transport, volume, shuffle and repeat, the queue, the radio list, and browsing,
+playlists and search on every provider the player has, Tidal included. Changing
+what plays at next boot (station, playlist, mode) goes through the same
+`streamer` commands as over SSH, so the volume floor and ramp apply no matter
+who asked.

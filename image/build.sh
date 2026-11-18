@@ -565,6 +565,25 @@ for script in "$CONFIG"/usr/local/bin/*; do
 done
 install -m 755 "$CLIAMP" "$R/usr/local/bin/cliamp"
 install -m 755 "$FFMPEG" "$R/usr/local/bin/ffmpeg"
+# A unit that names an interpreter the base image does not ship comes up as
+# 203/EXEC, which on this box is a silent speaker and one journal line. The
+# payload's scripts all name /bin/sh except the HTTP control server, which is
+# python3, so the card has to have python3. RasPiOS Lite happens to ship it;
+# "happens to" is exactly what a build check exists to turn into a fact.
+for script in "$R"/usr/local/bin/*; do
+    shebang=$(head -1 "$script")
+    case $shebang in
+        "#!/bin/sh")
+            [ -x "$R/bin/sh" ] ||
+                die "$(basename "$script") wants /bin/sh and the base image has none" ;;
+        "#!/usr/bin/env python3")
+            [ -x "$R/usr/bin/python3" ] ||
+                die "$(basename "$script") runs python3, which this base image does not ship: "
+                    "the HTTP control server cannot start" ;;
+        *)
+            die "$(basename "$script") names an unexpected interpreter: $shebang" ;;
+    esac
+done
 # The factory-reset template, the same directories the filesystem above was
 # made from. It sits on the read-only root, owned by the appliance user, so that
 # `cp -a` of it onto /data lands with the ownership the player needs. The path
@@ -587,6 +606,7 @@ enable() { # enable <unit> <target>
 enable streamer.target         multi-user.target
 enable streamer-cliamp.service streamer.target
 enable streamer-play.service   streamer.target
+enable streamer-http.service   streamer.target
 enable streamer-save.timer     timers.target
 
 # Stock Raspberry Pi OS leaves ssh switched off unless a /boot/firmware/ssh

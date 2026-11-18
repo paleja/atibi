@@ -45,6 +45,8 @@ ck_in() { # ck_in <label> <file> <fixed text>
 ck_not() { # ck_not <label> <file> <fixed text>
     if grep -qF -- "$3" "$2" 2>/dev/null; then bad "$1 ('$3' is present)";
     else good "$1"; fi; }
+ck_has() { # ck_has <label> <string> <fixed text>: ck_in for values, not files
+    case "$2" in *"$3"*) good "$1";; *) bad "$1 (no '$3' in: $(printf '%s' "$2" | head -c 120))";; esac; }
 jnum() { # jnum <key>: number for that key in the stand-in player's state.
          # Normalised because the stub stores JSON floats: -20.0 and -20 are the
          # same level, and a check should not be about the spelling.
@@ -304,7 +306,7 @@ sandbox() { # sandbox <script name>
         "$CFG/usr/local/bin/$1" >"$T/$1"
     chmod +x "$T/$1"
 }
-for s in streamer-bootlog streamer-play streamer-save streamer; do
+for s in streamer-bootlog streamer-play streamer-save streamer streamer-http; do
     sandbox "$s"
 done
 
@@ -363,7 +365,86 @@ socket_off() {
     return 0
 }
 # Whatever a scenario forgets, the fake player must not outlive the harness.
-trap 'socket_off' EXIT
+trap 'socket_off; ipc_off; http_stop' EXIT
+
+# --- the LAN server's stand-ins (scenario 17) --------------------------------
+# The real daemon's socket protocol, faked well enough that the HTTP server
+# cannot pass by accidentally: state persists, and every operation is written
+# down for read-back. Process groups, because a Python http.server is not one
+# process, and a stray listener outlives the harness otherwise.
+ipc_start() {
+    rm -f "$T/ipc.log"
+    setsid python3 "$FIX/fake-ipc.py" "$sock" "$T/state.json" "$T/ipc.pid" \
+        "$T/ipc.log" </dev/null >/dev/null 2>&1 &
+    i=0
+    while [ ! -S "$sock" ] && [ $i -lt 40 ]; do sleep 0.05; i=$((i + 1)); done
+}
+ipc_off() {
+    # setsid detaches: the child is in a session of its own, invisible to this
+    # shell's $!. It writes its own pid at startup, and a whole session (not
+    # just the listener) is what has to die, because every accepted connection
+    # gets its own thread inside the one process.
+    if [ -f "$T/ipc.pid" ]; then
+        kill -- "-$(cat "$T/ipc.pid")" 2>/dev/null
+        rm -f "$T/ipc.pid"
+    fi
+    rm -f "$sock"
+    return 0
+}
+http_start() {
+    export http_port
+    http_port=$(python3 -c 'import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+    STREAMER_CONF="$T/streamer.conf" \
+        STREAMER_HTTP_PORT="$http_port" \
+        STREAMER_HTTP_PIDFILE="$T/http.pid" \
+        STREAMER_CLIAMP_SOCKET="$sock" \
+        STREAMER_EXECUTABLE="$T/streamer" \
+        setsid "$T/streamer-http" </dev/null >"$T/logs/http.out" 2>&1 &
+    i=0
+    until http_raw GET / >/dev/null 2>&1; do
+        i=$((i + 1)); [ $i -gt 100 ] && break; sleep 0.05
+    done
+}
+http_stop() {
+    if [ -f "$T/http.pid" ]; then
+        kill -- "-$(cat "$T/http.pid")" 2>/dev/null
+        rm -f "$T/http.pid"
+    fi
+    return 0
+}
+# curl in this sandbox is a stub for `streamer stations`: it answers one URL
+# shape and fails every other one. So the HTTP client here is Python, one
+# request per call, and the token goes in as a header exactly the way the
+# browser sends it.
+http_raw() { # http_raw GET|POST <path> [body] [token]: real curl is not trusted
+             # here; this is the request, raw, on stdout
+    python3 -c 'import sys, urllib.request
+method, path, body, tok = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+port = __import__("os").environ["http_port"]
+req = urllib.request.Request("http://127.0.0.1:%s%s" % (port, path), method=method)
+if tok: req.add_header("X-Token", tok)
+if body:
+    req.add_header("Content-Type", "application/json")
+    req.data = body.encode()
+try:
+    with urllib.request.urlopen(req, timeout=10) as r:
+        sys.stderr.write(str(r.status) + "\n")
+        sys.stdout.buffer.write(r.read())
+except urllib.error.HTTPError as e:
+    sys.stderr.write(str(e.code) + "\n")
+    sys.stdout.buffer.write(e.read())' "$1" "$2" "${3:-}" "${4:-}"
+}
+http() { # http GET|POST <path> [json body]: with the server's own token
+    local tok=""
+    [ -f "$T/data/streamer/http.token" ] && tok=$(cat "$T/data/streamer/http.token")
+    http_raw "$1" "$2" "${3:-}" "$tok" 2>/dev/null
+}
+http_code() { # http_code GET|POST <path> [json body] [token]: status only.
+              # No token is sent unless one is named: that is the whole point
+              # of the "no token: the API says no" check below.
+    http_raw "$1" "$2" "${3:-}" "${4:-}" 2>&1 >/dev/null | head -1
+}
 count_markers() { # exact marker lines only: the appliance block also mentions
                    # them in prose, which the awk splice does not match
     grep -cE '^# --- streamer audio (begin|end) ---$' "$T/fw/config.txt"; }
@@ -928,14 +1009,26 @@ run() { # run <scenario number>
             n=$((n + 1))
             ck_eq "$name begins with a shebang, because systemd execs rather than parses" \
                 "$(head -c 2 "$f")" "#!"
-            ck_eq "$name names /bin/sh, the shell guaranteed on the card" \
-                "$(head -1 "$f")" "#!/bin/sh"
-            ck "$name parses as shell (sh -n only; a strict POSIX pass needs dash)" \
-                "sh -n \"$f\""
+            if [ "$name" = streamer-http ]; then
+                # The one payload program that is not shell: the LAN control
+                # server is python3, and image/build.sh checks the base image
+                # really ships that interpreter, per script. So the payload
+                # side of the deal is the same idea: right interpreter named,
+                # and the file at least parses.
+                ck_eq "$name names /usr/bin/env python3, which build.sh cross-checks against the base image" \
+                    "$(head -1 "$f")" "#!/usr/bin/env python3"
+                ck "$name parses as python3" \
+                    "python3 -c 'import sys; compile(sys.stdin.read(), sys.argv[1], \"exec\")' \"$f\" < \"$f\""
+            else
+                ck_eq "$name names /bin/sh, the shell guaranteed on the card" \
+                    "$(head -1 "$f")" "#!/bin/sh"
+                ck "$name parses as shell (sh -n only; a strict POSIX pass needs dash)" \
+                    "sh -n \"$f\""
+            fi
         done
         echo "  $n scripts in the payload"
         ck "the payload has scripts in it, or the three checks above checked nothing" \
-            "[ $n -ge 4 ]"
+            "[ $n -ge 5 ]"
         # Unit files are not shell either, so no sh -n would notice a mistyped
         # program name, and it surfaces as the same 203/EXEC. Every program a unit
         # names is checked against the payload: this design ships its own tools and
@@ -1011,6 +1104,86 @@ run() { # run <scenario number>
         # The shipped budget goes back: like the ramp steps above, a leaked
         # one-second wait would confuse the scenarios that run after this one.
         sed -i 's/^STREAMER_SYNC_WAIT=.*$/STREAMER_SYNC_WAIT=30/' "$T/streamer.conf" ;;
+    17) note "17. the LAN control server: token-guarded, and every playback path goes through the sanctioned writers"
+        reset
+        # build.sh and the payload have to agree on the interpreter, from both
+        # ends: the build refuses a python3 unit if the base image has no
+        # python3, and nothing here may enable a unit the image never installs.
+        ck_in "the build cross-checks every unit's interpreter against the base image" \
+            "$BUILD" 'runs python3, which this base image does not ship'
+        ck_in "the build enables the control unit at boot" \
+            "$BUILD" 'enable streamer-http.service   streamer.target'
+        ck_in "streamer.conf carries the port and token knobs" \
+            "$T/streamer.conf" "STREAMER_HTTP_TOKEN="
+        # Packaging, without listening: the config the server would run with.
+        no_listen=$(STREAMER_HTTP_TEST_NO_LISTEN=1 "$T/streamer-http" 2>&1); rc=$?
+        ck_eq "it reads its knobs from streamer.conf without a listen" "$rc" "0"
+        ck_has "it takes the port from the config" "$no_listen" "port=8077"
+        ck_has "it takes the token path from the config" \
+            "$no_listen" "token=$T/data/streamer/http.token"
+        ck_not "the no-listen pass does not create the token file" \
+            "$T/data/streamer/http.token" "x"
+        # A stand-in player that speaks the same IPC V2 as the real daemon, so
+        # the checks below are about this server's behaviour, not about whether
+        # json.loads happened to work.
+        ipc_start
+        http_start
+        ck_eq "no token: the API says no" "$(http_code GET /api/status)" "401"
+        ck_eq "the page itself needs no token (the token arrives in the URL)" \
+            "$(http_code GET /)" "200"
+        ck_eq "once running, it has made the token" "$([ -f "$T/data/streamer/http.token" ] && echo y)" "y"
+        ck_eq "the token file is readable only by its owner" \
+            "$(stat -c %a "$T/data/streamer/http.token")" "600"
+        tk=$(cat "$T/data/streamer/http.token")
+        ck_has "with the token, the player's state comes back" \
+            "$(http GET /api/status)" '"state":"stopped"'
+        ck_has "the boot intent rides along, read from the appliance state file" \
+            "$(http GET /api/status)" '"intent":{'
+        ck_has "pause reaches the player over IPC" \
+            "$(http POST /api/op/pause '{}')" '"ok":true'
+        ck_eq "the player really paused" "$(jstr state)" "paused"
+        ck_has "toggle came back playing, over the same socket" \
+            "$(http POST /api/op/toggle '{}'; http GET /api/status)" '"state":"playing"'
+        ck_has "a level set from the phone lands on the player" \
+            "$(http POST /api/op/volume '{"value":-12}'; http GET /api/status)" '"volume":-12'
+        # Browsing a provider the TUI reached for: Tidal over HTTP is the whole
+        # reason this server exists next to the widget.
+        ck_has "the provider list names Tidal" "$(http GET /api/providers)" '"key":"tidal"'
+        ck_has "Tidal's playlists list over the API" \
+            "$(http GET '/api/playlists?provider=tidal')" '"name":"Toni"'
+        ck_has "Tidal search over the API" \
+            "$(http GET '/api/search?provider=tidal&q=jamiroquai')" '"artist":"Jamiroquai"'
+        ck_has "a searched row plays through the player's own track.play" \
+            "$(http POST /api/play '{"track":{"title":"x","path":"tidal://album/1"}}')" '"ok":true'
+        ck_eq "the player was asked for that exact row, once" \
+            "$(grep -c '^track.play ' "$T/ipc.log")" "1"
+        ck_has "a listed playlist loads through provider.load" \
+            "$(http POST /api/load/playlist '{"provider":"tidal","id":"pl-1"}')" '"ok":true'
+        ck_eq "provider.load carried the provider and the list id" \
+            "$(grep -c '^provider.load {"provider":"tidal","playlist":"pl-1"}' "$T/ipc.log")" "1"
+        # Boot intent is the part with consequences, so the guards are checked
+        # in both directions: the sanctioned path, and the rejections around it.
+        ck_has "a station set from the phone writes the boot intent" \
+            "$(http POST /api/intent '{"kind":"station","target":"http://station.example/s"}')" '"ok":true'
+        ck_eq "the intent file says the new station plays next boot" \
+            "$(sed -n 's/^target=//p' "$T/data/streamer/state")" "http://station.example/s"
+        ck_in "and it restarts playback through the ramp path, not around it" \
+            "$T/systemctl" "restart streamer-play.service"
+        ck_has "the status call now shows the new station as next boot's target" \
+            "$(http GET /api/status)" "station.example/s"
+        ck_eq "a non-http station target is refused before anything is written" \
+            "$(http_code POST /api/intent '{"kind":"station","target":"file:///etc/passwd"}' "$tk")" "400"
+        ck_eq "the intent file did not move" \
+            "$(sed -n 's/^target=//p' "$T/data/streamer/state")" "http://station.example/s"
+        ck_eq "a non-http url.load is refused too" \
+            "$(http_code POST /api/load/url '{"url":"javascript:alert(1)"}' "$tk")" "400"
+        ck_eq "and with no token at all it is refused before even that" \
+            "$(http_code POST /api/intent '{"kind":"mode","target":"stop"}')" "401"
+        ck_has "the boot mode toggles through the streamer command as well" \
+            "$(http POST /api/intent '{"kind":"mode","target":"stop"}')" '"ok":true'
+        ck_eq "mode=stop is what the state file says now" \
+            "$(sed -n 's/^mode=//p' "$T/data/streamer/state")" "stop"
+        http_stop; ipc_off ;;
     esac
     log_tail
 }
@@ -1019,7 +1192,7 @@ echo "sandbox: $T"
 if [ $# -gt 0 ]; then
     for n in "$@"; do run "$n"; done
 else
-    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do run "$n"; done
+    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do run "$n"; done
 fi
 
 printf '\n%d checks, %d failed\n' "$((pass + fail))" "$fail"

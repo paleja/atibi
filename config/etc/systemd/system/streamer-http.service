@@ -1,0 +1,33 @@
+[Unit]
+Description=streamer LAN control server (web page on the appliance's player)
+Documentation=file:/data/cliamp/cliamp.log
+After=streamer-cliamp.service
+RequiresMountsFor=/data
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+Environment=HOME=/home/pi
+# System services get no locale from PAM; without this, non-ASCII station and
+# track names come out mangled in the journal.
+Environment=LANG=C.UTF-8
+ExecStart=/usr/local/bin/streamer-http
+Restart=always
+RestartSec=2
+PrivateTmp=yes
+# The server only writes inside /data (its token, and the boot intent through
+# the streamer command); the rest of the filesystem is not its business. Note
+# there is deliberately no NoNewPrivileges here: the server runs as the same
+# unprivileged user the units and SSH all run as, and reaching root for a
+# streamer station|playlist goes through sudo, exactly as it does from a
+# terminal. Blocking exec-with-privilege in the unit would break the one path
+# that writes the boot intent, which is the whole point of that route.
+ProtectSystem=strict
+ReadWritePaths=/data
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=streamer-http
+
+[Install]
+WantedBy=streamer.target
