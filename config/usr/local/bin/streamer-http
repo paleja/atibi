@@ -231,7 +231,7 @@ def read_intent():
     data = conf.get("STREAMER_DATA", "/data")
     state_path = conf.get("STREAMER_STATE", data + "/streamer/state")
     state_path = state_path.replace("$STREAMER_DATA", data)
-    intent = {"mode": "", "kind": "", "target": ""}
+    intent = {"mode": "", "kind": "", "target": "", "provider": "", "volume": ""}
     try:
         with open(state_path, encoding="utf-8") as f:
             for line in f:
@@ -386,7 +386,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._json_out({"ok": False, "error": "value must be a dB number"}, 400)
                 return
-            self._json_out(self._op("volume", {"value": db}))
+            # Not a bare volume call: the level is remembered as well as set,
+            # and the streamer command is the only thing allowed to write that
+            # down. It also reads the level back from the player, so a floor or
+            # ceiling the player enforces is what gets saved, not what the
+            # slider happened to show.
+            self._json_out({"ok": True, "streamer": run_streamer("vol", repr(db))})
             return
         if path == "/api/op/seek":
             try:
@@ -403,7 +408,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json_out({"ok": False, "error": "provider and id required"}, 400)
                 return
             ipc_op("provider.load", {"provider": provider, "playlist": pid})
-            self._json_out({"ok": True})
+            # A playlist started from the phone is what should play after the
+            # next reboot, so it is written down — through the streamer command,
+            # with the provider:id spelling that command understands. Not
+            # `streamer playlist` on its own: that verb also restarts the boot
+            # sequence, which on top of a click would mean the track starts
+            # again, quietly, from the volume floor.
+            self._json_out({"ok": True,
+                            "streamer": run_streamer("remember", "playlist",
+                                                     "%s:%s" % (provider, pid))})
             return
         if path == "/api/load/url":
             url = str(body.get("url", ""))
@@ -539,7 +552,7 @@ a{color:var(--acc)}
  <h1>boot station</h1>
  <div id="intent" class="sub"></div>
  <div class="row" style="margin-top:8px">
-  <button onclick="intentStation()">use current stream as boot station</button>
+  <button onclick="intentStation()">play this again after a reboot</button>
  </div>
  <h1 style="margin-top:14px">queue</h1>
  <ul id="queue"></ul>
@@ -585,7 +598,7 @@ function render(s){
   $('vd').textContent=(s.volume===undefined?'':s.volume+' dB');
   if(document.activeElement!==$('v')&&s.volume!==undefined)$('v').value=Math.max(-50,Math.min(0,Math.round(s.volume)));
   const m=s.intent||{};$('mode').textContent=m.mode||'last';
-  $('intent').textContent=(m.kind==='playlist'?'playlist: ':'')+ (m.target||'(default)');
+  $('intent').textContent=((m.kind==='provider'?('playlist on '+(m.provider||'?')+': '):m.kind==='playlist'?'playlist: ':'')+(m.target||'(default)'))+(m.volume?(' at '+m.volume+' dB to start with'):' (level not saved)');
 }
 function paintBar(){if(dur>0)$('p').style.width=Math.min(100,100*tick/dur)+'%';}
 async function poll(){
@@ -650,6 +663,14 @@ async function loadQueue(){
 }
 function intentStation(){
   api('/api/status').then(s=>{
+    // cliamp's own name for what is loaded, when it has one: "tidal:<id>" or
+    // "local:<name>". That is the form the boot can load again. The path of the
+    // track under it is no use here: for a streaming service it reads
+    // tidal://track/123, and url.load answers that with "no such file".
+    if(s.playlist){
+      api('/api/intent',{kind:'playlist',target:s.playlist}).then(r=>{if(!r.ok)fail(r.error);poll();});
+      return;
+    }
     const t=s.logical_track||s.track||{};
     if(!t.path){fail('nothing playing that has a URL');return;}
     api('/api/intent',{kind:'station',target:t.path}).then(r=>{if(!r.ok)fail(r.error);poll();});

@@ -8,14 +8,16 @@
 #   streamer pause | toggle     transport
 #   streamer stop               stop now, and stay quiet after the next boot
 #   streamer next | prev        skip
-#   streamer vol -12            set the level to -12 dB (cliamp scale)
-#   streamer up 3 | down 3      move the level by N dB
+#   streamer vol -12            set the level to -12 dB, next boot too
+#   streamer up 3 | down 3      move the level by N dB, next boot too
 #   streamer station <url>      play this stream from now on, next boot too
 #   streamer playlist <name>    play a saved cliamp playlist from now on
+#   streamer playlist tidal:ID  play a streaming service playlist, next boot too
+#   streamer remember <what> <target>
+#                               next boot only, without touching what plays now
 #   streamer stations           list the built-in radio endpoints
 #   streamer last               what the appliance will play on next boot
 #   streamer mode [last|stop]   resume-on-boot behaviour
-#   streamer forget             drop the saved playback position
 #   streamer log                this boot's player log
 #   streamer boots              the durable boot log, the one that survives a cut
 #   streamer reload             restart daemon and playback
@@ -44,23 +46,74 @@ needs_root() { # needs_root <command> [argument]
     esac
 }
 
-# Atomically replace the appliance intent. It lives on /data, so a power cut
-# between here and the next boot loses at most nothing: mode=stop keeps the box
-# silent until it is told to play again.
-save_state() {
+# Atomically replace the appliance record of what to play next boot and the
+# level to play it at. It lives on /data, so a power cut between here and the
+# next boot loses at most nothing: mode=stop keeps the box silent until it is
+# told to play again. Omitted arguments carry on what is already recorded, so
+# turning the volume down cannot forget the station and setting a station cannot
+# forget the level. Nothing else writes this file: what appears in boot.log as
+# "intent set" is always something a person did through the appliance.
+save_state() { # save_state <mode> <kind> <target> [provider] [volume]
+    mode=$1 kind=$2 cur=$3
+    [ "$#" -ge 4 ] && provider=$4
+    [ "$#" -ge 5 ] && cur_vol=$5
     mkdir -p "$(dirname "$STREAMER_STATE")"
     tmp="$STREAMER_STATE.tmp"
-    printf 'mode=%s\nkind=%s\ntarget=%s\n' "$1" "$2" "$3" >"$tmp"
+    {
+        printf 'mode=%s\nkind=%s\ntarget=%s\n' "$mode" "$kind" "$cur"
+        [ -n "$provider" ] && printf 'provider=%s\n' "$provider"
+        [ -n "$cur_vol" ] && printf 'volume=%s\n' "$cur_vol"
+        true
+    } >"$tmp"
     mv -f "$tmp" "$STREAMER_STATE"
     sync
     # The journal is volatile, so intent changes worth reading about a week later
     # belong in the durable log too.
-    /usr/local/bin/streamer-bootlog "intent set: mode=$1 kind=$2 target=$3"
+    /usr/local/bin/streamer-bootlog "intent set: mode=$mode kind=$kind target=$cur${provider:+ provider=$provider}${cur_vol:+ volume=$cur_vol}"
 }
 
-mode=$(sed -n 's/^mode=//p' "$STREAMER_STATE" 2>/dev/null || true)
-kind=$(sed -n 's/^kind=//p' "$STREAMER_STATE" 2>/dev/null || true)
-cur=$(sed -n 's/^target=//p' "$STREAMER_STATE" 2>/dev/null || true)
+playlist_target() { # playlist_target <name | provider:id>
+    # Splits into pl_kind, pl_name, pl_provider. The difference matters at boot:
+    # a bare name is a playlist cliamp saved on disk, so streamer-play loads it
+    # with `cliamp load`; a name written provider:id — the spelling cliamp itself
+    # uses in its status output — is a playlist that lives on a streaming
+    # service, which only provider.load can fetch.
+    pl_kind=playlist
+    pl_name=$1
+    pl_provider=
+    case "$1" in
+        local:*) pl_name=${1#local:} ;;
+    esac
+    for pr in ${STREAMER_PROVIDERS:-tidal qobuz spotify}; do
+        case "$1" in
+            "$pr":*) pl_provider=$pr; pl_kind=provider; pl_name=${1#"$pr":} ;;
+        esac
+    done
+}
+
+json_num() { # json_num <json> <key> : that key's number, sign included. The
+             # real player pretty-prints and repeats some keys, so allow the
+             # space and keep the last hit. Must match the same helper in
+             # streamer-play: both read the player, one of them has to be right.
+    printf '%s' "$1" |
+        sed -n "s/.*\"$2\": *\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" | tail -n 1
+}
+
+save_level() { # record the level the player is actually at, after a change
+    lvl=$(json_num "$(cliamp status --json 2>/dev/null || true)" volume)
+    case "$lvl" in ''|*[!0-9.-]*) return 0 ;; esac
+    [ "$lvl" = "$cur_vol" ] && return 0
+    save_state "$mode" "$kind" "$cur" "$provider" "$lvl"
+}
+
+# Same rule as the boot script: last line wins for each key, so a file with a
+# repeated key cannot hand two values to one comparison.
+state_last() { sed -n "s/^$1=//p" "$STREAMER_STATE" 2>/dev/null | tail -n 1; }
+mode=$(state_last mode)
+kind=$(state_last kind)
+cur=$(state_last target)
+provider=$(state_last provider)
+cur_vol=$(state_last volume)
 mode=${mode:-last}
 kind=${kind:-$STREAMER_START_KIND}
 cur=${cur:-$STREAMER_START_TARGET}
@@ -80,10 +133,16 @@ case "$cmd" in
     status)
         cliamp status
         printf 'boot mode:   %s\n' "$mode"
-        printf 'boot target: %s %s\n' "$kind" "$cur"
+        printf 'boot target: %s %s%s\n' "$kind" "$cur" "${provider:+ on $provider}"
+        lvl="${cur_vol:-}"
+        [ -n "$lvl" ] || lvl="$STREAMER_VOL_TARGET (default, never saved)"
+        printf 'boot level:  %s dB\n' "$lvl"
         ;;
     last)
-        printf '%s %s\n' "$kind" "$cur"
+        # Everything the next boot needs, on one line: what to load, where it
+        # lives when it is not on this card, and the level to start at.
+        printf '%s %s %s%s%s\n' "$mode" "$kind" "$cur" \
+            "${provider:+ on $provider}" "${cur_vol:+ at $cur_vol dB}"
         ;;
     mode)
         case "${1:-}" in
@@ -99,15 +158,39 @@ case "$cmd" in
         ;;
     station)
         url=${1:?usage: streamer station <url>}
-        save_state last url "$url"
-        rm -f "$STREAMER_PROGRESS"
+        save_state last url "$url" ""
         systemctl restart streamer-play.service
         ;;
     playlist)
-        name=${1:?usage: streamer playlist <name>}
-        save_state last playlist "$name"
-        rm -f "$STREAMER_PROGRESS"
+        playlist_target "${1:?usage: streamer playlist <name> | <provider>:<id>}"
+        save_state last "$pl_kind" "$pl_name" "$pl_provider"
         systemctl restart streamer-play.service
+        ;;
+    remember)
+        # Write down what should play next boot without touching what is playing
+        # now. The web page uses this when a playlist is tapped: that tap has
+        # already started the music, and `streamer playlist` on top of it would
+        # restart the boot sequence, which means a second start and a trip back
+        # to the volume floor in the middle of a track.
+        what=${1:?usage: streamer remember <station|playlist|mode> <target>}
+        case "$what" in
+            station)
+                url=${2:?usage: streamer remember station <url>}
+                save_state last url "$url" ""
+                ;;
+            playlist)
+                playlist_target "${2:?usage: streamer remember playlist <name>}"
+                save_state last "$pl_kind" "$pl_name" "$pl_provider"
+                ;;
+            mode)
+                case "${2:-}" in
+                    last|stop) save_state "$2" "$kind" "$cur" ;;
+                    *) echo "usage: streamer remember mode [last|stop]" >&2; exit 2 ;;
+                esac
+                ;;
+            *) echo "usage: streamer remember <station|playlist|mode> <target>" >&2
+               exit 2 ;;
+        esac
         ;;
     stations)
         # The list belongs to the radio service, not to this box, so this needs
@@ -134,11 +217,6 @@ case "$cmd" in
         fi
         echo "then: streamer station <url>"
         ;;
-    forget)
-        rm -f "$STREAMER_PROGRESS"
-        /usr/local/bin/streamer-bootlog "playback position forgotten"
-        echo "playback position forgotten"
-        ;;
     stop)
         cliamp stop || true
         save_state stop "$kind" "$cur"
@@ -150,6 +228,11 @@ case "$cmd" in
         db=${1:?usage: streamer vol <dB>}
         case "$db" in -[0-9]*|[0-9]*) ;; *) echo "not a dB value: $db" >&2; exit 2 ;; esac
         cliamp volume "$db"
+        # The change is remembered straight away, and remembered from the
+        # player rather than from what was asked for: the player has a floor and
+        # a ceiling of its own, and the level it settled at is the one the next
+        # boot should aim at. Nothing saves the volume on a timer.
+        save_level
         ;;
     up|down)
         n=${1:-3}
@@ -157,6 +240,7 @@ case "$cmd" in
         sign=
         [ "$cmd" = down ] && sign=-
         cliamp remote call volume.adjust --params "{\"value\":$sign$n}" --wait >/dev/null
+        save_level
         ;;
     reset)
         # Put /data back exactly as it was when the card was built. The template

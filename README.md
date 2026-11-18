@@ -43,14 +43,14 @@ boot.
     and the ramp, where the state files live, and the user and group that own
     them
   - `etc/systemd/system/` — the units: the player daemon, the boot-time play, the
-    position-save timer, the LAN control server, and the target that ties them
-    together
+    LAN control server, and the target that ties them together
   - `etc/streamer/audio-{jack,dac}.txt` — the two audio setups (3.5mm jack, I2S
     DAC HAT); `streamer audio jack|dac` swaps one into `config.txt`
   - `boot/appliance-config.txt` — the block appended to `/boot/firmware/config.txt`
-  - `usr/local/bin/streamer` — the command people actually use, over SSH
-  - `usr/local/bin/streamer-{daemon,play,save}` — the player daemon, the
-    boot-time play, and the position save
+  - `usr/local/bin/streamer` — the command people actually use, over SSH, and the
+    only thing that writes the record of what to play next boot and how loud
+  - `usr/local/bin/streamer-{daemon,play}` — the player daemon, and the
+    boot-time play
   - `usr/local/bin/streamer-bootlog` — one durable line per event; it is the only
     record that outlives a power cut
   - `usr/local/bin/streamer-http` — the LAN control server: a token-guarded
@@ -65,15 +65,19 @@ boot.
   volatile, on purpose), the hostname and timezone if you ask for them, the SSH
   `authorized_keys`, a fresh machine-id and SSH host keys for this build, and the
   `systemctl enable` symlinks for the units above.
-- `tests/appliance-scripts.sh` — the regression suite for those scripts: seventeen
-  scenarios, each one asserting rather than merely running. It checks the
-  boot-time ramp from the floor (including that the floor is set before the
-  player is told to make a sound), resuming at a saved row and position and
-  level, the save round-trip, `mode=stop`, the volume ceiling and its floor, a
-  level parked below it, a saved row that no longer exists, the ramp's own
-  guards (a level that will not move, a step budget, a volume somebody else
-  moved mid-ramp), the jack/dac switch leaving the rest of `config.txt` alone,
-  the `streamer` command's reporting, the factory reset, the packaging
+- `tests/appliance-scripts.sh` — the regression suite for those scripts: nineteen
+  scenarios and 257 checks, each one asserting rather than merely running. It
+  checks the boot-time ramp from the floor (including that the floor is set
+  before the player is told to make a sound), starting from a saved target and
+  level, saving on change (the level you set lands in the record at once, a
+  playlist tapped on a phone is remembered without restarting the music, and the
+  next boot fetches it as a provider list rather than a local one), `mode=stop`,
+  the volume ceiling and its floor, a level parked below it, a provider the card
+  has no credentials for, the ramp's own guards (a level that will not move, a
+  step budget, a volume somebody else moved mid-ramp), the jack/dac switch
+  leaving the rest of `config.txt` alone, the `streamer` command's reporting,
+  waiting for the clock before an https target, and waiting for a route before
+  fetching a playlist from a streaming service, the factory reset, the packaging
   (every script that systemd starts names its interpreter, and every unit points
   at a file that exists), the LAN control server (token-guarded, browsing and
   searching providers through the player's own socket, and writing boot intent
@@ -81,16 +85,26 @@ boot.
   `sfdisk`, `mkfs.ext4 -d`, `e2fsck`, `tune2fs`, `blkid`, `dumpe2fs` and `dd`,
   run without root on an image file, plus the fstab editor run against a real
   fstab. No root, no Pi and no real cliamp: a stand-in covers the parts of the
-  player the scripts talk to, and a sandbox stands in for `/data` and
+  player the scripts talk to, and its `status --json` output is pretty-printed
+  the way the real cliamp 2.4.1 answers, because the compact shape the fixtures
+  used to print hid a bug on the card. A sandbox stands in for `/data` and
   `/boot/firmware`. The scripts under test are the real ones, only their paths
-  are redirected. The verdict is the last line, `N checks, M failed`, and the
+  are redirected. A command that fails inside a scenario is something the checks
+  are there to notice, not something that ends the run: `set -e` is off inside a
+  scenario, and reading a file a script was supposed to write goes through a
+  helper that says so, so a script that writes nothing fails its own check
+  instead of killing the harness and silently dropping every check after it. The
+  verdict is the last line, `N checks, M failed`, and the
   exit status; `bash tests/appliance-scripts.sh` runs all of them, or pass
   scenario numbers to run a few.
 - `tests/mutation-check.py` — the test of the tests. It deliberately breaks one
-  shipped behaviour at a time (thirty of them) and requires the suite to go
+  shipped behaviour at a time (forty-seven of them) and requires the suite to go
   red on the check that cares about that behaviour; anything it misses is a check
-  that looks meaningful and is not. `python3 tests/mutation-check.py`, a few
-  minutes, and it restores every file it touched even if a scenario hangs.
+  that looks meaningful and is not. It checks its own anchors before it starts —
+  each break has to name exactly one line, and each one has to name a check that
+  exists — and it keeps a journal so that a run killed half-way cannot put old
+  text over a file that has since changed. `python3 tests/mutation-check.py`, a
+  few minutes, and it restores every file it touched even if a scenario hangs.
 - `tests/fixtures/` — the shape `https://radio.cliamp.stream/stations` really
   answers with, and the `/etc/fstab` a real card shipped (`fstab.orig`, input)
   next to what the editor is expected to make of it (`fstab.expected`, written by

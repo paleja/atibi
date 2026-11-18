@@ -23,10 +23,13 @@ Two things make this safe to leave running unattended:
   write into the code it is meant to only read. Either is repaired and reported,
   and the run fails, because a clean verdict over a changed tree is worth
   nothing.
-* A journal under /tmp/opencode names the file being mutated before it is
-  touched and the original text. If the process is killed hard enough to skip
-  the finally block, the next run restores from the journal first and says so,
-  rather than leaving a half-mutated tree behind.
+* A journal under /tmp/opencode names the file being mutated, the mutation
+  applied to it, and its original text. If the process is killed hard enough to
+  skip the finally block, the next run restores from the journal first and says
+  so, rather than leaving a half-mutated tree behind. It restores only when the
+  file on disk still holds exactly what that mutation would have written: a
+  journal from a run that died in an earlier session is not permission to
+  overwrite work done since, and an unmatched one is discarded with a warning.
 
 Only the one file being mutated is ever written.
 """
@@ -43,6 +46,7 @@ PLAY = "config/usr/local/bin/streamer-play"
 CTRL = "config/usr/local/bin/streamer"
 BOOTLOG = "config/usr/local/bin/streamer-bootlog"
 HTTP = "config/usr/local/bin/streamer-http"
+META = "tests/mutation-check.py"
 BUILD = "image/build.sh"
 FSTAB_AWK = "image/fstab-ro.awk"
 
@@ -112,15 +116,79 @@ MUTATIONS = [
      'cliamp queue "$target"',
      "that row is the one playing, not row 0"),
 
-    ("the seconds from a refused row are replayed anyway", PLAY,
-     "            saved_pos=0\n",
-     "",
-     "the seconds from the vanished row are not replayed on row 0"),
+    ("the provider list is fetched as a local playlist", PLAY,
+     'if ! cliamp remote call provider.load \\\n             --params "{\\"provider\\":\\"$esc_p\\",\\"playlist\\":\\"$esc_t\\"}" --wait; then',
+     'if ! cliamp load "$target"; then',
+     "the boot asked the player for the provider playlist"),
+
+    ("the boot starts a row provider.load already started", PLAY,
+     'if [ "$(jstr "$(status)" state)" != playing ]; then',
+     "if true; then",
+     "provider.load started it, so the boot did not start it again"),
+
+    ("the boot reads a provider playlist as an unknown kind", PLAY,
+     "    provider)\n",
+     "    provider-not-implemented)\n",
+     "it does not pretend the target was unknown"),
+
+    ("a provider boot skips the network wait because a bare playlist id has no host in it", PLAY,
+     'if [ -n "$host" ] || [ "$kind" = provider ]; then',
+     'if [ -n "$host" ]; then',
+     "FAIL no network route for provider pl-42"),
+
+    ("a provider boot probes for the provider by name, which the target never names", PLAY,
+     "        ip route get 1.1.1.1 >/dev/null 2>&1\n",
+     '        getent hosts "$target" >/dev/null 2>&1\n',
+     "a lease that arrives late does not fail the boot"),
+
+    ("the network budget for a provider boot is divided by four", PLAY,
+     '        [ "$i" -gt "$((STREAMER_NET_WAIT * 4))" ] && {',
+     '        [ "$i" -gt "$STREAMER_NET_WAIT" ] && {',
+     "inside the seconds it was given, not one more"),
+
+    ("the status reader insists on no space after the colon again", PLAY,
+     'sed -n "s/.*\\"$2\\": *\\(-\\{0,1\\}[0-9][0-9.]*\\).*/\\1/p" | tail -n 1',
+     'sed -n "s/.*\\"$2\\":\\(-\\{0,1\\}[0-9][0-9.]*\\).*/\\1/p" | tail -n 1',
+     "boot.log says the level came from elsewhere"),
 
     ("the station list looks for a url key again", CTRL,
      r"""grep -o '"stream":"[^"]*"'""",
      r"""grep -o '"url":"[^"]*"'""",
      "stations pairs each name with its stream"),
+
+    # Saving on change: the level and the target are written by the streamer
+    # command when a person changes them, and each write carries on what the
+    # previous one recorded. Without that, turning the volume down would forget
+    # the station, and the two guards in the ramp would have no level to guard.
+    ("a volume change is played but never written down", CTRL,
+     '        save_level\n        ;;\n    up|down)',
+     '        ;;\n    up|down)',
+     "the change is written down at once"),
+
+    ("a step up or down is played but never written down", CTRL,
+     'cliamp remote call volume.adjust --params "{\\"value\\":$sign$n}" --wait >/dev/null\n        save_level\n',
+     'cliamp remote call volume.adjust --params "{\\"value\\":$sign$n}" --wait >/dev/null\n',
+     "a step up or down is remembered the same way"),
+
+    ("the level is read back with a pattern that fits nothing the real player prints", CTRL,
+     'sed -n "s/.*\\"$2\\": *\\(-\\{0,1\\}[0-9][0-9.]*\\).*/\\1/p" | tail -n 1',
+     'sed -n "s/.*\\"$2\\":\\(-\\{0,1\\}[0-9][0-9.]*\\).*/\\1/p" | tail -n 1',
+     "the change is written down at once"),
+
+    ("recording a new playlist drops the level that was saved with it", CTRL,
+     '        [ -n "$cur_vol" ] && printf \'volume=%s\\n\' "$cur_vol"\n',
+     "",
+     "the level survives the rewrite"),
+
+    ("recording a provider playlist drops the provider it belongs to", CTRL,
+     '        [ -n "$provider" ] && printf \'provider=%s\\n\' "$provider"\n',
+     "",
+     "on that provider"),
+
+    ("remembering the next boot also restarts what is playing now", CTRL,
+     '            playlist)\n                playlist_target "${2:?usage: streamer remember playlist <name>}"\n                save_state last "$pl_kind" "$pl_name" "$pl_provider"\n                ;;\n',
+     '            playlist)\n                playlist_target "${2:?usage: streamer remember playlist <name>}"\n                save_state last "$pl_kind" "$pl_name" "$pl_provider"\n                systemctl restart streamer-play.service\n                ;;\n',
+     "and recording it did not restart the player"),
 
     ("the ramp has no step budget", PLAY,
      '[ "$steps" -ge "$STREAMER_RAMP_MAX_STEPS" ]',
@@ -171,6 +239,14 @@ MUTATIONS = [
      'out = run_streamer("station", target)',
      'out = ""',
      "the intent file says the new station plays next boot"),
+    ("the page sets the level on the player only, so the next boot does not know it", HTTP,
+     'self._json_out({"ok": True, "streamer": run_streamer("vol", repr(db))})',
+     'self._json_out(self._op("volume", {"value": db}))',
+     "and it is the level the next boot will start at"),
+    ("a playlist tapped on the phone plays once and is never remembered", HTTP,
+     'self._json_out({"ok": True,\n                            "streamer": run_streamer("remember", "playlist",\n                                                     "%s:%s" % (provider, pid))})',
+     'self._json_out({"ok": True})',
+     "that tap is what the next boot will load, as a provider target"),
     ("the submit envelope nests its operation inside params, as the fixture "
      "used to allow and the real player never did", HTTP,
      'reply = ipc("operation.submit", params, id_hint="h",\n'
@@ -213,6 +289,23 @@ MUTATIONS = [
      '$2 == "/" || $2 == "/boot/firmware" || $2 == "/data"',
      "and the data partition, which is meant to be written, stays writable"),
 
+    # The tool that breaks things on purpose is also a program that writes into
+    # this repository, and scenario 18 checks its two guards. The journal is the
+    # one that can cost work: it holds the text a payload had when a sweep was
+    # killed, and applying it without looking writes that older text over
+    # whatever the file holds now.
+    ("a killed run's journal is applied whatever the file looks like now", META,
+     "    current = path.read_text() if path.is_file() else None\n"
+     "    if entry is not None and current == original.replace(entry[2], entry[3], 1):",
+     "    current = path.read_text() if path.is_file() else None\n"
+     "    if entry is not None and current is not None:",
+     "a journal from an older run cannot overwrite the file as it is now"),
+
+    ("the anchor pass stops counting how many places a mutation points at", META,
+     "        n = path.read_text().count(old)\n        if n != 1:",
+     "        n = path.read_text().count(old)\n        if n == 0:",
+     "every mutation names one line of a payload, and a check owns its label"),
+
 ]
 
 
@@ -242,13 +335,31 @@ def run_suite(timeout=90):
 
 
 def recover():
-    """Undo a mutation left behind by a previous run that was killed hard."""
+    """Undo a mutation left behind by a previous run that was killed hard.
+
+    The journal records one file's text at one moment, so it has to be matched
+    against the file before it is used. A run killed hard enough to skip the
+    finally block leaves one in /tmp, and work may be done to that file
+    afterwards: restoring the journal then quietly reverts that work, which is
+    what happened once, with a payload script losing a whole feature with no
+    message. So the journal is applied only when the file still holds exactly
+    what that run would have written; anything else means the journal is stale,
+    and the file wins.
+    """
     if not JOURNAL.exists():
         return
-    rel, _, text = JOURNAL.read_text().split("\n", 2)
-    (ROOT / rel).write_text(text)
+    rel, what, original = JOURNAL.read_text().split("\n", 2)
+    path = ROOT / rel
+    entry = next((m for m in MUTATIONS if m[0] == what), None)
+    current = path.read_text() if path.is_file() else None
+    if entry is not None and current == original.replace(entry[2], entry[3], 1):
+        path.write_text(original)
+        print("restored %s from the previous run's journal" % rel)
+    else:
+        print("left %s alone: the journal from a killed run describes a mutation "
+              "that is not in the file, so it was discarded rather than applied"
+              % rel, file=sys.stderr)
     JOURNAL.unlink()
-    print("restored %s from the previous run's journal" % rel)
     sys.stdout.flush()
 
 
@@ -313,7 +424,7 @@ def main():
             print("ANCHOR MISSING, not applied: %-46s" % what)
             missed += 1
             continue
-        JOURNAL.write_text(rel + "\n" + original)
+        JOURNAL.write_text(rel + "\n" + what + "\n" + original)
         path.write_text(original.replace(old, new, 1))
         began = time.time()
         try:

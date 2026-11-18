@@ -16,7 +16,10 @@ ExecStart=/usr/local/bin/streamer-play
 TimeoutStartSec=120
 # A cold boot can lose the race against NTP, or catch the stream server down
 # for a minute: the script is idempotent, so a retry is worth more than a
-# failed unit leaving the box silent until somebody sshes in.
+# failed unit leaving the box silent until somebody sshes in. The races the boot
+# knows about it waits for itself — the clock for an https target, a route for a
+# playlist on a streaming service — so this is the backstop for transients
+# nobody predicted, not the first line of defence.
 Restart=on-failure
 RestartSec=15
 StandardOutput=journal

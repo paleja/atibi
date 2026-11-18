@@ -33,8 +33,9 @@ A reproducible custom Raspberry Pi OS image containing:
 - Trimmed Raspberry Pi OS Lite (Debian) base with the boot-time tuning of §6.
 - Read-only root + a separate writable `/data` partition (§7) — safe to pull the
   plug at any moment.
-- `cliamp` in headless daemon mode, autostarted via systemd, auto-play and
-  resume of the last-played source; radio favorites baked into the image.
+- `cliamp` in headless daemon mode, autostarted via systemd, auto-play of
+  whatever source the listener last chose at the level they last set; radio
+  favorites baked into the image.
   No service credentials in the image — providers are logged in on first use
   over SSH (§8.2).
 - Correct audio bring-up for the IQaudIO Pi-DAC+ HAT (§5, §6.4), with the 3.5mm
@@ -55,9 +56,10 @@ a maintenance story (config updates without reflashing).
 
 - Power-on → audio playing (last-played source resumed) in **≤ 10 s wall
   clock**, measured from 5V applied, median of ≥5 cold boots.
-- On every boot the streamer auto-plays what was playing at the previous
-  power-off (radio station / playlist / provider context; stream position is
-  not resumed — live streams have none).
+- On every boot the streamer auto-plays the source the listener last chose
+  (radio station, saved playlist, or streaming-service playlist) at the level
+  they last set. Position is not resumed: a live stream has none, and coming up
+  mid-playlist is a detail rather than a feature (§8.3).
 - Survive unlimited hard power-cuts with zero manual recovery.
 - Sources: internet radio (Radio Browser, ~58k stations + custom favorites),
   Tidal (OAuth device-code login), local files on a USB stick (optional).
@@ -274,10 +276,11 @@ startup are slower on Cortex-A72.
 - **The floor is not bypassable, and the ramp target is the saved level, not
   0 dB** (implemented): `streamer-play` is the only thing that starts audio; it
   sets `STREAMER_VOL_FLOOR` (−30) with a failure check before playback, then
-  ramps in steps from 1 s after audio starts toward the volume the previous
-  session saved (`volume=` in `/data/streamer/progress`).
+  ramps in steps from 1 s after audio starts toward the volume the listener
+  last set (`volume=` in `/data/streamer/state`, written when the level
+  changes — see §8.3).
   `STREAMER_VOL_TARGET` (−20) is only the fallback when nothing was saved, and
-  `STREAMER_VOL_MAX` (+6) clamps both ends, so a stale progress file can neither
+  `STREAMER_VOL_MAX` (+6) clamps both ends, so a stale record can neither
   silence the box nor ask for full power. All of it goes through cliamp's dB, so
   there is still exactly one volume path.
 - **The ramp cannot outlive the boot, and it yields to a hand on the volume.**
@@ -360,12 +363,15 @@ corruptable itself if the cut lands mid-overlay-writeback):
   repairs it: that is the entire power-cut recovery protocol, and it is the
   distro's own, not a script of ours.
 - Writable content that must survive a cut, all on `/data`: cliamp config and
-  credentials (`/data/cliamp`, symlinked from `~/.config/cliamp`), the appliance
-  intent (`/data/streamer/state`: `mode`/`kind`/`target`, written only by the
-  `streamer` command), playback position (`/data/streamer/progress`:
-  `position=`/`index=`/`volume=`, written by `streamer-save` on a 1-minute
-  timer), and `/data/streamer/boot.log`. Everything sits at the top of `/data`,
-  which is what makes a clean slate one command.
+  credentials (`/data/cliamp`, symlinked from `~/.config/cliamp`), the
+  appliance's record of what to play next boot and at what level
+  (`/data/streamer/state`: `mode`/`kind`/`target`, plus `provider=` and
+  `volume=` when those apply), and `/data/streamer/boot.log`. That record has
+  exactly one writer — the `streamer` command, at the moment a person changes
+  something. Nothing in the image writes it on a timer, which is what keeps it
+  an intent rather than a position snapshot, and keeps every `intent set` line
+  in the durable log traceable to an action. Everything sits at the top of
+  `/data`, which is what makes a clean slate one command.
 - **journald stays deliberately volatile** (`Storage=volatile`,
   `RuntimeMaxUse=32M` in `/etc/journald.conf.d/streamer.conf`). A durable journal
   on `/data` would be left dirty at exactly the instant of a hard cut — the one
@@ -480,20 +486,57 @@ corruptable itself if the cut lands mid-overlay-writeback):
   `client_id`/`client_secret` override as escape hatch.
 
 ### 8.3 Auto-play & resume policy (implemented)
-- Requirement: every cold boot resumes what was playing at last power-off —
-  same provider context, station/playlist, volume state. Live stream position is
-  not applicable; for finite tracks/albums, resuming mid-track is best-effort,
-  acceptable to restart the track.
-- cliamp's own resume state (`~/.config/cliamp/resume.json`) is **not** enough:
-  a headless radio start bypasses it (`main.go:113-118`), so the appliance keeps
-  its own two files on `/data` and replays them — `state` for *what* to play,
-  `progress` for *where* it was and at what level.
-- **Resume order matters, and is the one thing that was got wrong in design
-  review:** loading a source parks cliamp on row 0, so the live `index` is only
-  a "something is loaded" gate. What actually restores an album is
-  `queue.play {"index": <saved row>}` and *then*
-  `seek.absolute {"value": <saved position>}`. Seeking before selecting the row,
-  or trusting the live index, plays track one from the top.
+- Requirement: every cold boot starts what the listener last chose, at the level
+  they last set — station, saved playlist, or streaming-service playlist, with
+  the provider context, plus the listening level. Position inside a playlist or
+  a track is deliberately **not** part of it: this is a radio, and a boot that
+  came up three rows into a playlist from Tuesday is indistinguishable from one
+  that lost its place. So the appliance records *what* and *how loud*, never
+  *where*.
+- cliamp's own resume state (`~/.config/cliamp/resume.json`) is still not
+  enough: a headless radio start bypasses it (`main.go:113-118`), so the
+  appliance keeps its own record on `/data` and replays it through IPC.
+- **Saved on change, not on a timer.** `streamer play`, `station`, `playlist`,
+  `remember`, `mode`, `stop`, `vol` and `up|down`, and the LAN page's equivalents,
+  each rewrite the whole record, with arguments they were not given carried over
+  from what is already stored: turning the level down cannot forget the station,
+  choosing a station cannot forget the level. The periodic writer
+  that used to do this (`streamer-save` on a one-minute timer, and the
+  `position=`/`index=` it stored) is gone: it bought a detail nobody asked for
+  at the cost of a unit, a timer, a second file, and a boot that resumed in the
+  middle of things.
+- The level is read back **from the player**, not recorded from what was asked
+  for: cliamp has its own floor and ceiling, and the value it settled at is the
+  one the next boot should aim at. Getting that value out of `cliamp status
+  --json` is where the first real card caught the suite out — the fixtures
+  printed compact JSON, the real cliamp pretty-prints with two-space indent,
+  and every extractor that insisted on no space after the colon returned an
+  empty string, which made both ramp guards inert without failing a single
+  check. The fixtures pretty-print like the real player now, and a mutation
+  entry puts the compact pattern back to prove the suite would notice.
+- A playlist that lives on a streaming service is stored as `kind=provider`
+  with `provider=` and the bare list id, and fetched at boot by
+  `cliamp remote call provider.load --params {"provider":…,"playlist":…}`;
+  `cliamp load <name>` only resolves playlists saved on the card. Passing a
+  Tidal list id to `load` was why the box stayed silent on a Tidal playlist.
+  Since `provider.load` starts playing, the boot starts row 0 only if the
+  player is not already playing.
+- A streaming-service list cannot be fetched before the card has an address, and
+  a provider target is a bare list id with no hostname in it, so the name
+  resolution the boot already waits for has nothing to work on there. On the
+  2026-11-18 card the DHCP lease landed at 02:27:51 and `provider.load` was
+  asked for at 02:27:43; cliamp could not refresh its Tidal session and answered
+  `sign-in required`. The boot now waits for what a provider target actually
+  needs — a route and a source address, which is what `ip route get` answers —
+  inside `STREAMER_NET_WAIT`, the same budget the name check uses, and gives up
+  with `FAIL no network route for provider <id>` in boot.log rather than
+  spending the call. No retry: the wait is the fix, and `Restart=on-failure` on
+  the unit stays as the backstop for transients nobody predicted, not as the
+  designed path.
+- `streamer remember <what> <target>` records intent without touching playback.
+  The page needs it: a tapped playlist has already started the music, and
+  `streamer playlist` on top of that restarts the boot sequence underneath it —
+  a second start and a trip back to the volume floor in the middle of a track.
 - Volume interacts with the boot floor (§6.4) on purpose: start at −30 dBFS,
   then ramp toward the saved level from a second after audio starts rather than
   instantly, so a power-cut can never produce a full-power first sample even
@@ -510,9 +553,11 @@ corruptable itself if the cut lands mid-overlay-writeback):
 
 One command, and its own help text is the reference: `streamer help`, or
 `streamer nonsense` for the same list and a non-zero exit. The groups: transport (`play`/`pause`/`toggle`/`next`/`prev`/`stop`), level
-(`vol <dB>`, `up`/`down <N>`, all going through cliamp's dB — §6.4), what to
-play (`station <url>`, `playlist <name>`, `stations`, `last`, `mode
-last|stop`, `forget`), diagnostics (`status`, `log`, `boots`), maintenance
+(`vol <dB>`, `up`/`down <N>`, all going through cliamp's dB and all recorded for
+the next boot — §6.4, §8.3), what to play (`station <url>`, `playlist <name>`,
+`playlist <provider>:<id>`, `stations`, `last`, `mode last|stop`,
+`remember <what> <target>` for next boot without touching what is playing),
+diagnostics (`status`, `log`, `boots`), maintenance
 (`reload`, `audio [jack|dac]`, `rw`/`ro`, `reset --yes`). The privileged ones
 re-run themselves under sudo and say so; the sudoers drop-in that makes that
 passwordless is written by `build.sh`, so it is there on the first boot.
@@ -564,9 +609,9 @@ Out of scope for v1.
    first time this box is powered on is a runtime boot like every other one.
 2. 20 consecutive hard power-cuts (strip off, any moment after boot): 21st
    boot succeeds, **auto-plays the source that was playing before the first
-   cut**, and favorites/credentials are intact. If the saved position cannot be
-   read, the fallback is the saved intent, never silence, and
-   `streamer boots` says which happened.
+   cut**, at the level it was at, and favorites/credentials are intact. If the
+   saved level is missing or unusable, the fallback is the configured default,
+   never silence, and `streamer boots` says which happened.
 3. `streamer toggle` and `cliamp toggle` over SSH work from the desktop with no
    interactive prompts (key auth), and the bar panel drives the Pi instance.
 4. Bar panel controls the Pi instance (search + transport + volume).
@@ -576,8 +621,8 @@ Out of scope for v1.
    reflash, by contrast, is a factory reset — §7).
 6. Rebuilding the image from this repo by a scripted path reproduces a
    working card on a second SD of the same size.
-7. Boot behavior (§8.3) is deterministic: the same source resumes after every
-   cut, verified over the §10.1 torture sequence.
+7. Boot behavior (§8.3) is deterministic: the same source starts, at the saved
+   level, after every cut, verified over the §10.1 torture sequence.
 8. `streamer audio jack` ↔ `streamer audio dac` changes the audio output on a
    running box with no reflash, leaves the rest of `config.txt` untouched, and
    is idempotent: switching to the output already in use changes nothing.
@@ -596,19 +641,31 @@ These criteria are not all verified the same way, and the distinction matters
 when reading a green result:
 
 - **Script level** (automated, on the build host, no root, no Pi, no network):
-  `tests/appliance-scripts.sh`, fifteen scenarios and 179 assertions — ramp from
+  `tests/appliance-scripts.sh`, nineteen scenarios and 257 assertions — ramp from
   the floor (including that the floor reaches the player *before* anything is
-  told to make a sound), resume at a saved row/position/level, the save
-  round-trip, `mode=stop`, volume clamped at the ceiling, a player that never
-  comes up, the `streamer` command's reporting (including `stations` pairing
-  names with `stream`, never `tracks_url`), the jack/dac splice leaving the rest
+  told to make a sound), starting from a saved target and level, saving on change
+  (the level a person set lands in the record at once, a playlist tapped on a
+  phone is remembered without restarting the music, and the next boot fetches it
+  as a provider list rather than a local one), `mode=stop`, volume clamped at the
+  ceiling, a player that never comes up, a provider the card has no credentials
+  for, the `streamer` command's reporting (including `stations` pairing
+  names with `stream`, never `tracks_url`, and the level the next boot starts at),
+  the jack/dac splice leaving the rest
   of `config.txt` alone and being idempotent, a saved level parked at the floor,
-  a saved row that no longer exists, the three ramp guards of §6.4, the factory
-  reset of §7, and the packaging: every script a unit execs names its
-  interpreter on its first line and parses as shell, and every `ExecStart` in
-  every unit points at a file the payload actually ships.
+  the three ramp guards of §6.4, a provider boot that waits for a route before
+  asking the service for its list, the factory reset of §7, the packaging: every
+  script a unit execs names its interpreter on its first line and parses as
+  shell, and every `ExecStart` in every unit points at a file the payload
+  actually ships, and the mutation tool's own two guards: its anchor pass has to
+  report a doubled anchor, a missing anchor and a label nothing carries, and the
+  journal it keeps against a killed run may only be applied when the file still
+  holds exactly the damage that journal describes.
   It runs the real scripts with only their paths redirected, against a stand-in
-  for the player's IPC and stubs for `systemctl`/`mount`/`chown`/`curl`. The
+  for the player's IPC and stubs for `systemctl`/`mount`/`chown`/`curl`/`ip`. The
+  `ip` stub answers the route probe the build host may or may not be able to
+  answer, and a scenario's `net-down` file takes that answer away, because a
+  check that "waits for the network" is worthless if the network is whatever the
+  laptop running the suite happens to have. The
   stand-in's volume ceiling is deliberately *above* `STREAMER_VOL_MAX`, so a
   script that forgot to clamp is caught rather than hidden. Covers criteria 2
   (the logic), 7 (the logic) and 8 (the mechanics).
@@ -634,18 +691,38 @@ when reading a green result:
   -u=S`) proves nothing except that the author believed it. Running the real
   tools on an image file is the only way to check that belief short of a card.
 - **Meta level** (automated): `tests/mutation-check.py` breaks one shipped
-  behaviour at a time (twenty-one: the boot floor and the order it is set in, the
-  parked-level rule, the ceiling, `url.load` versus plain queueing, the
-  refused-row position reset, the `"stream"` key, both ramp guards, the
-  set-elsewhere guard, the boot-log window, the reset asking before it wipes /
-  using a glob / wiping under a running player, `streamer ro`, an invented
+  behaviour at a time (forty-seven: the boot floor and the order it is set in, the
+  parked-level rule, the ceiling, `url.load` versus plain queueing, a provider
+  list fetched as a local playlist, a second start on top of a provider list that
+  `provider.load` already started, a provider playlist stored as a kind nothing
+  handles, a status reader that insists on compact JSON, the `"stream"` key, a
+  level or a playlist that gets played but never written down, a rewrite that
+  drops the level or the provider saved with it, `remember` reaching for the
+  player instead of only the record, both ramp guards, the set-elsewhere guard,
+  an https target handed to TLS with the clock still wrong, a provider playlist
+  fetched with no route to fetch it over, a provider route probe that asks for a
+  hostname the target never names, a network budget divided by four, the boot-log window,
+  the reset asking before it wipes / using a glob / wiping under a running
+  player, `streamer ro`, the LAN server's token and station guards, the page
+  setting the level on the player but not in the record, a tapped playlist that
+  plays once and is never remembered, the submit envelope nesting its operation,
+  `job.get` looking in the wrong place, the job poll budget, an invented
   `blockdev` flag, a partition table no longer read back, `mkfs` allowed to pick
-  its own block size, `debugfs` used as a writer, and three in the fstab editor:
-  leaving root writable, rebuilding the line from its fields instead of editing
-  the text, and catching `/data` as well) and requires the suite to go red on the
+  its own block size, `debugfs` used as a writer, payload interpreters no longer
+  checked against the base image, three in the fstab editor: leaving root
+  writable, rebuilding the line from its fields instead of editing the text, and
+  catching `/data` as well; and two aimed at the tool itself: a journal applied
+  whatever the file looks like now, and an anchor pass that stopped counting how
+  many places a mutation points at) and requires the suite to go red on the
   check that owns that behaviour. A mutation that hangs the suite counts as
   caught — an unbounded loop in the boot script is exactly what those guards
-  prevent. The harness keeps the unmutated text of every file it touches in
+  prevent. Two entries came back MISSED the first time they were written, and the
+  fault was in the harness rather than the checks: a script that wrote no state
+  file made the next line of the transcript fail its input redirection under
+  `set -e`, so the run exited non-zero with no failed check to name and every
+  check after it never ran. A suite that dies is not a suite that notices, so
+  `-e` is now off inside a scenario and promised files are read through a helper
+  that reports a missing one: the damage shows up as the red check it is. The harness keeps the unmutated text of every file it touches in
   memory and restores that text, never a fresh read from disk, and sweeps the
   tree against the baseline on the way out: a run that ends with a changed tree
   fails, because a clean verdict over a tree that was quietly modified means
@@ -658,7 +735,7 @@ when reading a green result:
   boot shows whether something else in the distro overrides it — which is exactly
   the bug the first card had.
 - **Torture** (M4): the 20 hard cuts of criterion 2, cut at arbitrary moments
-  including mid-write of the progress file, and checking that the stock
+  including mid-write of the state file, and checking that the stock
   `systemd-fsck` at boot repairs a volume left dirty rather than the box coming
   up with an unmounted `/data` and three failed units.
 
@@ -667,12 +744,13 @@ when reading a green result:
 | Risk | Impact | Mitigation |
 |---|---|---|
 | ≤10s not reached on stock-Debian userspace (Pi 4 SD I/O) | Goal miss | Critical-chain work is incremental; fallback ladder: faster SD → USB3 SSD → trimmed userspace, in that order, before considering Buildroot. A2 microSD is the starting point; the SSD is bought only if the first five-boot median misses |
-| Resume-last (§8.3) not natively supported by cliamp | Feature gap | Built and tested here: the appliance keeps its own `state`/`progress` files and replays them through IPC. What M1 still has to confirm is the IPC shape — that `cliamp load <name>` resolves a playlist by name and `queue.play {"index":N}` takes a row number (`cliamp remote call capabilities` lists the parameter hints) |
+| Resume-last (§8.3) not natively supported by cliamp | Feature gap | Built and tested here: the appliance keeps its own `state` record and replays it through IPC. Checked against a live cliamp 2.4.1: `status --json` pretty-prints with two-space indent, and a streaming-service playlist needs `provider.load` — `cliamp load` only resolves lists saved on the card. What still has to be seen on the card is `cliamp remote call capabilities` confirming that `provider.load` takes exactly `{"provider":…,"playlist":…}` |
+| A cold boot's DHCP lease arrives after the boot script asks the service for its list | Silent card, one failed unit in that boot's journal | Seen on the 2026-11-18 card: `provider.load` eight seconds before the lease, answered `sign-in required`. Fixed as §8.3 describes: the boot waits for a route within `STREAMER_NET_WAIT` before asking, scenario 18 checks both the late lease and no lease at all, and three mutation entries cover the wait, the probe and its budget |
 | Tidal revokes shared OAuth client IDs | Provider breakage | `client_id`/`client_secret` override in config; re-login path documented; alert on status code in logs |
 | cliamp updates change socket protocol (1.x → 2.x was a breaking change) | Control breakage | Pin cliamp version in image; upgrade deliberately via reflash/overlay update |
 | HAT EEPROM misdetection | No audio | `force_eeprom_read=0` plus an explicit `dtoverlay=iqaudio-dacplus` matched to the black board bought (§6.4); `/proc/device-tree/hat/product` confirms it on first boot, and `streamer audio jack` is one command away if it is wrong |
 | Ground-loop hum Pi→amp (a 1993 amp bonding the Pi's SMPS earth into its own analog ground) | Audible defect | Quality PSU; test before buying a galvanic isolator; isolate only if present. Note the cheap fix (inline 1:1 transformer) rolls off bass below ~40 Hz, so with full-range speakers the acceptable remedies are a proper isolator or breaking the loop at the PSU/mains side |
-| `/data` wear from state writes | SD wear-out | State is written on intent change and once a minute by `streamer-save` (a few bytes, ≈4 MB/day worst case); the journal is volatile, so nothing else is written to the card at all (§7) |
+| `/data` wear from state writes | SD wear-out | The state file is rewritten only when a person changes something — a station, a playlist, a level — a few hundred bytes through a temp file and a rename, so even a day of fiddling with the volume on the phone is kilobytes, not the megabytes the old one-minute timer wrote. The journal is volatile, so nothing else is written to the card at all (§7) |
 | Loud surprise at power-on: the amp's volume knob is a physical setting that survives a hard power cut | UX / possible speaker damage | Boot volume floor −30 dBFS (§6.4) bounds the worst case at ≤13 W even with the knob at maximum. The amp's own speaker-protection delay closes before the Pi produces audio, so there are no relay-clipped first seconds (§5.2) |
 | cliamp's software volume is undithered truncation, raising the hiss floor at low listening levels | Sound quality | Measured in M1 (§6.4); fallback is the codec's dithered digital volume driven from the same control surface |
 
@@ -699,8 +777,9 @@ when reading a green result:
   first boot that `/data` is already mounted and seeded, that root really is `ro`
   as systemd mounted it, and that SSH answers by key only — then music out of the
   jack while the HAT is in the post. Then, on the bench:
-  `cliamp remote call capabilities` to confirm the IPC forms the resume code
-  assumes (§8.3); what `cliamp radio --list` and the station list actually print;
+  `cliamp remote call capabilities` to confirm the IPC forms §8.3 assumes (the
+  pretty-printed `status --json` and the `provider.load` shape are already
+  confirmed on the running card); what `cliamp radio --list` and the station list actually print;
   whether cliamp's dB is dithered at 16-bit output (§6.4); the −30 dBFS floor and
   ramp at a reference dial position; the amp's speaker-relay close time
   (§5.2). Measure the baseline boot number here, before any tuning.

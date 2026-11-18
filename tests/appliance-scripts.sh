@@ -94,11 +94,15 @@ cp "$CFG"/etc/streamer/audio-*.txt "$T/"
 # script under test actually asked the player to do.
 cat >"$T/bin/cliamp" <<'PYEOF'
 #!/usr/bin/env python3
-import json, os, re, sys
+import json, os, re, sys, time
 S = os.path.join(os.environ["TESTROOT"], "state.json")
 # What a real daemon preloads. Row 0 is what a naive "play" would start.
 PRELOAD = ["cliamp radio: Omarchy", "cliamp radio: Chiptunes",
            "cliamp radio: Amiga", "cliamp radio: Lofi", "cliamp radio: Synthwave"]
+# The card has credentials for one streaming service and not the others, and so
+# does the stand-in: provider.load is refused for anything not on this list, the
+# way cliamp refuses a provider it was never configured with.
+CONFIGURED_PROVIDERS = ("tidal",)
 def fresh():
     return {"state": "stopped", "position": 0, "volume": -30,
             "index": -1, "queue": list(PRELOAD)}
@@ -166,8 +170,32 @@ if a[:1] != ["--default-state"]:
         f.write(" ".join(a) + "\n")
 if a[:1] == ["--daemon"]: sys.exit(0)
 if a[:1] == ["--version"]: print("fake-cliamp 9.9.9"); sys.exit(0)
+def view(d):
+    # The real 2.4.1 `cliamp status --json` pretty-prints, spells the row number
+    # twice (inside "track" and at the top level), and keeps "index" out of the
+    # output entirely until a row is current. The stand-in used to print its own
+    # storage dict, compact and single-line, and a key lookup written only for
+    # that shape silently returned nothing on the card: every number the boot
+    # script read from the player came back empty. Same lesson as the IPC
+    # envelope: the stand-in has to lie as little as possible.
+    q = d.get("queue", [])
+    i = d.get("index", -1)
+    v = {"ok": True, "state": d.get("state", "stopped")}
+    if 0 <= i < len(q):
+        v["track"] = {"title": q[i], "artist": "fake artist",
+                      "path": "fake://row/%d" % i, "index": i, "stream": True}
+    if d.get("name"):
+        v["playlist"] = "%s:%s" % (d.get("provider") or "local", d["name"])
+    v["total"] = len(q)
+    v["shuffle"] = False
+    v["repeat"] = "Off"
+    v["position"] = d.get("position", 0)
+    v["volume"] = d.get("volume", 0)
+    if i >= 0:
+        v["index"] = i
+    sys.stdout.write(json.dumps(v, indent=2) + "\n")
 if a[:1] == ["--default-state"]: out(fresh()); sys.exit(0)
-if a[:1] == ["status"]:   out(load()); sys.exit(0)
+if a[:1] == ["status"]:   view(load()); sys.exit(0)
 if a[:1] == ["logs"]:     sys.exit(0)
 if a[:1] in (["pause"], ["toggle"], ["next"], ["previous"], ["save"]):
     d = load()
@@ -192,6 +220,20 @@ if a[:1] == ["load"]:
     # replaces the playlist, and leaves no row current until something plays
     d = load(); d["queue"] = ["%s: row %d" % (a[1], i) for i in range(12)]
     d["index"] = -1; d["name"] = a[1]; save(d); sys.exit(0)
+if a[:3] == ["remote", "call", "provider.load"]:
+    # provider.load pulls a playlist that lives on a streaming service into the
+    # live list, and starts playing it. That is what the boot does for a
+    # kind=provider target and what the phone does when one is tapped, so the
+    # stand-in has to answer both the same way.
+    prov, pid = sarg("provider"), sarg("playlist")
+    if prov not in CONFIGURED_PROVIDERS:
+        # The card has credentials for some services and not others, and cliamp
+        # says so by refusing the call. A boot that ignored that answer would
+        # log a clean play of a playlist nobody can hear.
+        sys.exit("Error: no credentials configured for provider %s" % prov)
+    d = load(); d["queue"] = ["%s: row %d" % (pid, i) for i in range(8)]
+    d["index"] = 0; d["name"] = pid; d["provider"] = prov
+    d["state"] = "playing"; save(d); sys.exit(0)
 if a[:1] == ["play"]:
     d = load()
     if d["index"] < 0:
@@ -247,6 +289,21 @@ case " $* " in
 esac
 exit 0
 EOF
+cat >"$T/bin/ip" <<'EOF'
+#!/bin/sh
+# The network as a build host has it: usable, unless a scenario says otherwise.
+# A stream URL is checked by resolving its host, but a playlist on a streaming
+# service has no host in its target, so streamer-play falls back to asking for a
+# route and an address. Neither answer should depend on the machine running the
+# suite, which may have neither iproute2 nor a default route: so the answer is
+# here, and the file net-down is how a scenario takes it away. Each call is
+# counted, because "it waited for the network" is only a check if the number of
+# asks is visible.
+printf '%s\n' "$*" >>"$TESTROOT/ip.log"
+[ -f "$TESTROOT/net-down" ] && exit 1
+echo "1.1.1.1 dev eth0 table main src 192.168.88.7"
+exit 0
+EOF
 # The station list belongs to the radio service, so a build host with no network
 # would otherwise fail for the wrong reason. The fixture is the shape that
 # service really answers with, captured from https://radio.cliamp.stream/
@@ -259,7 +316,7 @@ case "\$*" in
     *) exit 22 ;;
 esac
 EOF
-chmod +x "$T/bin/cliamp" "$T/bin/systemctl" "$T/bin/mount" "$T/bin/curl"
+chmod +x "$T/bin/cliamp" "$T/bin/systemctl" "$T/bin/mount" "$T/bin/ip" "$T/bin/curl"
 
 cat >"$T/bin/chown" <<'EOF'
 #!/bin/sh
@@ -306,7 +363,7 @@ sandbox() { # sandbox <script name>
         "$CFG/usr/local/bin/$1" >"$T/$1"
     chmod +x "$T/$1"
 }
-for s in streamer-bootlog streamer-play streamer-save streamer streamer-http; do
+for s in streamer-bootlog streamer-play streamer streamer-http; do
     sandbox "$s"
 done
 
@@ -319,6 +376,7 @@ reset() { # the data partition as the card ships it, a player as a live daemon
     for d in $DATA_DIRS; do install -d "$T/data/$d"; done
     "$T/bin/cliamp" --default-state >"$T/state.json"
     rm -f "$T/player.log"
+    rm -f "$T/ip.log" "$T/net-down"
     fw_seed jack
 }
 
@@ -457,10 +515,24 @@ rows() { # how many rows the stand-in player has loaded
     python3 -c 'import json, sys; print(len(json.load(sys.stdin).get("queue", [])))' \
         <"$T/state.json"; }
 log_tail() { printf 'boot.log:\n'; sed 's/^/  /' "$T/data/streamer/boot.log" 2>/dev/null || echo "  (none)"; }
+oneline() { # oneline <file>: that file on one line, or a note that it is not there.
+    # Reading what a script was supposed to write has to work when the script
+    # did not write it: that is a failed check, and a check has to be runnable
+    # to fail. `tr '\n' ' ' <file` dies on the spot instead, and a dead harness
+    # reports nothing after the line it died on.
+    if [ -f "$1" ]; then tr '\n' ' ' <"$1"; else printf '(no %s)' "${1##*/}"; fi; }
 
 # Every scenario ends with its checks. The transcripts are there to read when a
 # check fails, not as the verdict on their own.
 run() { # run <scenario number>
+    # -e stays off inside a scenario. A command that fails is a thing the checks
+    # are there to notice; letting it abort the harness loses every check after
+    # it, in this scenario and in all the later ones, and the run then exits
+    # non-zero for a reason no check owns. Two mutation entries found this: a
+    # level that is played but never written down killed the run on the display
+    # line that tried to read the missing state file, so the check that should
+    # have gone red never ran. -u stays on.
+    set +e
     case "$1" in
     1) note "1. first boot: no saved state, the default station, ramp to the fallback level"
         reset; socket_on
@@ -478,41 +550,66 @@ run() { # run <scenario number>
         ck_in "boot.log records the play" "$T/data/streamer/boot.log" "OK url http://localhost/x.mp3"
         ck_in "boot.log records the level it reached" "$T/data/streamer/boot.log" "(target -20)"
         ck_in "it says the level came from the fallback" "$T/logs/s1" "no saved volume" ;;
-    2) note "2. resume: playlist 'Late Night', row 7, 412s in, at the saved -9 dB"
+    2) note "2. resume: playlist 'Late Night' at the saved -9 dB"
         reset; socket_on
-        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'position=412\nindex=7\nvolume=-9\n' >"$T/data/streamer/progress"
+        printf 'mode=last\nkind=playlist\ntarget=Late Night\nvolume=-9\n' >"$T/data/streamer/state"
         if "$T/streamer-play" >"$T/logs/s2" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s2"; player
         socket_off
         ck_eq "exit status 0" "$rc" "0"
         ck_eq "the preloaded channels were replaced" "$(jrow 0)" "Late Night: row 0"
-        ck_eq "row 7 is playing" "$(jnum index)" "7"
-        ck_eq "back to the saved position" "$(jnum position)" "412"
+        ck_eq "row 0 plays: the appliance keeps what, not where" "$(jnum index)" "0"
+        ck_not "it does not reach back into the playlist" "$T/player.log" "seek.absolute"
         ck_eq "the saved level is replayed" "$(jnum volume)" "-9"
-        ck_in "boot.log records the resume" "$T/data/streamer/boot.log" "resumed at row 7"
+        ck_not "it does not claim there was no saved level" "$T/logs/s2" "no saved volume"
         ck_in "boot.log records the play" "$T/data/streamer/boot.log" "OK playlist Late Night"
         ck_in "boot.log records the level it reached" "$T/data/streamer/boot.log" "(target -9)" ;;
-    3) note "3. streamer-save while playing, then a resume from what it wrote"
+    3) note "3. saving on change: the level a person set, and a playlist the phone started"
         reset; socket_on
         "$T/streamer-play" >/dev/null 2>&1
-        # Move the stand-in to a mid-album spot, the way a real session would be
-        # when the timer fires, and check the saved file says the same thing.
-        "$T/bin/cliamp" remote call queue.play --params '{"index":4}' --wait >/dev/null
-        "$T/bin/cliamp" remote call seek.absolute --params '{"value":613.7}' --wait >/dev/null
-        "$T/streamer-save"; echo "  exit $?"
-        echo "  progress: $(tr '\n' ' ' <"$T/data/streamer/progress")"
-        ck_in "progress keeps the row" "$T/data/streamer/progress" "index=4"
-        ck_in "progress keeps the position" "$T/data/streamer/progress" "position=613"
-        ck_in "progress keeps the level" "$T/data/streamer/progress" "volume=-20"
-        echo "  and a resume from it:"
-        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        if "$T/streamer-play" >/dev/null 2>&1; then rc=0; else rc=$?; fi
-        player
+        # A session in progress: something is playing, and the level is wherever
+        # the boot left it. Nothing writes the record on a timer, so the file is
+        # still without a level line at this point.
+        echo "  before anyone touches anything:"
+        oneline "$T/data/streamer/state"; echo
+        ck_not "nothing has recorded a level yet" "$T/data/streamer/state" "volume="
+        if "$T/streamer" vol -12 >"$T/logs/vol" 2>&1; then rc=0; else rc=$?; fi
+        sed 's/^/  /' "$T/logs/vol"
+        echo "  after streamer vol -12:"; oneline "$T/data/streamer/state"; echo
+        ck_eq "setting the level on a running player exits 0" "$rc" "0"
+        ck_in "the change is written down at once" "$T/data/streamer/state" "volume=-12"
+        ck_in "the boot target is recorded alongside it" "$T/data/streamer/state" "target=http://localhost/x.mp3"
+        if "$T/streamer" down 3 >"$T/logs/down" 2>&1; then rc=0; else rc=$?; fi
+        sed 's/^/  /' "$T/logs/down"
+        echo "  after streamer down 3:"; oneline "$T/data/streamer/state"; echo
+        ck_eq "stepping the level down exits 0" "$rc" "0"
+        ck_in "a step up or down is remembered the same way" "$T/data/streamer/state" "volume=-15"
+        # The phone tapping a Tidal playlist: playback is started over IPC, and
+        # the boot target is written through the streamer command with the
+        # provider:id spelling, without restarting the sequence underneath it.
+        if "$T/streamer" remember playlist tidal:e407f56e >"$T/logs/rem" 2>&1; then
+            rc=0; else rc=$?; fi
+        sed 's/^/  /' "$T/logs/rem"
+        echo "  after remember playlist tidal:e407f56e:"; oneline "$T/data/streamer/state"; echo
+        ck_eq "recording next boot exits 0" "$rc" "0"
+        ck_in "the playlist is what plays next boot" "$T/data/streamer/state" "kind=provider"
+        ck_in "on that provider" "$T/data/streamer/state" "provider=tidal"
+        ck_in "by that id" "$T/data/streamer/state" "target=e407f56e"
+        ck_in "the level survives the rewrite" "$T/data/streamer/state" "volume=-15"
+        ck_not "and recording it did not restart the player" "$T/systemctl" "restart streamer-play.service"
+        echo "  and a boot from it, with the player as it is after a reboot:"
+        rm -f "$T/state.json" "$T/player.log"
+        "$T/bin/cliamp" --default-state >"$T/state.json"
+        if "$T/streamer-play" >"$T/logs/s3" 2>&1; then rc=0; else rc=$?; fi
+        sed 's/^/  /' "$T/logs/s3"; player
         socket_off
         ck_eq "exit status 0" "$rc" "0"
-        ck_eq "the row it saved is the row it plays" "$(jnum index)" "4"
-        ck_eq "the position it saved is the position it seeks" "$(jnum position)" "613" ;;
+        ck_has "the boot asked the player for the provider playlist" "$(cat "$T/player.log")" "provider.load"
+        ck_eq "the provider playlist is loaded" "$(jrow 0)" "e407f56e: row 0"
+        ck "provider.load started it, so the boot did not start it again" \
+            "[ -z \"$(pln 'queue.play')\" ]"
+        ck_eq "and the level came back to the -15 dB that was saved" "$(jnum volume)" "-15"
+        ck_in "boot.log names the provider playlist" "$T/data/streamer/boot.log" "OK provider e407f56e" ;;
     4) note "4. stop mode: stay quiet"
         reset; socket_on
         printf 'mode=stop\nkind=url\ntarget=http://localhost/x.mp3\n' >"$T/data/streamer/state"
@@ -527,7 +624,7 @@ run() { # run <scenario number>
     5) note "5. a saved level of +99 dB is clamped to STREAMER_VOL_MAX"
         reset; socket_on
         printf 'mode=last\nkind=url\ntarget=http://localhost/x.mp3\n' >"$T/data/streamer/state"
-        printf 'position=0\nindex=-1\nvolume=99\n' >"$T/data/streamer/progress"
+        printf 'volume=99\n' >>"$T/data/streamer/state"
         if "$T/streamer-play" >"$T/logs/s7" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s7"; player
         socket_off
@@ -544,9 +641,9 @@ run() { # run <scenario number>
     7) note "7. streamer, the SSH-facing control: what it reports"
         reset; socket_on
         printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'position=412\nindex=7\nvolume=-9\n' >"$T/data/streamer/progress"
+        printf 'volume=-9\n' >>"$T/data/streamer/state"
         echo "-- streamer last"; "$T/streamer" last >"$T/logs/last" 2>&1; sed 's/^/  /' "$T/logs/last"
-        echo "-- streamer status"; "$T/streamer" status | sed 's/^/  /'
+        echo "-- streamer status"; "$T/streamer" status >"$T/logs/status" 2>&1; sed 's/^/  /' "$T/logs/status"
         echo "-- streamer audio, with no argument, reports the live block"
         "$T/streamer" audio | grep -v '^#' | grep -v '^$' | sed 's/^/  /'
         echo "-- streamer stations, from the list in STREAMER_STATION_LIST"
@@ -571,6 +668,9 @@ run() { # run <scenario number>
         for i in 1 2 3 4 5 6 7; do "$T/streamer-bootlog" "line $i"; done
         echo "  lines kept: $(wc -l <"$T/data/streamer/boot.log")"
         ck_in "last reports the saved intent" "$T/logs/last" "Late Night"
+        ck_in "and the level the next session starts at" "$T/logs/last" "at -9 dB"
+        ck_in "status repeats the saved level" "$T/logs/status" "boot level:  -9 dB"
+        ck_in "status repeats the saved target" "$T/logs/status" "boot target: playlist Late Night"
         ck_eq "stations pairs each name with its stream, one per line" \
             "$(grep -c "	https://radio.cliamp.stream/.*/stream$" "$T/logs/stations")" "4"
         ck_in "and the pairing is the right way round" "$T/logs/stations" \
@@ -581,6 +681,10 @@ run() { # run <scenario number>
         ck_eq "the usage text is more than one line" "$([ "$(wc -l <"$T/logs/nonsense")" -gt 3 ] && echo yes)" "yes"
         ck_in "usage starts with the synopsis" "$T/logs/nonsense" "streamer [command]"
         ck_in "usage lists the audio switch" "$T/logs/nonsense" "streamer audio [jack|dac]"
+        ck_in "usage lists what gets remembered for the next boot" "$T/logs/nonsense" \
+            "streamer remember <what> <target>"
+        ck_not "and no longer offers to drop a position that is not kept" "$T/logs/nonsense" \
+            "forget"
         ck_eq "streamer rw then ro leaves the root read-only, in that order" \
             "$(tr '\n' ' ' <"$T/mount-root")" "rw ro "
         ck_eq "boot.log keeps the configured window" "$(wc -l <"$T/data/streamer/boot.log")" "4"
@@ -624,33 +728,33 @@ run() { # run <scenario number>
     9) note "9. a saved level at or below the floor is treated as parked, not replayed"
         reset; socket_on
         printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'position=0\nindex=0\nvolume=-30\n' >"$T/data/streamer/progress"
+        printf 'volume=-30\n' >>"$T/data/streamer/state"
         if "$T/streamer-play" >"$T/logs/s11a" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s11a"
         ck_eq "exit status 0" "$rc" "0"
         ck_eq "the parked -30 dB became the fallback" "$(jnum volume)" "-20"
         ck_in "and boot.log says so" "$T/data/streamer/boot.log" "saved volume -30 at the floor, using -20"
-        printf 'position=0\nindex=0\nvolume=-99\n' >"$T/data/streamer/progress"
+        printf 'volume=-99\n' >>"$T/data/streamer/state"
         if "$T/streamer-play" >"$T/logs/s11b" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s11b"; player
         socket_off
         ck_eq "exit status 0" "$rc" "0"
         ck_eq "a level below the floor became the fallback too" "$(jnum volume)" "-20"
         ck_in "and boot.log says so" "$T/data/streamer/boot.log" "saved volume -99 at the floor, using -20" ;;
-    10) note "10. a saved row that no longer exists falls back to row 0, and still plays"
+    10) note "10. a provider the player has no credentials for: the boot says which one, and stops"
         reset; socket_on
-        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'position=412\nindex=99\nvolume=-9\n' >"$T/data/streamer/progress"
+        printf 'mode=last\nkind=provider\ntarget=pl-42\nprovider=qobuz\nvolume=-9\n' >"$T/data/streamer/state"
         if "$T/streamer-play" >"$T/logs/s12" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s12"; player
         socket_off
-        ck_eq "exit status 0" "$rc" "0"
-        ck_eq "something is playing" "$(jstr state)" "playing"
-        ck_eq "row 0 after the refused row 99" "$(jnum index)" "0"
-        ck_eq "the seconds from the vanished row are not replayed on row 0" \
-            "$(jnum position)" "0"
-        ck_in "boot.log records the refused jump" "$T/data/streamer/boot.log" "FAIL queue.play index=99"
-        ck_in "boot.log still records the play" "$T/data/streamer/boot.log" "OK playlist Late Night" ;;
+        ck "exit status is non-zero" "[ $rc -ne 0 ]"
+        ck_eq "nothing is playing" "$(jstr state)" "stopped"
+        ck_in "boot.log names the provider and the list it could not fetch" \
+            "$T/data/streamer/boot.log" "FAIL provider.load qobuz pl-42"
+        ck_not "it does not pretend the target was unknown" \
+            "$T/data/streamer/boot.log" "FAIL unknown kind provider"
+        ck_not "and it does not quietly swap in the default station" \
+            "$T/player.log" "url.load" ;;
     11) note "11. the ramp never outlives the boot: a step budget, and a level that will not move"
         reset; socket_on
         # 13a. The player will not go past -12 dB: a hardware limit, standing in
@@ -659,7 +763,7 @@ run() { # run <scenario number>
         # unit's start timeout is what would end it.
         printf -- '-12\n' >"$T/stuck-at"
         printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'position=0\nindex=0\nvolume=-9\n' >"$T/data/streamer/progress"
+        printf 'volume=-9\n' >>"$T/data/streamer/state"
         if "$T/streamer-play" >"$T/logs/s13a" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s13a"; player
         ck_eq "the boot still ends cleanly" "$rc" "0"
@@ -673,7 +777,7 @@ run() { # run <scenario number>
         sed -i 's/^STREAMER_RAMP_MAX_STEPS=.*$/STREAMER_RAMP_MAX_STEPS=2/' "$T/streamer.conf"
         reset; socket_on
         printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'position=0\nindex=0\nvolume=-9\n' >"$T/data/streamer/progress"
+        printf 'volume=-9\n' >>"$T/data/streamer/state"
         if "$T/streamer-play" >"$T/logs/s13b" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s13b"; player
         socket_off
@@ -695,7 +799,7 @@ run() { # run <scenario number>
         # climbing straight back over a level someone has just set by hand.
         printf -- '-40\n' >"$T/set-elsewhere"
         printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'position=0\nindex=0\nvolume=-9\n' >"$T/data/streamer/progress"
+        printf 'volume=-9\n' >>"$T/data/streamer/state"
         if "$T/streamer-play" >"$T/logs/s14" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s14"; player
         socket_off; rm -f "$T/set-elsewhere"
@@ -943,7 +1047,7 @@ run() { # run <scenario number>
         # to diagnose a month later.
         printf 'mode=last\nkind=url\ntarget=https://example.org/stale/stream\n' \
             >"$T/data/streamer/state"
-        printf 'position=99\nindex=3\nvolume=-4\n' >"$T/data/streamer/progress"
+        printf 'volume=-4\n' >>"$T/data/streamer/state"
         install -d "$T/data/cliamp" "$T/data/music" "$T/data/bin"
         printf 'token = "not-a-real-token"\n' >"$T/data/cliamp/config.toml"
         printf 'hidden\n' >"$T/data/.hidden"
@@ -976,12 +1080,12 @@ run() { # run <scenario number>
         ck_in "the template's README came across too" "$T/data/README" "template"
         ck "the saved intent is gone, so the next boot starts from the defaults" \
             "[ ! -e \"$T/data/streamer/state\" ]"
-        ck "as is the position, the local music, and the Tidal sign-in" \
-            "[ ! -e \"$T/data/streamer/progress\" ] && [ ! -e \"$T/data/music/song.flac\" ] && [ ! -e \"$T/data/cliamp/config.toml\" ]"
+        ck "as are the local music and the Tidal sign-in" \
+            "[ ! -e \"$T/data/music/song.flac\" ] && [ ! -e \"$T/data/cliamp/config.toml\" ]"
         ck "and so is the dotfile, which is why this does not use a glob" \
             "[ ! -e \"$T/data/.hidden\" ]"
         ck_eq "so 'streamer last' falls back to the configured default" \
-            "$("$T/streamer" last)" "url http://localhost/x.mp3"
+            "$("$T/streamer" last)" "last url http://localhost/x.mp3"
         ck_in "the durable log records the reset" "$T/data/streamer/boot.log" "factory reset"
         # The order of the two systemctl calls is not decoration: the player holds
         # the IPC socket and its configuration directory open, and its exit handler
@@ -1146,6 +1250,8 @@ run() { # run <scenario number>
             "$(http POST /api/op/toggle '{}'; http GET /api/status)" '"state":"playing"'
         ck_has "a level set from the phone lands on the player" \
             "$(http POST /api/op/volume '{"value":-12}'; http GET /api/status)" '"volume":-12'
+        ck_in "and it is the level the next boot will start at" \
+            "$T/data/streamer/state" "volume=-12"
         # Browsing a provider the TUI reached for: Tidal over HTTP is the whole
         # reason this server exists next to the widget.
         ck_has "the provider list names Tidal" "$(http GET /api/providers)" '"key":"tidal"'
@@ -1171,6 +1277,12 @@ run() { # run <scenario number>
             "$(http POST /api/load/playlist '{"provider":"tidal","id":"pl-1"}')" '"ok":true'
         ck_eq "provider.load carried the provider and the list id" \
             "$(grep -c '^provider.load {"provider":"tidal","playlist":"pl-1"}' "$T/ipc.log")" "1"
+        ck_in "that tap is what the next boot will load, as a provider target" \
+            "$T/data/streamer/state" "kind=provider"
+        ck_in "with its provider named" "$T/data/streamer/state" "provider=tidal"
+        ck_in "and its list id" "$T/data/streamer/state" "target=pl-1"
+        ck_not "and recording it did not restart the boot sequence under the music" \
+            "$T/systemctl" "restart streamer-play.service"
         # Boot intent is the part with consequences, so the guards are checked
         # in both directions: the sanctioned path, and the rejections around it.
         ck_has "a station set from the phone writes the boot intent" \
@@ -1194,6 +1306,110 @@ run() { # run <scenario number>
         ck_eq "mode=stop is what the state file says now" \
             "$(sed -n 's/^mode=//p' "$T/data/streamer/state")" "stop"
         http_stop; ipc_off ;;
+    18) note "18. a provider playlist whose network has not arrived yet"
+        reset; socket_on
+        # The card's own failure, 2026-11-18: DHCP's lease landed at 02:27:51
+        # and provider.load was asked for at 02:27:43, so cliamp had no route to
+        # refresh Tidal's session with and answered "sign-in required". A
+        # provider target is a bare playlist id with no hostname in it, which is
+        # why the name-resolution wait never applied to it.
+        sed -i 's/^STREAMER_NET_WAIT=.*$/STREAMER_NET_WAIT=2/' "$T/streamer.conf"
+        printf 'mode=last\nkind=provider\ntarget=pl-42\nprovider=tidal\nvolume=-9\n' >"$T/data/streamer/state"
+        # The lease lands half a second into the boot.
+        touch "$T/net-down"; ( sleep 0.5; rm -f "$T/net-down" ) >/dev/null 2>&1 &
+        if "$T/streamer-play" >"$T/logs/s18a" 2>&1; then rc=0; else rc=$?; fi
+        sed 's/^/  /' "$T/logs/s18a"; player
+        echo "  route asked for: $(wc -l <"$T/ip.log") times"
+        ck_eq "a lease that arrives late does not fail the boot" "$rc" "0"
+        ck "it asked more than once, so it waited rather than guessed" \
+            "[ $(wc -l <"$T/ip.log") -gt 1 ]"
+        ck_eq "the provider playlist is playing" "$(jrow 0)" "pl-42: row 0"
+        ck_eq "at the level that was saved" "$(jnum volume)" "-9"
+        ck_not "a boot that got there wrote no failure" "$T/data/streamer/boot.log" "FAIL"
+        ck_in "the one line it did write is the play" "$T/data/streamer/boot.log" "OK provider pl-42"
+        # No network at all, the other half: it has to stop, inside the budget it
+        # was given, and without ever asking the player for something the player
+        # could not have fetched.
+        rm -f "$T/state.json" "$T/player.log" "$T/ip.log" "$T/data/streamer/boot.log"
+        "$T/bin/cliamp" --default-state >"$T/state.json"
+        touch "$T/net-down"
+        if "$T/streamer-play" >"$T/logs/s18b" 2>&1; then rc=0; else rc=$?; fi
+        sed 's/^/  /' "$T/logs/s18b"
+        socket_off
+        ck_eq "with no network the boot fails" "$rc" "1"
+        ck_eq "inside the seconds it was given, not one more" \
+            "$(wc -l <"$T/ip.log")" "$((2 * 4 + 1))"
+        ck_in "boot.log says what was missing" \
+            "$T/data/streamer/boot.log" "FAIL no network route for provider pl-42"
+        ck_not "and it never asked the player for the playlist" \
+            "$T/player.log" "provider.load" ;;
+    19) note "19. the tool that breaks the payloads on purpose: its own guards"
+        # tests/mutation-check.py rewrites the payload files, so two of its
+        # guards are worth checking here, in a tenth of a second, rather than
+        # only inside a nine-minute sweep: the anchor pass it runs before
+        # breaking anything, and the journal it keeps in case the sweep is
+        # killed between writing and restoring. The second one is not
+        # hypothetical: a journal left by a sweep that died in an earlier
+        # session once restored a payload over a newer version of itself, which
+        # quietly undid work and read, for a confusing while, as five typos in
+        # the mutation list.
+        python3 - "$T" >"$T/logs/meta" 2>&1 <<'PY'
+import importlib.util, pathlib, sys
+spec = importlib.util.spec_from_file_location("mc", "tests/mutation-check.py")
+mc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mc)
+
+# The anchor pass, against the real definitions and the real payloads: an anchor
+# that occurs twice mutates the wrong line, and an anchor that occurs nowhere
+# tests nothing while still reporting a verdict.
+print("preflight problems: %d" % mc.preflight())
+
+tmp = pathlib.Path(sys.argv[1]) / "meta"
+tmp.mkdir(parents=True, exist_ok=True)
+
+# The same pass, aimed at three definitions that are known to be wrong, so the
+# count is the thing being checked and not merely the absence of a complaint.
+mc.ROOT = tmp
+(tmp / "pay.sh").write_text("X\nX\nY\n")
+(tmp / "tests").mkdir(exist_ok=True)
+(tmp / "tests/appliance-scripts.sh").write_text('ck "the one label that exists" x y\n')
+mc.MUTATIONS = [
+    ("points at two places", "pay.sh", "X\n", "Z\n", "the one label that exists"),
+    ("points at no place", "pay.sh", "Q\n", "Z\n", "the one label that exists"),
+    ("has no check to notice it", "pay.sh", "Y\n", "Z\n", "a label nothing carries"),
+]
+mc.JOURNAL = tmp / "journal"
+print("planted problems: %d" % mc.preflight())
+
+# The journal, against the same scratch tree: nothing here may touch the payloads.
+(tmp / "pay.sh").write_text("A\nC\n")          # the damage is still sitting there
+mc.JOURNAL.write_text("pay.sh\ndrop a line\nA\nB\nC\n")
+mc.MUTATIONS = [("drop a line", "pay.sh", "B\n", "", "the one label that exists")]
+mc.recover()
+print("matching journal undone: %s" % ((tmp / "pay.sh").read_text() == "A\nB\nC\n"))
+print("journal left behind: %s" % mc.JOURNAL.exists())
+
+(tmp / "pay.sh").write_text("A\nB\nC\nD\n")    # the file has moved on since
+mc.JOURNAL.write_text("pay.sh\ndrop a line\nA\nB\nC\n")
+mc.recover()
+print("stale journal left the newer file: %s" % ((tmp / "pay.sh").read_text() == "A\nB\nC\nD\n"))
+print("journal left behind again: %s" % mc.JOURNAL.exists())
+PY
+        sed 's/^/  /' "$T/logs/meta"
+        ck_eq "every mutation names one line of a payload, and a check owns its label" \
+            "$(grep 'preflight problems:' "$T/logs/meta")" "preflight problems: 0"
+        ck_eq "the anchor pass reports a doubled anchor, a missing anchor, and an unowned label" \
+            "$(grep 'planted problems:' "$T/logs/meta")" "planted problems: 3"
+        ck_in "a journal that describes damage still in the file is undone" \
+            "$T/logs/meta" "matching journal undone: True"
+        ck_in "the journal it used is consumed, not kept" \
+            "$T/logs/meta" "journal left behind: False"
+        ck_in "a journal from an older run cannot overwrite the file as it is now" \
+            "$T/logs/meta" "stale journal left the newer file: True"
+        ck_in "it says which journal it threw away, rather than fixing it silently" \
+            "$T/logs/meta" "discarded rather than applied"
+        ck_in "and that journal is consumed too" \
+            "$T/logs/meta" "journal left behind again: False" ;;
     esac
     log_tail
 }
@@ -1202,7 +1418,7 @@ echo "sandbox: $T"
 if [ $# -gt 0 ]; then
     for n in "$@"; do run "$n"; done
 else
-    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17; do run "$n"; done
+    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do run "$n"; done
 fi
 
 printf '\n%d checks, %d failed\n' "$((pass + fail))" "$fail"

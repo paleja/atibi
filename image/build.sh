@@ -607,7 +607,6 @@ enable streamer.target         multi-user.target
 enable streamer-cliamp.service streamer.target
 enable streamer-play.service   streamer.target
 enable streamer-http.service   streamer.target
-enable streamer-save.timer     timers.target
 
 # Stock Raspberry Pi OS leaves ssh switched off unless a /boot/firmware/ssh
 # marker happens to exist at boot. There is no screen or keyboard on this box,
