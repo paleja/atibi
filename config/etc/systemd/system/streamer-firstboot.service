@@ -1,14 +1,18 @@
 [Unit]
-Description=Set up the streamer data partition
+Description=Set up and grow the streamer data partition
 Documentation=file:/etc/streamer.conf
-# Runs before /data is mounted, because rewriting a partition table and making
-# a filesystem is something nothing else may be holding. ConditionFirstBoot is
-# not used: it is tied to an uninitialised /etc, and this box has already
-# consumed that first boot before the appliance ever starts.
+# Runs before /data is mounted: resizing a partition and an ext4 is something
+# nothing else may be holding. It is not a one-shot and has no condition on the
+# provisioning marker - the partition table can only be written in a boot where
+# the kernel still sees the old geometry, so the filesystem has to catch up in
+# the boot after that. Every check it makes is cheap and reads current facts,
+# so a mature boot runs it, finds the sizes agree, and leaves.
+# ConditionFirstBoot is not used either: it is tied to an uninitialised /etc,
+# and this box has already consumed that first boot before the appliance ever
+# starts.
 DefaultDependencies=no
 After=systemd-udevd.service local-fs-pre.target
 Before=local-fs.target data.mount
-ConditionPathExists=!/etc/streamer/provisioned
 
 [Service]
 Type=oneshot

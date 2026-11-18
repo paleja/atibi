@@ -1,149 +1,355 @@
-#!/bin/sh
-# streamer-firstboot - one-time provisioning of the data partition.
+# streamer-firstboot - provisioning of the data partition, and its growth into
+# whatever card the image was written to.
 #
-# It runs before /data is mounted, which is the only safe moment to lay out a
-# filesystem on the last partition. The image ships that partition as a
-# partition table entry with no filesystem: its real size is only known once
-# the card it was written to is known.
+# It runs before /data is mounted, the only moment when nothing else is holding
+# the last partition. It is deliberately NOT a one-shot: the growth cannot
+# finish inside one boot, because the running kernel refuses to re-read a
+# partition table on a disk whose partitions are mounted - and root lives on
+# that same card. So the layout converges over at most three boots:
 #
-# In order:
-#   1. grow the last partition to the end of the card, if the card is bigger
-#      than the image the partition table was written from
-#   2. make an ext4 filesystem on it, unless one is already there
-#   3. build the appliance directories, and seed the cliamp config
-#   4. switch the root filesystem to read-only in /etc/fstab, and allow sudo
-#      without a password (the only way in is an SSH key; see docs/PRD.md)
-#   5. write the marker that keeps this script from running again, and reboot
+#   boot 1  write the new partition table, seed /data, switch the root to
+#           read-only in fstab, allow password-free sudo, and record the
+#           geometry that was asked for in /etc/streamer/geometry-target.
+#           streamer-bootcount reads that record in the same boot and asks
+#           systemd for one more boot, because only a unit that runs after the
+#           filesystems are mounted can reach reboot.service
+#   boot 2  the kernel has read the new table: resize2fs brings the shipped
+#           ext4 up to the grown partition, and the box plays
+#   later   every check below reads the same facts and finds nothing to do
+#
+# Two things about that sequence are easy to get wrong and load-bearing:
+#
+#   - /data is seeded on a private mount point under /run, not through the /data
+#     directory. This unit runs before data.mount, so /data is an empty
+#     directory on the root at the time, and a tree seeded through it would be
+#     buried by the real mount and leave /data empty forever.
+#   - whether the tree exists is read from the data partition itself, from its
+#     .ready file. A marker kept in /etc instead is a second copy of that fact,
+#     and the copy that survives a factory reset of /data is the wrong one.
+#
+# The image ships /data with an ext4 already in it, at its build size. That is
+# what makes this survivable: if the growth ever goes wrong, /data is still
+# mountable, so /data/.ready exists and the player still starts. The old
+# design - a bare partition entry whose filesystem appeared on first boot -
+# had one failure mode that bricked the card: data.mount fails, every unit
+# that needs it fails with it, and neither a writable root nor a password-free
+# sudo exists yet to repair it, because firstboot is the thing that died.
 set -eu
 
-# The kernel command line says ro, and this script has to write /etc/fstab,
-# /etc/sudoers.d and the marker in /etc/streamer. Ask for a writable root
-# instead of hoping something else already did it.
-mount -o remount,rw / || { echo "cannot make the root filesystem writable" >&2; exit 1; }
+# Whether the root has to be made writable is decided further down, from facts
+# read off the disk, and the root is only made writable when one of the writes
+# below still has something to say. Every pass that ran on a mature boot must
+# leave the root read-only: remounting it rw on every boot would quietly undo
+# the whole power-cut design.
 
-# /data is named the way fstab names it, which is usually a PARTUUID and not a
-# device name, so translate it before anything tries to use it as a path.
-spec=$(awk '$1 !~ /^#/ && $2 == "/data" {print $1; exit}' /etc/fstab)
-[ -n "$spec" ] || { echo "no /data line in /etc/fstab" >&2; exit 1; }
-case $spec in
-    PARTUUID=*)  DATA_DEV=/dev/disk/by-partuuid/${spec#PARTUUID=} ;;
-    PARTLABEL=*) DATA_DEV=/dev/disk/by-partlabel/${spec#PARTLABEL=} ;;
-    UUID=*)      DATA_DEV=/dev/disk/by-uuid/${spec#UUID=} ;;
-    LABEL=*)     DATA_DEV=/dev/disk/by-label/${spec#LABEL=} ;;
-    /dev/*)      DATA_DEV=$spec ;;
-    *) echo "do not know how to find a partition named $spec" >&2; exit 1 ;;
+# Which partition to grow comes from fstab, the same place the mount reads it
+# from. A PARTUUID baked into a script would be a second copy of that fact, and
+# two copies is how a script ends up resizing somebody else's card. fstab's
+# device field is the third field on the line, after the comment-free device and
+# the mount point: PARTUUID=27b94958-03  /data  ext4  ...
+data_spec=$(awk '$2 == "/data" && $1 !~ /^#/ {print $1; exit}' /etc/fstab)
+[ -n "$data_spec" ] || { echo "fstab has no /data line to take its partition from" >&2; exit 1; }
+case $data_spec in
+    PARTUUID=*) DATA_DEV=/dev/disk/by-partuuid/"${data_spec#PARTUUID=}" ;;
+    /dev/*)     DATA_DEV=$data_spec ;;
+    *) echo "do not know how to find a partition given '$data_spec'" >&2; exit 1 ;;
 esac
-
-# It is a brand-new partition entry: give udev a moment to notice it.
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [ -e "$DATA_DEV" ] && break
-    udevadm settle
-    sleep 0.2
-done
-[ -b "$DATA_DEV" ] || { echo "data partition $spec ($DATA_DEV) is missing" >&2; exit 1; }
+[ -e "$DATA_DEV" ] || { echo "fstab wants /data on $data_spec, which is not there" >&2; exit 1; }
 DATA_DEV=$(readlink -f "$DATA_DEV")
 
-# mmcblk0p3 and sda3 both say which disk they live on; lsblk is the only tool
-# that knows how the partition suffix is spelled.
-part_name=$(basename "$DATA_DEV")
-DISK=$(lsblk -no PKNAME -n "$DATA_DEV" 2>/dev/null | tr -d ' ')
-[ -n "$DISK" ] || { echo "cannot find the disk holding $DATA_DEV" >&2; exit 1; }
-DISK_DEV="/dev/$DISK"
-[ -b "$DISK_DEV" ] || { echo "data partition is on $DISK_DEV, which is not a block device" >&2; exit 1; }
-PART=${part_name#"$DISK"}
-PART=${PART#p}
-case "$PART" in ''|*[!0-9]*) echo "cannot read the partition number from $part_name" >&2; exit 1 ;; esac
-
-disk_sectors=$(blockdev --getsz "$DISK_DEV")
-part_sectors=$(blockdev --getsz "$DATA_DEV")
-# The kernel already knows where the partition starts: /sys/class/block/<name>/start
-# is in sectors, for mmcblk0p3 and sda3 alike. (blockdev has no --getstart; it
-# is one of those options that looks obvious and does not exist. Everything
-# else this script takes from blockdev -- getro, getsz, flushbufs -- really is
-# there.)
-part_start=$(cat "/sys/class/block/$part_name/start" 2>/dev/null || true)
-case "$part_start" in ''|*[!0-9]*)
-    echo "cannot read the start sector of $DATA_DEV from sysfs" >&2; exit 1 ;;
+# Resolve the disk and partition number behind that node: mmcblk0p3 -> mmcblk0
+# plus 3. Everything is derived from what the kernel enumerated rather than a
+# name baked at build time, because the controller differs between a Pi 4
+# (mmcblk0) and a Pi 5 with an NVMe HAT (nvme0n1).
+name=${DATA_DEV##*/}
+case $name in
+    mmcblk*p[0-9]*) DISK=${name%p*}; PART=${name##*p} ;;
+    *sd[a-z][0-9]*) DISK=${name%[0-9]}; PART=${name##*[!0-9]} ;;
+    nvme*n1p[0-9]*)  DISK=${name%p*}; PART=${name##*p} ;;
+    *) echo "unrecognised partition name $name" >&2; exit 1 ;;
 esac
+DISK_DEV=/dev/$DISK
+
+# Where the partition starts, and how much room is left after it. The start
+# sector is sysfs, not blockdev: there is no `blockdev --getstart`, a flag that
+# was invented here and only showed up on the card, which is what the
+# tool-contract scenario in tests/appliance-scripts.sh exists to prevent.
+part_start=$(cat /sys/class/block/"$name"/start)
+part_sectors=$(blockdev --getsz "$DATA_DEV")
+disk_sectors=$(blockdev --getsz "$DISK_DEV")
+echo "$DATA_DEV: partition p$PART of $DISK_DEV, start $part_start, $part_sectors sectors, disk holds $disk_sectors" >&2
 
 # A card that is larger than the image this table was written from leaves the
 # last partition short. Everything before it stays where it is.
-avail=$((disk_sectors - part_start))
-if [ "$part_sectors" -lt $((avail - 8192)) ]; then
-    echo "data partition holds $part_sectors of $avail sectors: growing $DISK_DEV p$PART" >&2
-    if ! printf 'start=%s, size=%s, type=83\n' "$part_start" "$avail" |
-            sfdisk -q -f -u=S -N "$PART" "$DISK_DEV"; then
-        # Some sfdisk versions will not take an exact end-of-disk size. The
-        # default size means exactly the same thing: to the end of the device.
-        echo "sfdisk refused size=$avail, asking for the rest of the card instead" >&2
-        printf 'start=%s, type=83\n' "$part_start" |
-            sfdisk -q -f -u=S -N "$PART" "$DISK_DEV"
+want=$((disk_sectors - part_start - 1))
+grew=0
+if [ "$part_sectors" -lt $((want - 8192)) ]; then
+    echo "data partition holds $part_sectors of $want sectors: growing $DISK_DEV p$PART" >&2
+    # sfdisk -N with an explicit start and size. Things learned the hard way on
+    # real util-linux 2.41.5 (the card) and 2.42.4 (the build host):
+    #  - `-u=S` is dead: a deprecated no-op whose arg parser feeds the literal
+    #    "=" to the unit check, so both versions die with "unsupported unit
+    #    '='". Sectors are the default and only unit.
+    #  - "-N p" with only start= is not "extend to the end of the device" as
+    #    the old manual recipes claim: it is a silent no-op that rc=0s unchanged.
+    #  - `--part-size dev part -1` from the popular Pi recipe does not exist in
+    #    either version.
+    #  - `-f` is required and means what we need: the disk IS in use (root is
+    #    p2 of this same card), and util-linux's own source shows sfdisk
+    #    proceeds past the in-use check with -f and discards the kernel's
+    #    answer to the partition-table reread.
+    if ! printf 'start=%s, size=%s, type=83\n' "$part_start" "$want" |
+            sfdisk -q -f -N "$PART" "$DISK_DEV"; then
+        echo "sfdisk could not resize $DISK_DEV p$PART" >&2; exit 1
     fi
-    udevadm settle
-    part_sectors=$(blockdev --getsz "$DATA_DEV")
-    if [ "$part_sectors" -lt $((avail - 8192)) ]; then
-        echo "still $part_sectors of $avail sectors: carrying on with a small /data" >&2
+    blockdev --flushbufs "$DISK_DEV" 2>/dev/null || true
+    grew=1
+    # Do NOT read the size back from blockdev or sysfs, and do not treat an
+    # unchanged size as a bug: the kernel refuses BLKRRPART on a disk with
+    # mounted partitions, so it keeps the old geometry no matter what was just
+    # written. sfdisk -d reads the table from the sectors themselves, so it is
+    # the only honest read-back at this point in the boot.
+    disk_size=$(sfdisk -d "$DISK_DEV" |
+        awk -v pat="${DISK}p$PART :" '$0 ~ pat {
+            if (match($0, /size=[[:space:]]*[0-9]+/))
+                print substr($0, RSTART + 5, RLENGTH - 5) + 0 }')
+    if [ "$disk_size" != "$want" ]; then
+        echo "sfdisk said OK but the table on $DISK_DEV still says $disk_size, want $want" >&2
+        exit 1
     fi
+    echo "new table is on disk; the kernel sees it after a reboot" >&2
 fi
 
 if [ "$(blkid -o value -s TYPE "$DATA_DEV" 2>/dev/null)" != "ext4" ]; then
+    # Current images already carry an ext4 here (the build makes one). This is
+    # only for cards written from older images, where the entry was a bare
+    # slot. mkfs makes a filesystem for the size the kernel currently reports,
+    # which is the small one; the resize2fs below is what makes it big, in the
+    # boot where the geometry is finally honest.
     echo "making ext4 on $DATA_DEV ($part_sectors sectors)" >&2
     mkfs.ext4 -q -F -L streamer-data -m 0 "$DATA_DEV"
     udevadm settle
 fi
 
-mnt=/mnt/streamer-data
-mkdir -p "$mnt"
-mount -o noatime "$DATA_DEV" "$mnt"
-trap 'umount "$mnt" 2>/dev/null || true' EXIT INT TERM
-
-mkdir -p "$mnt/streamer" "$mnt/bin" "$mnt/cliamp"
-printf 'provisioned=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$mnt/.ready"
-chmod 2775 "$mnt/streamer"
-chown -R 1000:1000 "$mnt/streamer" "$mnt/cliamp" "$mnt/bin"
-
-if [ ! -f "$mnt/cliamp/config.toml" ]; then
-    # Written once. Everything after that belongs to the user: the Tidal
-    # credentials, the playlists, and cliamp's own state all live on /data.
-    cat >"$mnt/cliamp/config.toml" <<'EOF'
-# cliamp configuration for the streamer appliance. This file is created by
-# streamer-firstboot; edit it, then run `streamer reload` to restart the
-# player. Credentials and history are kept in this directory too.
-
-volume = 0
-
-# The lowest level cliamp will go to, in dB. The appliance starts each boot at
-# the floor in /etc/streamer.conf and ramps up from there.
-volume_min = -50
-EOF
-    chown 1000:1000 "$mnt/cliamp/config.toml"
+# Bring the filesystem up to its partition. This is the boot-2 step after a
+# boot-1 table write, and it is harmless on every later boot. The comparison is
+# done in the filesystem's own blocks rather than bytes: a partition is measured
+# in 512-byte sectors and an ext4 in 4096-byte blocks, and a sector count that
+# is not a multiple of eight leaves a slack of under one block that resize2fs
+# can never fill. Comparing bytes would therefore ask for a resize on every
+# single boot - an e2fsck and a no-op resize2fs each time, forever.
+fs_short=0
+set -- $(dumpe2fs -h "$DATA_DEV" 2>/dev/null |
+    awk '/^Block count:/ {c=$3} /^Block size:/ {s=$3} END {if (c && s) print c, s}')
+if [ -n "${1:-}" ] && [ -n "${2:-}" ]; then
+    fs_blocks=$1
+    fs_bsize=$2
+    part_blocks=$(( $(blockdev --getsz "$DATA_DEV") * 512 / fs_bsize ))
+    if [ "$fs_blocks" -lt "$part_blocks" ]; then
+        fs_short=1
+        echo "growing the ext4 on $DATA_DEV: $fs_blocks of $part_blocks ${fs_bsize}-byte blocks" >&2
+        # e2fsck first, every time the resize is needed: it is a fraction of a
+        # second at this size, and it is the one thing standing between a power
+        # cut mid-resize and a /data that will not mount. 1 means errors were
+        # corrected, which is a pass; 2 or above needs a human.
+        #
+        # The status has to be captured with `|| ec=$?` rather than a following
+        # `; ec=$?`: this script runs under `set -e`, and a bare failing command
+        # ends the script there, with fsck's own exit status and no message. That
+        # is exactly the common case on a card that lost power, because fsck
+        # returning 1 is it having fixed something.
+        ec=0; e2fsck -fy "$DATA_DEV" >/dev/null || ec=$?
+        [ "$ec" -le 1 ] || { echo "e2fsck on $DATA_DEV reports $ec" >&2; exit 1; }
+        # Bare resize2fs means "fill the partition". Naming a size would risk
+        # shrinking, and shrinking is how a filesystem gets destroyed rather
+        # than fixed.
+        resize2fs "$DATA_DEV" >/dev/null ||
+            { echo "resize2fs on $DATA_DEV failed" >&2; exit 1; }
+        echo "$DATA_DEV grown to $((part_blocks * fs_bsize / 1048576)) MiB" >&2
+    fi
 fi
 
-umount "$mnt"
-rmdir "$mnt" 2>/dev/null || true
-trap - EXIT INT TERM
+# The data partition is mounted by nothing yet - this unit runs before
+# data.mount exactly so that the partition and the filesystem can be resized
+# while they are idle. That also means /data is only a plain directory on the
+# root filesystem right now, and anything seeded through it would be written to
+# the root and buried by the real mount a second later: the tree would look
+# complete in this boot, and /data would come up empty in every boot after it.
+# So the partition is mounted somewhere private instead, under /run, where pid1
+# has already put a fresh tmpfs and where nothing else ever looks.
+DATA_MNT=/run/streamer-data
+mkdir -p "$DATA_MNT"
+if ! mount "$DATA_DEV" "$DATA_MNT"; then
+    # A mount that fails is not a reason to walk away from the partition, and
+    # this is the only moment in the boot when checking it is safe: nothing else
+    # has it. It matters because /data's own fstab entry deliberately has no
+    # boot fsck (pass 0) and `nofail`: if this script gave up here, data.mount
+    # would fail the same quiet way on every boot for the rest of the card's
+    # life, and the player, gated on /data/.ready, would never make a sound.
+    echo "mounting $DATA_DEV failed: checking it while nothing else holds it" >&2
+    ec=0; e2fsck -fy "$DATA_DEV" >/dev/null || ec=$?
+    # 0 is clean, 1 means errors were corrected and the filesystem can be used;
+    # 2 says it needs another run with nothing mounted, and 4 or 8 says fsck
+    # could not fix it. Only the last two are worth stopping for.
+    [ "$ec" -le 1 ] || { echo "e2fsck on $DATA_DEV reports $ec" >&2; exit 1; }
+    mount "$DATA_DEV" "$DATA_MNT" ||
+        { echo "cannot mount $DATA_DEV even after checking it" >&2; exit 1; }
+fi
+# Whatever happens from here on, the partition has to be released again: it is
+# mounted on a tmpfs that the next boot will not remember, and a partition left
+# mounted here is a partition data.mount cannot take over. A failure to release
+# it is worth reading in the journal, so it is not sent to /dev/null.
+trap 'umount "$DATA_MNT" || true' EXIT INT TERM
 
-# Read-only root from the next boot on, by systemd-remount-fs.service.
-if ! grep -q 'streamer-ro-root' /etc/fstab 2>/dev/null; then
-    sed -i -E 's#^([^ ]+[[:space:]]+/[[:space:]]+ext4[[:space:]]+)([^ ,]+)(.*)#\1\2,ro\3#' /etc/fstab
-    printf '# streamer-ro-root: / is remounted read-only at boot. Undo with\n' >>/etc/fstab
-    printf '#   sudo sed -i s/,ro// /etc/fstab\n' >>/etc/fstab
+# Whether the tree on the data partition is complete is a fact about that
+# partition, so it is read from that partition. The marker for it used to live
+# in /etc, on the root, which is a second copy of the same fact - and the copy
+# that survives a factory reset of /data is the wrong one: the box concluded it
+# had already been set up, left /data empty, and the player's
+# ConditionPathExists=/data/.ready kept it silent for good.
+seeded=0
+[ -f "$DATA_MNT/.ready" ] && seeded=1
+
+# Everything that writes to the root filesystem is collected below, and the root
+# is only made writable if at least one of them still has something to write.
+# Each test reads a current fact rather than a flag, so a mature boot - which
+# has all of them already, on a read-only root - makes no write call at all.
+root_dirty=0
+if [ "$(awk '$2 == "/" {print ($4 ~ /(^|,)ro(,|$)/) ? "ro" : "rw"; exit}' /etc/fstab)" != ro ]; then
+    root_dirty=1
+fi
+if [ ! -f /etc/sudoers.d/streamer ]; then root_dirty=1; fi
+if [ ! -L /home/pi/.config/cliamp ]; then root_dirty=1; fi
+if [ "$grew" = 1 ]; then root_dirty=1; fi
+if [ "$root_dirty" = 1 ]; then
+    # The kernel command line mounts the root read-only, and the writes below
+    # go to /etc/fstab, /etc/sudoers.d, /home/pi/.config and /etc/streamer.
+    mount -o remount,rw / || { echo "cannot make the root filesystem writable" >&2; exit 1; }
 fi
 
-# Password-free sudo. There is no password anywhere in this image: SSH is
-# key-only, so anyone who can run sudo already has the key.
-# Group, not user name: the stock first-boot user setup can rename uid 1000, and a
-# name-based rule would stop working the moment it does.
-printf '%%1000 ALL=(ALL) NOPASSWD: ALL\n' >/etc/sudoers.d/streamer
-chmod 440 /etc/sudoers.d/streamer
-visudo -cf /etc/sudoers.d/streamer
+# The hand-off to streamer-bootcount, which is the script that can actually
+# reboot: this one runs before the filesystems are mounted, while reboot.service
+# is unreachable. This file records the geometry the layout is supposed to
+# reach, and bootcount compares the kernel's answer against it on every boot.
+#
+# It is deliberately a record and not a request, so nothing ever has to clear
+# it. That matters: the boot where the comparison first succeeds is the boot
+# after the table was written, and by then fstab has made the root read-only,
+# so a flag in /etc could not be removed without remounting the root writable
+# in early boot - the one thing this box is designed not to do. Writing it here
+# is fine because it is only ever written on the provisioning boot, when this
+# script has already made the root writable itself.
+if [ "$grew" = 1 ]; then
+    # mkdir -p on an existing directory succeeds even on a read-only root, which
+    # is what every later boot has.
+    mkdir -p /etc/streamer
+    # One key per line: streamer-bootcount reads these with `sed -n 's/^key=//p'`,
+    # which takes everything to the end of the line, so a single-line record
+    # would read the dev key as the whole rest of the line.
+    {
+        printf 'dev=%s\n'    "$DATA_DEV"
+        printf 'disk=%s\n'   "$DISK"
+        printf 'part=%s\n'   "$PART"
+        printf 'start=%s\n'  "$part_start"
+        printf 'want=%s\n'   "$want"
+    } > /etc/streamer/geometry-target
+    echo "/data now runs to the card's edge: one more boot to grow the filesystem" >&2
+fi
 
-mkdir -p /etc/streamer
-printf 'provisioned=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >/etc/streamer/provisioned
+# --- the tree on the data partition ------------------------------------------
+
+if [ "$seeded" = 1 ]; then
+    echo "the data partition holds the appliance's tree" >&2
+else
+    # The appliance's own tree, written on the mounted partition rather than
+    # through the /data mount point. /data/cliamp holds cliamp's socket, its
+    # resume state, and its log; /data/state is what streamer-save writes.
+    # /data/bin sits on PATH ahead of the read-only root, which is how the DAC
+    # driver can be dropped in after delivery without rebuilding the image.
+    #
+    # Everything lives at the top of /data so that a single `rm -rf /data/*` is
+    # a clean slate. Nested directories invite half-cleaned state.
+    for d in cliamp state bin music; do
+        mkdir -p "$DATA_MNT/$d"
+    done
+    chown -R pi:pi "$DATA_MNT/cliamp" "$DATA_MNT/state" "$DATA_MNT/bin" "$DATA_MNT/music"
+    chmod 0775 "$DATA_MNT/cliamp" "$DATA_MNT/state" "$DATA_MNT/bin" "$DATA_MNT/music"
+
+    # Mark the data volume. streamer-cliamp and streamer-play gate on it, and
+    # this script reads it back as the one fact that says the tree is there.
+    touch "$DATA_MNT/.ready"
+    chown pi:pi "$DATA_MNT/.ready"
+    chmod 0664 "$DATA_MNT/.ready"
+fi
+
+# --- the writes that live on the root, and only if they are still owed -------
+
+if [ "$root_dirty" = 1 ]; then
+    # cliamp stores its configuration in $XDG_CONFIG_HOME/cliamp. The unit pins
+    # HOME to /home/pi, so the link below is where its socket lands, and /data is
+    # the only writable place on this box. The link belongs to the daemon's user.
+    if [ ! -L /home/pi/.config/cliamp ]; then
+        mkdir -p /home/pi/.config
+        ln -sfn /data/cliamp /home/pi/.config/cliamp
+        chown -h pi:pi /home/pi/.config/cliamp
+    fi
+
+    # Switch the root filesystem to read-only. fstab is authoritative; this only
+    # appends ",ro" to the options field of the existing root line rather than
+    # rewriting it, so the PARTUUID the build chose, the spacing, and every other
+    # line stay exactly as they were. Working on the text rather than rebuilding
+    # the line from fields matters: awk would otherwise flatten the column
+    # alignment that makes this file readable by eye over SSH. Inserting after
+    # the found options field is safe because the option string cannot occur
+    # earlier on the line (the device is a PARTUUID, the mount point is "/"), and
+    # the result is re-read afterwards to confirm the root line really did gain
+    # ro. A root line that already says ro - every boot after the first - leaves
+    # this rewrite as a copy of the same file.
+    awk '{
+        if (!done && $2 == "/" && $4 !~ /(^|,)ro(,|$)/) {
+            i = index($0, $4)
+            if (i) $0 = substr($0, 1, i + length($4) - 1) ",ro" substr($0, i + length($4))
+            done = 1
+        }
+        print
+    }' /etc/fstab > /etc/fstab.streamer-new
+    if [ "$(awk '$2 == "/" {print ($4 ~ /(^|,)ro(,|$)/) ? "ro" : "rw"; exit}' /etc/fstab.streamer-new)" != ro ]; then
+        echo "could not add ro to the root line of /etc/fstab" >&2; exit 1
+    fi
+    chmod 644 /etc/fstab.streamer-new
+    mv /etc/fstab.streamer-new /etc/fstab
+
+    # Password-free sudo for the pi account. The account has no password and the
+    # only way in is an SSH key, so a password prompt is not a security boundary
+    # here, it is an obstacle: `streamer audio dac` and `streamer rw` both
+    # re-exec through sudo, and there is no screen attached to type a password
+    # into. visudo is used rather than writing the file directly because it
+    # checks the syntax, and a broken sudoers line on a box with no password is
+    # a door wide shut.
+    if [ ! -f /etc/sudoers.d/streamer ]; then
+        tmp=$(mktemp)
+        printf '%s\n' 'Defaults!streamer !requiretty' 'pi ALL=(ALL) NOPASSWD:ALL' > "$tmp"
+        visudo -cf "$tmp" >/dev/null || { echo "generated sudoers fragment is invalid" >&2; exit 1; }
+        install -m 0440 "$tmp" /etc/sudoers.d/streamer
+        rm -f "$tmp"
+
+        # Stop apt from being helpful in the background: a timer that fetches
+        # indexes or upgrades packages can turn a read-only root into a
+        # half-written one. Only worth trying once, and it needs a writable root.
+        apt-mark hold raspi-config >/dev/null 2>&1 || true
+    fi
+
+    mkdir -p /etc/streamer
+    if [ ! -f /etc/streamer/flash-info ]; then
+        printf 'flashed=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /etc/streamer/flash-info
+    fi
+    sync
+fi
+
+# Nothing has to say that this boot is finished: every fact the next boot looks
+# for was written by the boot that owed it, and each of them is read back before
+# it is written.
+if [ "$seeded" = 1 ] && [ "$grew" = 0 ]; then
+    echo "data partition is provisioned, nothing left to do" >&2
+fi
 sync
-blockdev --flushbufs "$DATA_DEV" 2>/dev/null || true
-
-echo "data partition ready: $DATA_DEV" >&2
-echo "rebooting into the read-only appliance" >&2
-systemctl --no-block reboot
-exit 0

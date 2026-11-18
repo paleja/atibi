@@ -311,11 +311,33 @@ corruptable itself if the cut lands mid-overlay-writeback):
 
 - **p1** vfat `/boot/firmware`, mounted read-write (it has to be: the firmware
   reads it). **p2** ext4 `/`, mounted `ro`. **p3** ext4 `/data`, the only
-  writable filesystem with state in it. `build.sh` writes the p3 *partition
-  table entry only*; `streamer-firstboot` grows it to the end of the card, makes
-  the filesystem, seeds `/data/{streamer,bin,cliamp}` and `/data/.ready`,
-  appends `,ro` to the root fstab line and installs the sudoers drop-in, then
-  reboots once.
+  writable filesystem with state in it. `build.sh` **makes the p3 filesystem
+  inside the image** (256 MiB, `mkfs.ext4 -L streamer-data`, check counters
+  zeroed), so `/data` is mountable from the very first boot and the worst a
+  botched growth can leave behind is a small `/data`, never an unmountable one.
+  `streamer-firstboot` then grows the p3 *table entry* to the end of the card
+  and runs `e2fsck` + `resize2fs`; because the running kernel will not re-read a
+  partition table on a disk whose partitions are mounted (and root is on the
+  same card), that hand-off takes at most three boots: boot 1 writes the table,
+  seeds `/data/{cliamp,state,bin,music}` and `/data/.ready`, appends `,ro` to the
+  root fstab line and installs the sudoers drop-in; `streamer-bootcount`, which
+  runs after the mounts and so can reach `reboot.service`, compares what the
+  kernel reports against the geometry firstboot recorded in
+  `/etc/streamer/geometry-target` and asks for one more boot; boot 2 resizes and
+  plays. `streamer-firstboot` never reboots itself. It works on the partition at
+  a mount point of its own under `/run`, never through the `/data` directory:
+  the unit runs before `data.mount`, so `/data` is an empty directory on the
+  root at that moment, and a tree seeded through it would be buried by the real
+  mount and leave `/data` empty in every boot after. Whether the tree exists is
+  read from the partition's own `.ready`, not from a marker in `/etc`, and the
+  root is made writable only when one of its own writes is still owed. If that
+  probe mount *fails*, firstboot runs `e2fsck -fy` on the partition and retries
+  the mount once: this is the only moment in the boot when nothing holds it, and
+  `/data`'s own fstab line has `nofail` and fsck pass 0, so a script that walked
+  away would leave a quietly unmountable `/data`, and a player gated on
+  `/data/.ready`, on every boot for the rest of the card's life. fsck's status is
+  read as the protocol it is — 0 clean, 1 repaired and usable, 2 and above needs
+  a human — so a repaired filesystem is grown rather than treated as a failure.
 - The `/data` fstab entry is derived, not copied: `build.sh` takes the
   `label-id` from `sfdisk -d`, appends `-03`, and dies if that disagrees with the
   stock root line (`PARTUUID=<8hex>-02`). It uses `nofail` and fsck fields `0 0`.
@@ -351,8 +373,11 @@ corruptable itself if the cut lands mid-overlay-writeback):
   `/data/bin` in front of it. So `scp new-ffmpeg pi@streamer.local:/data/bin/`
   is enough to try a newer one, with the image copy as the fallback, and nothing
   ever needs `streamer rw` except the rare edit to the root filesystem itself.
-- Factory reset = `mkfs.ext4` p3 (or `streamer forget` + wipe), reboot → back to
-  first-boot state: providers logged out, defaults restored.
+- Factory reset = `mkfs.ext4 -L streamer-data` on p3 (or `streamer forget` +
+  wipe), reboot → back to first-boot state: providers logged out, defaults
+  restored. Reformatting rather than deleting the partition is deliberate: the
+  shipped fstab expects a mountable `/data`, and a fresh ext4 with the right
+  label is what `build.sh` ships, so firstboot still mounts, grows and seeds it.
 
 ## 8. Player software
 
@@ -528,28 +553,45 @@ These criteria are not all verified the same way, and the distinction matters
 when reading a green result:
 
 - **Script level** (automated, on the build host, no root, no Pi):
-  `tests/appliance-scripts.sh`, fourteen scenarios and 93 assertions — ramp from
+  `tests/appliance-scripts.sh`, sixteen scenarios and 186 assertions — ramp from
   the floor (including that the floor reaches the player *before* anything is
   told to make a sound), resume at a saved row/position/level, the save
   round-trip, boot-count rollback, recording a known-good config, `mode=stop`,
   volume clamped at the ceiling, a player that never comes up, the `streamer`
   command's reporting (including `stations` pairing names with `stream`, never
   `tracks_url`), the jack/dac splice, a saved level parked at the floor, a saved
-  row that no longer exists, and the three ramp guards of §6.4.
+  row that no longer exists, the three ramp guards of §6.4, the option set of
+  every block-device tool the payload calls (checked against a real util-linux's
+  `--help`), and the whole first-boot layout of §7 on a stand-in card: table
+  written then filesystem grown a boot later, the tree seeded on the partition
+  rather than through its unmounted mount point, a resize that reported OK while
+  changing nothing, a factory reset, a `/data` that will not mount being checked
+  and retried, and one that cannot be fixed stopping the boot.
   It runs the real scripts with only their paths redirected, against a stand-in
-  for the player's IPC and stubs for `systemctl`/`mount`/`curl`. The stand-in's
-  volume ceiling is deliberately *above* `STREAMER_VOL_MAX`, so a script that
-  forgot to clamp is caught rather than hidden. Covers criteria 2 (the
+  for the player's IPC and stubs for `systemctl`/`mount`/`curl`. The block-device
+  stubs keep the card's whole geometry in one state file and model the fact that
+  makes first boot hard — the kernel keeps the old table after a write to a busy
+  disk — and the `mount` stub models the one consequence a plain echo would hide:
+  mounting the data volume moves its contents in at the mount point and covers up
+  whatever was in that directory before. The stand-in's volume ceiling is
+  deliberately *above* `STREAMER_VOL_MAX`, so a script that forgot to clamp is
+  caught rather than hidden. Covers criteria 2 (the
   logic), 7 (the logic), 8 and 9 (the mechanics).
 - **Meta level** (automated): `tests/mutation-check.py` breaks one shipped
-  behaviour at a time (ten: the floor, the parked-level rule, the ceiling,
-  `url.load` versus plain queueing, the refused-row position reset, the
+  behaviour at a time (twenty-seven: the floor, the parked-level rule, the
+  ceiling, `url.load` versus plain queueing, the refused-row position reset, the
   `"stream"` key, both ramp guards, the set-elsewhere guard, the rollback
-  threshold) and requires the suite to go red on the check that owns that
-  behaviour. A mutation that hangs the suite counts as caught — an unbounded
-  loop in the boot script is exactly what those guards prevent. This is what
-  makes a green suite mean something: without it, a passing check is only as
-  good as its ability to fail.
+  threshold, and on the provisioning side an invented `blockdev` flag, the dead
+  `-u=S` sfdisk flag, a no-op resize taken as a note, a size read back from the
+  kernel instead of the sectors, a byte-wise instead of block-wise filesystem
+  comparison, a one-line geometry record, bootcount ignoring that record, seeding
+  through the unmounted `/data`, the `.ready` read, the root remounted writable on
+  every boot, and fsck's exit status misread in both directions — a repair treated
+  as a failure, and an unfixable volume treated as untidy) and requires the suite
+  to go red on the check that owns that behaviour. A mutation that hangs the suite
+  counts as caught — an unbounded loop in the boot script is exactly what those
+  guards prevent. This is what makes a green suite mean something: without it, a
+  passing check is only as good as its ability to fail.
 - **On-device** (M1+): partition layout, `ro` root, systemd ordering, the
   first-boot grow-and-reboot, real cliamp IPC, timing, dithering, the relay.
   Nothing in the script suite stands in for these; they are criterion 1, 3, 5, 6

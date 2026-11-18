@@ -54,6 +54,38 @@ log_boot "boot attempt $n config $(printf '%.16s' "$cur_hash")"
 good_hash=""
 [ -f "$STREAMER_LASTGOOD/hash" ] && good_hash=$(cat "$STREAMER_LASTGOOD/hash")
 
+# A card bigger than the image written to it leaves the data partition short.
+# streamer-firstboot grows it and records the geometry it asked for in
+# /etc/streamer/geometry-target, but it cannot check its own work: the kernel
+# refuses to re-read a partition table on a disk whose partitions are mounted,
+# and root is p2 of that same card, so in the boot where the table is written
+# the kernel still reports the old size. Checking here is what makes the box
+# come round: the filesystems are mounted by now, so a plain
+# `systemctl --no-block reboot` is reachable, and the kernel has read the table
+# again. The comparison is the kernel's own size for the partition against the
+# size firstboot wrote into the table - a record, not a flag, so nothing has to
+# be cleared once it holds. The same GIVEUP_AT ceiling as every other reboot
+# this box takes, so a resize that never succeeds cannot spin it either.
+# The record is read with one key per line, the same way streamer-firstboot
+# writes it: `sed -n 's/^key=//p'` takes everything to the end of the line, so
+# the two scripts have to agree on that shape. A record that names a device the
+# kernel no longer enumerates, or a size that is not a number, is treated as no
+# record at all: the box boots the current configuration instead of spinning.
+if [ -f /etc/streamer/geometry-target ]; then
+    geo_dev=$(sed -n 's/^dev=//p' /etc/streamer/geometry-target)
+    geo_want=$(sed -n 's/^want=//p' /etc/streamer/geometry-target)
+    case "$geo_want" in ''|*[!0-9]*) geo_want="" ;; esac
+    if [ -n "$geo_dev" ] && [ -e "$geo_dev" ] && [ -n "$geo_want" ] &&
+            [ "$n" -lt "$GIVEUP_AT" ]; then
+        geo_now=$(blockdev --getsz "$geo_dev" 2>/dev/null || true)
+        case "$geo_now" in ''|*[!0-9]*) geo_now="" ;; esac
+        if [ -n "$geo_now" ] && [ "$geo_now" -lt "$geo_want" ]; then
+            log_boot "data partition is $geo_now sectors, wants $geo_want: booting once more so the kernel re-reads the partition table"
+            exec systemctl --no-block reboot
+        fi
+    fi
+fi
+
 if [ "$n" -ge "$RECOVERY_AT" ] && [ "$n" -lt "$GIVEUP_AT" ] \
         && [ -f "$STREAMER_LASTGOOD/config.txt" ] && [ "$good_hash" != "$cur_hash" ]; then
     echo "boot config $cur_hash failed $n times: restoring last-good config $good_hash" >&2

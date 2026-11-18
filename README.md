@@ -37,25 +37,29 @@ with an I2S DAC HAT) that boots from a cold power cut to audible music in under
   and the `systemctl enable` symlinks for the units above. The root `,ro` and
   `/etc/sudoers.d/streamer` come later, from first boot.
 - `tests/appliance-scripts.sh` — the regression suite for those scripts,
-  fourteen scenarios, each one asserting rather than merely running: the
+  sixteen scenarios, each one asserting rather than merely running: the
   first-boot ramp from the floor (including that the floor is set before the
   player is told to make a sound), resuming at a saved row and position and
   level, the save round-trip, the boot-failure counter and the boot-file
   rollback, `mode=stop`, the volume ceiling, a level parked at the floor, a
   saved row that no longer exists, the ramp's own guards (a level that will not
   move, a step budget, a volume somebody else moved mid-ramp), the jack/dac
-  switch leaving the rest of `config.txt` alone, and the `streamer` command's
-  reporting. No root, no Pi and no real cliamp: a stand-in covers the parts of
+  switch leaving the rest of `config.txt` alone, the `streamer` command's
+  reporting, and first boot on a stand-in card: the partition table written and
+  the filesystem catching up a boot later, the appliance's tree seeded on the
+  partition rather than through its unmounted mount point, a resize that quietly
+  did nothing, a factory reset, and a `/data` too corrupt to mount being checked
+  and retried. No root, no Pi and no real cliamp: a stand-in covers the parts of
   the player the scripts talk to, and a sandbox stands in for `/data` and
   `/boot/firmware`. The scripts under test are the real ones, only their paths
   are redirected. The verdict is the last line, `N checks, M failed`, and the
   exit status; `bash tests/appliance-scripts.sh` runs all of them, or pass
   scenario numbers to run a few.
 - `tests/mutation-check.py` — the test of the tests. It deliberately breaks one
-  shipped behaviour at a time (ten of them) and requires the suite to go red on
-  the check that cares about that behaviour; anything it misses is a check that
-  looks meaningful and is not. `python3 tests/mutation-check.py`, about 90
-  seconds, and it restores every file it touched even if a scenario hangs.
+  shipped behaviour at a time (twenty-seven of them) and requires the suite to
+  go red on the check that cares about that behaviour; anything it misses is a
+  check that looks meaningful and is not. `python3 tests/mutation-check.py`,
+  a few minutes, and it restores every file it touched even if a scenario hangs.
 - `tests/fixtures/stations.json` — the shape `https://radio.cliamp.stream/stations`
   really answers with, so the suite can check station parsing offline.
 - `docs/` — PRD, handoff notes, and the measurement logs once the box exists
@@ -74,8 +78,9 @@ image to guess. With `--new-key` the private half is generated under
 `output/keys/` and never goes near the image.
 
 Then the card is written by hand, and the script prints the command once it is
-done. First boot lays out `/data`, makes `/` read-only and reboots; the second
-boot plays.
+done. Boot 1 lays out `/data` and makes `/` read-only; because the kernel will
+not re-read a partition table on a card it is already mounted from, the boot
+after it is the one that grows the filesystem to the card's edge and plays.
 
 ## Using it
 

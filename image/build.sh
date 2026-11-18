@@ -50,11 +50,13 @@ FFMPEG_ASSET=ffmpeg-N-129000-g64f6bcffaf-linuxarm64-gpl.tar.xz
 FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/$FFMPEG_TAG/$FFMPEG_ASSET
 FFMPEG_SHA=6cdd6eae6bdb4ce8be9a751d17209cd1a0f237bc8fcc866ddbc92a501df0e8e0
 
-# The /data partition entry written into the image: a slot, not a filesystem.
-# streamer-firstboot grows it to the end of the card and makes the ext4 on the
-# first boot, so this size only has to be big enough for the partition table to
-# be valid. 32 MiB keeps the image small.
-DATA_SECTORS=65536
+# The /data partition entry written into the image, with a real ext4 in it.
+# It is deliberately small: streamer-firstboot grows the partition to the end
+# of the card and then runs resize2fs, so this only has to be big enough to
+# hold cliamp's state on a card whose size the build cannot know. 256 MiB
+# costs a few hundred KB in the xz and keeps /data mountable even if the grow
+# goes wrong, which is the whole point (see streamer-firstboot).
+DATA_SECTORS=524288
 
 # --- paths and defaults -----------------------------------------------------------------------
 
@@ -299,7 +301,7 @@ $parts"
 
 log "  firmware  start=$p1_start size=$(field "$first" size)"
 log "  root      start=$p2_start size=$p2_size"
-log "  data      start=$p3_start size=$DATA_SECTORS (no filesystem yet)"
+log "  data      start=$p3_start size=$DATA_SECTORS (ext4 is made a few lines later, after the loop device exists)"
 
 # Rewriting the whole table from the dump is what keeps the disk identifier,
 # the partition types and the boot flag of the firmware partition exactly as
@@ -334,6 +336,17 @@ mkdir -p "$R" "$FW"
 mount -o noatime "${LOOP}p2" "$R"
 mount -o noatime "${LOOP}p1" "$FW"
 log "$LOOP: p2 -> $R, p1 -> $FW"
+
+# p3 gets its filesystem here, in the image, not on the card. That is a design
+# decision and the first card paid for it: a partition entry with no filesystem
+# means data.mount fails, every unit that says Requires=data.mount fails with
+# it, and the one script that could undo the damage is the one that cannot run,
+# because the password-free sudo rule it writes lives on the far side of that
+# same failure. A card that ships with a mountable /data can only ever be left
+# with a small /data, never an unbootable one.
+mkfs.ext4 -q -F -L streamer-data -m 0 "${LOOP}p3" >/dev/null ||
+    die "mkfs.ext4 on the data partition failed"
+log "  data      ext4 made in the build: $((DATA_SECTORS / 2048)) MiB, resize2fs grows it on the card"
 
 DISK_ID=$(printf '%s\n' "$dump" | sed -n 's/^label-id:[[:space:]]*0x\([0-9a-fA-F]*\)$/\1/p' | tr 'A-F' 'a-f')
 [ -n "$DISK_ID" ] || die "the base image has no DOS disk identifier in its partition table"
@@ -437,11 +450,12 @@ fi
 if ! grep -qsE '^[^#][^[:space:]]+[[:space:]]+/data[[:space:]]' "$R/etc/fstab"; then
     {
         printf '\n# streamer data partition: cliamp state, playlists, downloads.\n'
-        printf '# The filesystem itself is made on the first boot, and nofail keeps a\n'
-        printf '# card that is not laid out yet from stopping the boot. The last two fields\n'
-        printf '# are zero on purpose: a boot-time fsck would otherwise try to check a\n'
-        printf '# partition that has no filesystem in it while streamer-firstboot is busy\n'
-        printf '# making one.\n'
+        printf '# The filesystem is made at build time and streamer-firstboot grows it\n'
+        printf '# into the rest of the card, so it is mountable from the very first boot.\n'
+        printf '# nofail is for the case where the partition entry itself is gone (a card\n'
+        printf '# written from an older image): a missing /data must not stop the boot.\n'
+        printf '# The last two fields are zero: the fsck pass is skipped at boot because\n'
+        printf '# streamer-firstboot runs e2fsck itself, before it resizes anything.\n'
         printf 'PARTUUID=%s  /data  ext4  defaults,nofail,noatime  0  0\n' "$DATA_UUID"
     } >>"$R/etc/fstab"
 fi
@@ -562,6 +576,18 @@ e2fsck -fy "${LOOP}p2" >/dev/null || die "the root partition fails e2fsck"
 tune2fs -C 0 -i 0 -T now "${LOOP}p2" >/dev/null \
     || die "tune2fs could not reset the root partition's check counters"
 log "root partition passes e2fsck, forced-check counters reset"
+
+# The data partition is handed to the card with a filesystem in it, so it gets
+# the same treatment; it is also the only chance to see that the filesystem the
+# card will boot with really exists and says what fstab expects.
+e2fsck -fy "${LOOP}p3" >/dev/null || die "the data partition fails e2fsck"
+tune2fs -C 0 -i 0 -T now "${LOOP}p3" >/dev/null \
+    || die "tune2fs could not reset the data partition's check counters"
+data_label=$(blkid -o value -s LABEL "${LOOP}p3")
+data_type=$(blkid -o value -s TYPE "${LOOP}p3")
+[ "$data_type" = ext4 ] && [ "$data_label" = streamer-data ] ||
+    die "the data partition is $data_type/$data_label, expected ext4/streamer-data"
+log "data partition passes e2fsck: $(blkid -o value -s LABEL "${LOOP}p3") ($data_type), $((DATA_SECTORS / 2048)) MiB"
 
 # Read the patched files back through a fresh mount: what matters is what the
 # Pi firmware will read, not what this script thinks it wrote.
