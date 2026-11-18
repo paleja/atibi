@@ -779,6 +779,17 @@ if [ -f "$R/etc/ssh/sshd_config.d/rename_user.conf" ]; then
     log "  stock ssh login banner replaced"
 fi
 
+# One state directory a unit cannot make for itself once the root is read-only.
+# systemd-logind declares StateDirectory=systemd/linger, and systemd creates a
+# unit's state directory when the unit starts: on a read-only root that mkdir
+# fails, logind dies with status 238/STATE_DIRECTORY, and every ssh login then
+# waits the full 25 s D-Bus activation timeout inside pam_systemd before the
+# shell opens. Writing the directory into the image costs one line, and logind
+# needs nothing else writable: its session state lives in /run, which is tmpfs.
+step "login state"
+install -d -m 755 "$R/var/lib/systemd/linger"
+log "  /var/lib/systemd/linger: systemd-logind cannot make it once / is read-only"
+
 # journald kept in memory, which is what a read-only root without
 # /var/log/journal already implies. Saying it out loud is the point: the
 # alternative is logs on the writable partition, and a hard power cut is exactly
@@ -907,6 +918,17 @@ tune2fs -U random -C 0 -i 0 -T now "${LOOP}p2" >"$STAGE/root-tune.log" 2>&1 \
 check counters:
 $(cat "$STAGE/root-tune.log")"
 log "root partition passes e2fsck, UUID and forced-check counters reset"
+
+# The one state directory the card can never make for itself, read back the same
+# way the seeded /data tree is read back below: through debugfs, without ever
+# mounting the partition. If this line is missing, sshd answers logins 25
+# seconds late and systemd sits in degraded, and nothing on the card can say so.
+linger=$(debugfs -R 'ls -l /var/lib/systemd' "${LOOP}p2" 2>/dev/null |
+    awk '{ print $NF }' | grep -cx 'linger' || true)
+[ "${linger:-0}" -eq 1 ] ||
+    die "the root filesystem does not hold /var/lib/systemd/linger:
+systemd-logind will fail at boot and every ssh login will stall 25 seconds"
+log "  /var/lib/systemd/linger is in the image"
 
 # The data partition's filesystem was made, seeded, checked and stamped as a
 # file a few minutes ago. Here it is only read back, to prove the splice landed
