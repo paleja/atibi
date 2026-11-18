@@ -248,6 +248,15 @@ def read_intent():
 TRANSPORT_OPS = {"play", "pause", "toggle", "next", "prev", "stop"}
 MODE_OPS = {"shuffle", "repeat"}
 
+# A provider search row whose path is provider://album/<id> stands for a
+# whole album, not one streamable track. Verified on the card against cliamp
+# 2.4.1: Tidal search answers with rows like that (provider_meta.kind says
+# "album", there is no stream flag), and the player can only open real track
+# rows: hand one of these to track.play and the job says succeeded while the
+# play pipeline answers with a plain filesystem error, the way it would for
+# any missing file. See the /api/play route.
+ALBUM_ROW = re.compile(r"\A([a-z][a-z0-9-]*)://album/(\S+)\Z")
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -432,7 +441,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not isinstance(track, dict):
                 self._json_out({"ok": False, "error": "track object required"}, 400)
                 return
-            ipc_op("track.play", {"track": track})
+            hit = ALBUM_ROW.match(str(track.get("path", "")))
+            if hit:
+                # An album search hit is not a track the player can open: it
+                # is a placeholder row standing for a whole album, and the
+                # operation it is asking for is the one the TUI runs when
+                # Enter lands on it — expand it into its real track rows and
+                # start playing. The scheme names the provider, so this holds
+                # for every provider that spells its rows this way, not just
+                # Tidal.
+                meta = track.get("provider_meta") or {}
+                ipc_op("provider.load_album",
+                       {"provider": hit.group(1),
+                        "album": str(meta.get("albumID") or hit.group(2))})
+            else:
+                ipc_op("track.play", {"track": track})
             self._json_out({"ok": True})
             return
         if path == "/api/intent":

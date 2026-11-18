@@ -1273,8 +1273,12 @@ run() { # run <scenario number>
         t1=$(date +%s%N)
         ck "the job poller waits between checks instead of giving up at once" \
             "[ $(( (t1 - t0) / 1000000 )) -ge 900 ]"
-        ck_has "a searched row plays through the player's own track.play" \
-            "$(http POST /api/play '{"track":{"title":"x","path":"tidal://album/1"}}')" '"ok":true'
+        ck_has "an album search hit loads as an album, not as one file" \
+            "$(http POST /api/play '{"track":{"title":"x","path":"tidal://album/1","provider_meta":{"albumID":"1","kind":"album"}}}')" '"ok":true'
+        ck_eq "through provider.load_album, with the provider and the album id" \
+            "$(grep -c '^provider.load_album {"provider":"tidal","album":"1"}' "$T/ipc.log")" "1"
+        ck_has "a real track row plays through the player's own track.play" \
+            "$(http POST /api/play '{"track":{"title":"y","path":"tidal://track/9","stream":true,"provider_meta":{"tidal.id":"9"}}}')" '"ok":true'
         ck_eq "the player was asked for that exact row, once" \
             "$(grep -c '^track.play ' "$T/ipc.log")" "1"
         ck_has "a listed playlist loads through provider.load" \
