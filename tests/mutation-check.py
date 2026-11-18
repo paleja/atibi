@@ -140,6 +140,10 @@ MUTATIONS = [
      'if ! cliamp volume "$STREAMER_VOL_FLOOR"; then',
      "if true; then",
      "the boot floor is set on the player"),
+    ("the boot hands an https target to TLS with the clock still wrong", PLAY,
+     'while [ ! -f "$sync_flag" ]; do',
+     "while false; do",
+     "the warning says the clock is what was missing"),
 
     # fstab-ro.awk is the one program the build runs against a file whose whole
     # job is to keep the root read-only, which is the thing that makes pulling

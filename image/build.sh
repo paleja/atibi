@@ -611,6 +611,11 @@ log "  ssh.service -> multi-user.target"
 #     read-only /etc/console-setup.
 #   dpkg-db-backup.timer stamps a backup of the dpkg database into /var, which a
 #     read-only root forbids: it failed on the day it fired.
+#   logrotate.timer    the same story one day later: logrotate cannot create its
+#     stub state file under /var on a read-only root, so it exits 3 and the
+#     service fails. There are no rotating logs on this appliance to rotate:
+#     journald is volatile and the appliance's own boot.log is trimmed by
+#     streamer-bootlog, not logrotate.
 #   rpi-resize.service  grows the last partition when the kernel command line
 #     says `resize`. That token is stripped from cmdline.txt below and /data is
 #     already the size it will ever be, but the unit still pulls
@@ -619,7 +624,7 @@ log "  ssh.service -> multi-user.target"
 # The unit files stay where the packages put them: removing the symlinks is
 # exactly what `systemctl disable` does.
 for off in userconfig.service apt-daily.timer apt-daily-upgrade.timer e2scrub_all.timer \
-           console-setup.service dpkg-db-backup.timer rpi-resize.service; do
+           console-setup.service dpkg-db-backup.timer logrotate.timer rpi-resize.service; do
     rm -f "$R/etc/systemd/system/"*".target.wants/$off"
     log "  $off -> not started"
 done
@@ -826,6 +831,84 @@ step "login state"
 install -d -m 755 "$R/var/lib/systemd/linger"
 log "  /var/lib/systemd/linger: systemd-logind cannot make it once / is read-only"
 
+# The same trade as the linger directory, at smaller scales. These are all
+# things a stock system makes somewhere under /var on some later boot, which a
+# read-only root never gets: each one logs an err or warn line on every single
+# boot until it is baked into the image, and each cost here is one line. The
+# list came from reading a real card's journal, so it is the set the card
+# actually complains about, not a guess at what could.
+step "first-boot state"
+#   /var/lib/dbus/machine-id  tmpfiles wants this symlink to /etc/machine-id.
+#     dbus reads /etc/machine-id fine without it, but tmpfiles logs "Failed to
+#     create symlink" at level err on every boot when it is not already there.
+install -d -m 755 "$R/var/lib/dbus"
+ln -sfn /etc/machine-id "$R/var/lib/dbus/machine-id"
+#   /var/lib/udisks2  udisks2 ships with the base image and starts enabled;
+#     its first act is mkdir under /var, which fails there and is logged. An
+#     empty directory is all it ever wants at boot.
+install -d -m 755 "$R/var/lib/udisks2"
+#   /var/lib/NetworkManager/secret_key  NetworkManager generates a machine-
+#     unique key at startup when none exists, then cannot write it, so it
+#     warns and starts over from a fresh random one every boot. Baking one in
+#     costs nothing, matches the per-build host keys, and takes the warning
+#     out of the journal.
+install -d -m 755 "$R/var/lib/NetworkManager"
+(umask 077; head -c 32 /dev/urandom >"$R/var/lib/NetworkManager/secret_key")
+#   /etc/resolv.conf  the image ships a static one, and NetworkManager keeps
+#     trying to rewrite it after every DHCP event, failing, and warning.
+#     dns=none says NM has no business running a DNS plugin at all, and
+#     rc-manager=file says /etc/resolv.conf is a plain file that is not NM's
+#     to manage - both are made for exactly this state. Both keys live in
+#     [main]; putting them under [global] only earns an "unknown key" warn.
+install -d -m 755 "$R/etc/NetworkManager/conf.d"
+cat >"$R/etc/NetworkManager/conf.d/10-ro-root.conf" <<'EOF'
+[main]
+# streamer: / is read-only, so NM must not manage /etc/resolv.conf (it is
+# baked into the image) or the DNS that goes with it. See image/build.sh.
+dns=none
+rc-manager=file
+EOF
+# Three vendor tmpfiles.d entries re-assert every boot rather than create when
+# missing, so they hit the read-only wall and log errors even though what
+# they want is already true on the card:
+#   debian.conf       L+ /etc/mtab recreates the symlink that is already there
+#     and correct; plain L would leave it alone, L+ forces it.
+#   systemd.conf      the a+ lines re-apply the ACLs under /var/log/journal on
+#     every boot. The ACLs are baked in and right, and this image runs
+#     journald volatile anyway (see the journal step), so those lines can
+#     only ever fail here.
+#   journal-nocow.conf  the h line re-stamps the no-CoW attribute on
+#     /var/log/journal, warning "cannot set file attributes ... ignoring" on
+#     every boot. The same reasoning: the directory is only ever touched from
+#     /run on this box, and the attribute cannot be set on a read-only fs.
+sed -i '\|^L+ /etc/mtab|d' "$R/usr/lib/tmpfiles.d/debian.conf"
+sed -i '/^a+ \/var\/log\/journal/d' "$R/usr/lib/tmpfiles.d/systemd.conf"
+sed -i '/^h \/var\/log\/journal/d' "$R/usr/lib/tmpfiles.d/journal-nocow.conf"
+#   90-alsa-restore.rules  the alsa-utils udev rule runs `alsactl restore`
+#     for every sound card that appears. This box has never saved a card
+#     state, so every card logs a failed restore - plus two level-err lines
+#     for a GOTO label missing from the vendor file itself. udev reads only
+#     the highest-priority file with a given basename, so an empty file in
+#     /etc turns the whole rule off. Nothing on this appliance touches
+#     alsactl or amixer: cliamp owns the volume, ramped by streamer-play.
+install -d "$R/etc/udev/rules.d"
+: >"$R/etc/udev/rules.d/90-alsa-restore.rules"
+# netplan generate runs at boot and warns about every config file it reads
+# that is world-readable; the vendor NetworkManager yaml ships 644 and the
+# warning's own advice is 600, so give it 600. The file's location varies by
+# netplan version - /usr/lib/netplan on this base, /etc/netplan or
+# /lib/netplan on others - so take whichever this tree has.
+found=0
+for f in "$R"/usr/lib/netplan/*.yaml "$R"/etc/netplan/*.yaml "$R"/lib/netplan/*.yaml; do
+    if [ -f "$f" ]; then
+        chmod 600 "$f"
+        found=1
+    fi
+done
+[ "$found" -eq 1 ] || log "  note: no netplan yaml in the tree to tighten"
+log "  dbus machine-id, udisks2, NM secret key, NM hands off resolv.conf: baked in"
+log "  mtab, journal-ACL and journal-attr tmpfiles lines, and the alsa restore rule: off"
+
 # journald kept in memory, which is what a read-only root without
 # /var/log/journal already implies. Saying it out loud is the point: the
 # alternative is logs on the writable partition, and a hard power cut is exactly
@@ -965,6 +1048,44 @@ linger=$(debugfs -R 'ls -l /var/lib/systemd' "${LOOP}p2" 2>/dev/null |
     die "the root filesystem does not hold /var/lib/systemd/linger:
 systemd-logind will fail at boot and every ssh login will stall 25 seconds"
 log "  /var/lib/systemd/linger is in the image"
+
+# The baked-in first-boot state, read back the same read-only way. Each piece
+# stands for a journal line: no dbus symlink and tmpfiles cries about the
+# symlink every boot, no NM key and NM re-randomises and warns every boot,
+# and so on. Better to find out here than to ship a card that starts its
+# journal with complaints.
+baked=$(debugfs -R 'ls -l /var/lib' "${LOOP}p2" 2>/dev/null | awk '{ print $NF }' |
+    grep -cxE 'dbus|udisks2|NetworkManager' || true)
+[ "${baked:-0}" -eq 3 ] ||
+    die "the root filesystem is missing baked-in /var/lib state (found $baked of 3: dbus, udisks2, NetworkManager)"
+dbus_link=$(debugfs -R 'ls -l /var/lib/dbus' "${LOOP}p2" 2>/dev/null |
+    grep -c 'machine-id -> /etc/machine-id' || true)
+[ "${dbus_link:-0}" -eq 1 ] ||
+    die "the root filesystem does not hold the /var/lib/dbus/machine-id -> /etc/machine-id symlink"
+nm_key=$(debugfs -R 'ls -l /var/lib/NetworkManager' "${LOOP}p2" 2>/dev/null |
+    awk '{ print $NF }' | grep -cx 'secret_key' || true)
+[ "${nm_key:-0}" -eq 1 ] ||
+    die "the root filesystem does not hold /var/lib/NetworkManager/secret_key"
+log "  baked-in /var/lib state reads back from the image"
+
+# The other half of that step: the vendor edits. Reading the shipped files back
+# and looking for the offending lines is the only way to know the seds ran
+# against a file that still had those lines in the same shape - a vendor update
+# to the base image can rewrite these files, and then the journal fills up with
+# the complaints the seds exist to remove.
+for f in debian.conf systemd.conf journal-nocow.conf; do
+    debugfs -R "cat /usr/lib/tmpfiles.d/$f" "${LOOP}p2" 2>/dev/null >"$STAGE/$f" || true
+    if grep -qE '^(L\+ /etc/mtab|a\+ /var/log/journal|h /var/log/journal)' "$STAGE/$f"; then
+        die "the root filesystem still carries a re-asserting tmpfiles line in $f"
+    fi
+done
+rot=$(debugfs -R 'ls -l /etc/systemd/system/timers.target.wants' "${LOOP}p2" 2>/dev/null |
+    grep -c 'logrotate.timer' || true)
+[ "${rot:-0}" -eq 0 ] || die "logrotate.timer is still enabled in the image"
+nmconf=$(debugfs -R 'cat /etc/NetworkManager/conf.d/10-ro-root.conf' "${LOOP}p2" 2>/dev/null || true)
+printf '%s\n' "$nmconf" | grep -q '^rc-manager=file' ||
+    die "the image does not carry the NetworkManager resolv.conf hand-off"
+log "  vendor tmpfiles edits, logrotate off, NM hand-off: read back from the image"
 
 # The data partition's filesystem was made, seeded, checked and stamped as a
 # file a few minutes ago. Here it is only read back, to prove the splice landed

@@ -14,6 +14,11 @@ Environment=HOME=/home/pi
 Environment=LANG=C.UTF-8
 ExecStart=/usr/local/bin/streamer-play
 TimeoutStartSec=120
+# A cold boot can lose the race against NTP, or catch the stream server down
+# for a minute: the script is idempotent, so a retry is worth more than a
+# failed unit leaving the box silent until somebody sshes in.
+Restart=on-failure
+RestartSec=15
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=streamer-play

@@ -70,6 +70,30 @@ if [ -n "$host" ]; then
     done
 fi
 
+# A Pi has no RTC battery: after a power cut the clock starts at the date the
+# image was built, and every TLS handshake made before the first NTP sync
+# fails with "certificate is not yet valid". The daemon accepts url.load and
+# reports it ok; only the stream behind it dies, in its own log, and the
+# playing-state wait below is what eventually notices. So an https target
+# waits for the clock. systemd-timesyncd writes the flag file on sync, the
+# same one systemd-time-wait-sync.service watches. The wait is bounded: with
+# no NTP server reachable the box still tries to play rather than not at all.
+case "$target" in
+    https://*)
+        sync_flag=${STREAMER_TIME_SYNC_FLAG:-/run/systemd/timesync/synchronized}
+        i=0
+        while [ ! -f "$sync_flag" ]; do
+            i=$((i + 1))
+            [ "$i" -gt $((STREAMER_SYNC_WAIT * 2)) ] && {
+                echo "clock not synchronized after ${STREAMER_SYNC_WAIT}s: https certificates will be checked against the wrong date" >&2
+                log_boot "WARN clock unsynced after ${STREAMER_SYNC_WAIT}s"
+                break
+            }
+            sleep 0.5
+        done
+        ;;
+esac
+
 status() { cliamp status --json 2>/dev/null || true; }
 pick() { # pick <json> <key>
     printf '%s' "$1" | sed -n "s/.*\"$2\":\(-\{0,1\}[0-9][0-9.]*\).*/\1/p"

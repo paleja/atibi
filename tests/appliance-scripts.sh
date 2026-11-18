@@ -976,6 +976,41 @@ run() { # run <scenario number>
         # the card by its own contents, never by a list of names that fell behind.
         ck_in "the build installs every script in the payload directory" \
             "$BUILD" 'for script in "$CONFIG"/usr/local/bin/*' ;;
+    16) note "16. cold boot with the clock behind: an https target waits for NTP instead of dying on a certificate"
+        # A power cut leaves the clock at the image build date, and a TLS
+        # handshake made before the first NTP sync fails on certificate
+        # validity. The daemon reports such a stream load as ok; only the
+        # wait for a playing state notices, twenty seconds late. So the
+        # script waits for the sync flag file first, bounded.
+        sed -i 's/^STREAMER_SYNC_WAIT=.*$/STREAMER_SYNC_WAIT=1/' "$T/streamer.conf"
+        # 16a. The clock never syncs in this scenario: the wait runs out,
+        # says so in both logs, and the boot plays anyway rather than not.
+        reset; socket_on
+        printf 'mode=last\nkind=url\ntarget=https://radio.cliamp.stream/lofi/stream\n' >"$T/data/streamer/state"
+        if STREAMER_TIME_SYNC_FLAG="$T/no-such-sync-flag" \
+            "$T/streamer-play" >"$T/logs/s16a" 2>&1; then rc=0; else rc=$?; fi
+        sed 's/^/  /' "$T/logs/s16a"; player
+        socket_off
+        ck_eq "the boot still ends cleanly" "$rc" "0"
+        ck_eq "playing" "$(jstr state)" "playing"
+        ck_in "the warning says the clock is what was missing" "$T/logs/s16a" "clock not synchronized"
+        ck_in "boot.log carries the warn too" "$T/data/streamer/boot.log" "WARN clock unsynced"
+        # 16b. The clock is synced already, which is every warm boot: the
+        # flag file is there, so there is no wait and no warning.
+        reset; socket_on
+        install -d "$T/timesync"
+        : >"$T/timesync/synchronized"
+        printf 'mode=last\nkind=url\ntarget=https://radio.cliamp.stream/lofi/stream\n' >"$T/data/streamer/state"
+        if STREAMER_TIME_SYNC_FLAG="$T/timesync/synchronized" \
+            "$T/streamer-play" >"$T/logs/s16b" 2>&1; then rc=0; else rc=$?; fi
+        sed 's/^/  /' "$T/logs/s16b"; player
+        socket_off; rm -rf "$T/timesync"
+        ck_eq "the boot ends cleanly" "$rc" "0"
+        ck_eq "playing" "$(jstr state)" "playing"
+        ck_not "no wait and no warning when the clock is synced" "$T/logs/s16b" "clock not synchronized"
+        # The shipped budget goes back: like the ramp steps above, a leaked
+        # one-second wait would confuse the scenarios that run after this one.
+        sed -i 's/^STREAMER_SYNC_WAIT=.*$/STREAMER_SYNC_WAIT=30/' "$T/streamer.conf" ;;
     esac
     log_tail
 }
@@ -984,7 +1019,7 @@ echo "sandbox: $T"
 if [ $# -gt 0 ]; then
     for n in "$@"; do run "$n"; done
 else
-    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do run "$n"; done
+    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do run "$n"; done
 fi
 
 printf '\n%d checks, %d failed\n' "$((pass + fail))" "$fail"
