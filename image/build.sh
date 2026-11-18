@@ -606,12 +606,48 @@ log "  ssh.service -> multi-user.target"
 #     at a moment nobody chose. Updating this box is `streamer rw` and apt, by
 #     hand.
 #   e2scrub_all.timer   checks LVM thin volumes; this box has no LVM.
+#   console-setup       sets a console font and keymap for a box that has no
+#     console to look at, and failed every boot writing its state into a
+#     read-only /etc/console-setup.
+#   dpkg-db-backup.timer stamps a backup of the dpkg database into /var, which a
+#     read-only root forbids: it failed on the day it fired.
+#   rpi-resize.service  grows the last partition when the kernel command line
+#     says `resize`. That token is stripped from cmdline.txt below and /data is
+#     already the size it will ever be, but the unit still pulls
+#     systemd-growfs-root.service into every boot, which fails against a
+#     read-only root.
 # The unit files stay where the packages put them: removing the symlinks is
 # exactly what `systemctl disable` does.
-for off in userconfig.service apt-daily.timer apt-daily-upgrade.timer e2scrub_all.timer; do
+for off in userconfig.service apt-daily.timer apt-daily-upgrade.timer e2scrub_all.timer \
+           console-setup.service dpkg-db-backup.timer rpi-resize.service; do
     rm -f "$R/etc/systemd/system/"*".target.wants/$off"
     log "  $off -> not started"
 done
+
+# Two stock subsystems go one step further, because they are wired in afresh by
+# a boot generator every time, and there is no wants symlink anywhere to remove:
+# disabling a generator is a symlink to /dev/null in
+# /etc/systemd/system-generators.
+#   cloud-init-generator  hangs cloud-init.target off multi-user.target from
+#     /run/systemd/generator.early, and the five services behind it are writers
+#     through and through - machine-id, hosts, network config - exactly what
+#     this build decides once and hands to the card read-only. All five failed.
+#     The /etc wants symlinks the package left behind go with them.
+#   rpi-swap-generator    manufactures the stock swap stack from
+#     /etc/rpi/swap.conf at every boot: dev-zram0.swap, rpi-setup-loop@var-swap,
+#     a zram writeback timer, and rpi-resize-swap-file behind them. Every piece
+#     of it wants to write /var/swap, which a read-only root forbids, so it
+#     failed and was retried again and again. Without it the box runs with no
+#     swap at all, which one headless audio stream on a gigabyte of RAM does
+#     not notice; the alternative would be swap on /data, which is exactly the
+#     partition a power cut is most likely to leave dirty.
+install -d "$R/etc/systemd/system-generators"
+for gen in cloud-init-generator rpi-swap-generator; do
+    ln -sfn /dev/null "$R/etc/systemd/system-generators/$gen"
+    log "  $gen -> /dev/null"
+done
+rm -rf "$R/etc/systemd/system/cloud-init.target.wants" \
+       "$R/etc/systemd/system/cloud-config.target.wants"
 
 step "the appliance user"
 # The appliance user is whatever account Raspberry Pi OS made with uid 1000. The
