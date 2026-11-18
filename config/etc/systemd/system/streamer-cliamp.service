@@ -13,7 +13,11 @@ Environment=HOME=/home/pi
 # track names come out mangled in the journal.
 Environment=LANG=C.UTF-8
 ExecStart=/usr/local/bin/streamer-daemon
-Restart=on-failure
+# always, not on-failure: cliamp treats SIGTERM as a clean shutdown and exits
+# 0, so a stray `pkill cliamp` (easy to hit when a second TUI needs killing)
+# would otherwise leave the appliance silent until reboot. Only deliberate
+# stops (streamer reset) use systemctl stop, which always wins over this.
+Restart=always
 RestartSec=2
 NoNewPrivileges=yes
 PrivateTmp=yes

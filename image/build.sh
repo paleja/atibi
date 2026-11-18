@@ -74,11 +74,11 @@ hostkey=$STAGE/ssh_host_ed25519_key.pub
 # half-cleaned state.
 #   cliamp   the player's configuration, its Tidal credentials, its socket, its
 #            log, and where it had got to in a local playlist
-#   state    what to play next boot: one small file
 #   bin      your own scripts, on PATH ahead of /usr/local/bin
 #   music    local files, if you put any there
-#   streamer boot.log, the one record of a boot that outlives a power cut
-DATA_DIRS="cliamp state bin music streamer"
+#   streamer state, the file that says what to play next boot, plus boot.log,
+#            the one record of a boot that outlives a power cut
+DATA_DIRS="cliamp bin music streamer"
 
 # /data, in MiB. Fixed at build time, and never changed on the card: cliamp's
 # state is a few hundred kilobytes, so this is room for playlists and a small
@@ -373,10 +373,10 @@ The directories at the top of the data partition:
 
     cliamp   the player's configuration and its Tidal credentials, its socket,
              its log, and where it had got to in a local playlist
-    state    what to play next boot: one small file
     bin      your own scripts, on PATH ahead of /usr/local/bin
     music    local files, if you put any there
-    streamer boot.log, the one record of a boot that outlives a power cut
+    streamer state, the file that says what to play next boot, plus boot.log,
+             the one record of a boot that outlives a power cut
 
 A card that has never been set up plays the station named in /etc/streamer.conf.
 EOF
@@ -1102,9 +1102,9 @@ data_label=$(blkid -o value -s LABEL "${LOOP}p3")
 # Nothing is ever written through debugfs: writes that matter go through a real
 # mount, by tools that check the filesystem afterwards.
 seeded=$(debugfs -R 'ls -l /' "${LOOP}p3" 2>/dev/null | awk '{ print $NF }' |
-    grep -cxE 'cliamp|state|bin|music|streamer' || true)
-[ "${seeded:-0}" -eq 5 ] ||
-    die "the /data filesystem does not hold the seeded tree (found $seeded of 5 directories):
+    grep -cxE 'cliamp|bin|music|streamer' || true)
+[ "${seeded:-0}" -eq 4 ] ||
+    die "the /data filesystem does not hold the seeded tree (found $seeded of 4 directories):
 the filesystem did not land at sector $p3_start"
 data_blocks=$(dumpe2fs -h "${LOOP}p3" 2>/dev/null |
     sed -n 's/^Block count:[[:space:]]*\([0-9]*\)$/\1/p')
