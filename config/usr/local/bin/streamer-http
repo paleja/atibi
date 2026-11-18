@@ -231,7 +231,8 @@ def read_intent():
     data = conf.get("STREAMER_DATA", "/data")
     state_path = conf.get("STREAMER_STATE", data + "/streamer/state")
     state_path = state_path.replace("$STREAMER_DATA", data)
-    intent = {"mode": "", "kind": "", "target": "", "provider": "", "volume": ""}
+    intent = {"mode": "", "kind": "", "target": "", "provider": "", "volume": "",
+              "title": ""}
     try:
         with open(state_path, encoding="utf-8") as f:
             for line in f:
@@ -256,6 +257,14 @@ MODE_OPS = {"shuffle", "repeat"}
 # play pipeline answers with a plain filesystem error, the way it would for
 # any missing file. See the /api/play route.
 ALBUM_ROW = re.compile(r"\A([a-z][a-z0-9-]*)://album/(\S+)\Z")
+
+# The matching shape for a single track row: the scheme names the provider and
+# the tail is the provider's own track id, which is exactly what the boot
+# needs to rebuild the row (see the album|track branch of streamer-play, and
+# why the display strings are saved with it). A row whose path is not this
+# shape — a file on the card, say — plays but is not remembered: the boot
+# cannot reach anything by that id anyway.
+TRACK_ROW = re.compile(r"\A([a-z][a-z0-9-]*)://track/(\S+)\Z")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -451,12 +460,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # for every provider that spells its rows this way, not just
                 # Tidal.
                 meta = track.get("provider_meta") or {}
+                album = str(meta.get("albumID") or hit.group(2))
                 ipc_op("provider.load_album",
-                       {"provider": hit.group(1),
-                        "album": str(meta.get("albumID") or hit.group(2))})
+                       {"provider": hit.group(1), "album": album})
+                # And it is remembered, through the streamer command, the same
+                # way /api/load/playlist remembers a tapped playlist: what was
+                # tapped on the phone is what should play after the next
+                # reboot. remember, not a restarting verb: the music already
+                # started on this tap.
+                self._json_out({"ok": True,
+                                "streamer": run_streamer(
+                                    "remember", "album",
+                                    "%s:%s" % (hit.group(1), album))})
+                return
+            ipc_op("track.play", {"track": track})
+            thit = TRACK_ROW.match(str(track.get("path", "")))
+            if thit:
+                provider = thit.group(1)
+                tid = str((track.get("provider_meta") or {}).get(
+                    "%s.id" % provider) or thit.group(2))
+                # The display strings come from the row the page is holding:
+                # the boot has no fetch-a-track-by-id call on cliamp 2.4.1, so
+                # what shows in "now playing" after a reboot is what is saved
+                # here. Empty strings are passed on purpose, so a row without
+                # an artist cannot inherit the previous track's.
+                self._json_out({"ok": True,
+                                "streamer": run_streamer(
+                                    "remember", "track",
+                                    "%s:%s" % (provider, tid),
+                                    str(track.get("title", "")),
+                                    str(track.get("artist", "")),
+                                    str(track.get("album", "")))})
             else:
-                ipc_op("track.play", {"track": track})
-            self._json_out({"ok": True})
+                self._json_out({"ok": True})
             return
         if path == "/api/intent":
             # Straight to the streamer command: the only sanctioned writer of
@@ -621,7 +657,10 @@ function render(s){
   $('vd').textContent=(s.volume===undefined?'':s.volume+' dB');
   if(document.activeElement!==$('v')&&s.volume!==undefined)$('v').value=Math.max(-50,Math.min(0,Math.round(s.volume)));
   const m=s.intent||{};$('mode').textContent=m.mode||'last';
-  $('intent').textContent=((m.kind==='provider'?('playlist on '+(m.provider||'?')+': '):m.kind==='playlist'?'playlist: ':'')+(m.target||'(default)'))+(m.volume?(' at '+m.volume+' dB to start with'):' (level not saved)');
+  const lbl={provider:'playlist on ',album:'album on ',track:'track on ',playlist:'playlist: '};
+  const svc=m.kind in lbl&&m.kind!=='playlist'?(m.provider||'?')+': ':'';
+  const shown=(m.kind==='track'&&(m.title||''))?m.title:(m.target||'(default)');
+  $('intent').textContent=(lbl[m.kind]||'')+svc+shown+(m.volume?(' at '+m.volume+' dB to start with'):' (level not saved)');
 }
 function paintBar(){if(dur>0)$('p').style.width=Math.min(100,100*tick/dur)+'%';}
 async function poll(){

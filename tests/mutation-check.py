@@ -163,7 +163,7 @@ MUTATIONS = [
      "it does not pretend the target was unknown"),
 
     ("a provider boot skips the network wait because a bare playlist id has no host in it", PLAY,
-     'if [ -n "$host" ] || [ "$kind" = provider ]; then',
+     "if need_network; then",
      'if [ -n "$host" ]; then',
      "FAIL no network route for provider pl-42"),
 

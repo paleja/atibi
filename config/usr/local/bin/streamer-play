@@ -23,11 +23,13 @@ saved_vol=""
 # person chose through the appliance, which is what makes boot.log honest: a
 # FAIL line there names something somebody asked for. The level the last
 # session settled on lives in the same file, written when the volume changes.
+# Defined before the file is read: the track branch below reads the row's
+# display strings through it too, and wants the same last-line-wins rule.
+last() { sed -n "s/^$1=//p" "$STREAMER_STATE" 2>/dev/null | tail -n 1; }
 if [ -f "$STREAMER_STATE" ]; then
     # Last line wins for each key, the same rule the JSON picks below use. The
     # streamer command never writes a key twice, but a file edited by hand can,
     # and an answer of "-30\n-99" would make every comparison below meaningless.
-    last() { sed -n "s/^$1=//p" "$STREAMER_STATE" 2>/dev/null | tail -n 1; }
     mode=$(last mode)
     kind=$(last kind)
     target=$(last target)
@@ -57,6 +59,14 @@ done
 # and the two second stall that comes with it, check the one thing the target
 # actually needs.
 host=$(printf '%s' "$target" | sed -n 's#^[a-zA-Z]*://\([^/:]*\).*#\1#p')
+need_network() { # does this target have to reach a service somewhere?
+    [ -n "$host" ] && return 0
+    # provider playlists, provider albums and single provider tracks are all
+    # bare ids with no hostname in them: the name check above has nothing to
+    # work on, yet every one of them is fetched across the network.
+    case "$kind" in provider|album|track) return 0 ;; esac
+    return 1
+}
 net_ready() { # can this target be reached yet?
     if [ -n "$host" ]; then
         getent hosts "$host" >/dev/null 2>&1
@@ -72,7 +82,7 @@ net_ready() { # can this target be reached yet?
         ip route get 1.1.1.1 >/dev/null 2>&1
     fi
 }
-if [ -n "$host" ] || [ "$kind" = provider ]; then
+if need_network; then
     i=0
     until net_ready; do
         i=$((i + 1))
@@ -200,6 +210,64 @@ case "$kind" in
             exit 1
         fi
         ;;
+    album|track)
+        # What tapping an album search hit (or one track) on the phone wrote
+        # down. provider.load_album expands an album into its real track rows
+        # and starts playing — the same call the page made when the hit was
+        # tapped — and a single track goes back through track.play as a row
+        # rebuilt from the state file. Both need the service, so the route
+        # wait above covers these kinds too.
+        #
+        # These targets only mean something together with the service that
+        # minted the id, and the provider name is used as a JSON key and the
+        # scheme of a provider:// path, so a hand-edited state file cannot be
+        # allowed to name it with quotes or spaces in it.
+        case "$provider" in
+            *[!a-z0-9-]*|'')
+                echo "kind=$kind with no usable provider name in $STREAMER_STATE: '$provider'" >&2
+                log_boot "FAIL $kind target with no provider: $target"
+                exit 1
+                ;;
+        esac
+        esc_p=$(printf '%s' "$provider" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        esc_t=$(printf '%s' "$target" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        if [ "$kind" = album ]; then
+            if ! cliamp remote call provider.load_album \
+                 --params "{\"provider\":\"$esc_p\",\"album\":\"$esc_t\"}" --wait; then
+                echo "could not load $provider album: $target" >&2
+                log_boot "FAIL provider.load_album $provider $target"
+                exit 1
+            fi
+        else
+            # cliamp 2.4.1 has no fetch-a-track-by-id call, so the row's
+            # display strings ride in the state file beside the id and are
+            # put back here. The player resolves the audio from the
+            # provider_meta id; the strings decide what "now playing" shows,
+            # and a track saved without them still plays, just unnamed.
+            esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+            row="{\"path\":\"$esc_p://track/$esc_t\",\"stream\":true,\"provider_meta\":{\"$esc_p.id\":\"$esc_t\"}"
+            t_title=$(last title); t_artist=$(last artist); t_album=$(last album)
+            if [ -n "$t_title" ]; then row="$row,\"title\":\"$(esc "$t_title")\""; fi
+            if [ -n "$t_artist" ]; then row="$row,\"artist\":\"$(esc "$t_artist")\""; fi
+            if [ -n "$t_album" ]; then row="$row,\"album\":\"$(esc "$t_album")\""; fi
+            row="$row}"
+            # The answer is captured, not just checked: cliamp says where the
+            # row it added landed, and if the transport had not flipped to
+            # playing by the time the guard below looks, that row — not row 0
+            # — is the one to start. Seen on the card 2026-11-18: the daemon
+            # had restored the previous session's list, the job answer still
+            # said stopped, and a row-0 start played The Final Countdown when
+            # the saved intent was Carrie, row 14.
+            if ! resp=$(cliamp remote call track.play --params "{\"track\":$row}" --wait); then
+                echo "could not play $provider track: $target" >&2
+                log_boot "FAIL track.play $provider $target"
+                exit 1
+            fi
+            play_index=$(printf '%s' "$resp" |
+                sed -n 's/.*"index": *\([0-9][0-9]*\).*/\1/p' | tail -n 1)
+            case "$play_index" in ''|*[!0-9]*) play_index= ;; esac
+        fi
+        ;;
     *) echo "unknown state kind: $kind" >&2; log_boot "FAIL unknown kind $kind"; exit 1 ;;
 esac
 
@@ -207,11 +275,15 @@ esac
 # live list. provider.load starts playing when it can, so ask only if nothing
 # is running: that keeps a boot from restarting a track that already began.
 # Row 0, not a remembered row: the appliance records what to play, not where in
-# it it had got to.
+# it it had got to — with one exception. A single track (kind=track) is a row
+# appended to whatever list is loaded, so its own row, where the track.play
+# answer said it landed, is the one to start if the transport has not begun
+# yet; row 0 there is a leftover from the previous session.
 if [ "$(jstr "$(status)" state)" != playing ]; then
-    if ! cliamp remote call queue.play --params '{"index":0}' --wait >/dev/null 2>&1; then
+    start_at=${play_index:-0}
+    if ! cliamp remote call queue.play --params "{\"index\":$start_at}" --wait >/dev/null 2>&1; then
         echo "nothing would play from $kind $target" >&2
-        log_boot "FAIL queue.play index=0 for $kind $target"
+        log_boot "FAIL queue.play index=$start_at for $kind $target"
         exit 1
     fi
 fi
