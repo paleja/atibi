@@ -1,7 +1,14 @@
 [Unit]
 Description=cliamp headless player daemon
 Documentation=file:/data/cliamp/cliamp.log
-After=network.target
+# network.target says almost nothing - it is up before any address exists.
+# network-online.target waits for NetworkManager-wait-online (enabled on this
+# image), which returns once a connection is activated - at which point the
+# lease is in and /run/NetworkManager/resolv.conf has the DNS from DHCP.
+# Without this, the daemon's first m3u fetch races the lease and logs
+# "lookup ... network is unreachable"; seen on the card 2026-10-06.
+Wants=network-online.target
+After=network-online.target
 RequiresMountsFor=/data
 
 [Service]

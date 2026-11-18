@@ -1168,7 +1168,7 @@ run() { # run <scenario number>
                 streamer-*.service|streamer-*.timer|streamer.target)
                     ck "$dep is a unit the payload really ships" \
                         "[ -f \"$CFG/etc/systemd/system/$dep\" ]" ;;
-                network.target|multi-user.target|timers.target|basic.target)
+                network.target|network-online.target|multi-user.target|timers.target|basic.target)
                     echo "  $dep: a stock RasPiOS target, taken as given" ;;
                 *) bad "$dep is named by a payload unit, and is neither one of ours nor a stock target" ;;
             esac

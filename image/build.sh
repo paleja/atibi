@@ -873,20 +873,28 @@ install -d -m 755 "$R/var/lib/udisks2"
 #     out of the journal.
 install -d -m 755 "$R/var/lib/NetworkManager"
 (umask 077; head -c 32 /dev/urandom >"$R/var/lib/NetworkManager/secret_key")
-#   /etc/resolv.conf  the image ships a static one, and NetworkManager keeps
-#     trying to rewrite it after every DHCP event, failing, and warning.
-#     dns=none says NM has no business running a DNS plugin at all, and
-#     rc-manager=file says /etc/resolv.conf is a plain file that is not NM's
-#     to manage - both are made for exactly this state. Both keys live in
-#     [main]; putting them under [global] only earns an "unknown key" warn.
+#   /etc/resolv.conf  the vendor ships a plain file with a static nameserver
+#     8.8.8.8 in it - Raspberry Pi OS has baked that line since before NM
+#     existed. Leaving it there means every card resolves through a public
+#     resolver with no cache, whatever the network's DHCP hands out, and that
+#     is what makes cliamp's lookups time out on WAN hiccups. NM wants to
+#     rewrite that file after every DHCP event, but / is read-only, so the
+#     rewrite fails and the journal fills with warnings. The way out is
+#     rc-manager=symlink: NM writes its nameservers to its own file under
+#     /run, which is tmpfs and writable every boot, and /etc/resolv.conf is a
+#     symlink to it. Replace the vendor's file with that symlink here, so a
+#     card resolves with the DNS its network actually provides.
 install -d -m 755 "$R/etc/NetworkManager/conf.d"
 cat >"$R/etc/NetworkManager/conf.d/10-ro-root.conf" <<'EOF'
 [main]
-# streamer: / is read-only, so NM must not manage /etc/resolv.conf (it is
-# baked into the image) or the DNS that goes with it. See image/build.sh.
-dns=none
-rc-manager=file
+# streamer: / is read-only, so NM must not write /etc/resolv.conf directly;
+# rc-manager=symlink has it write /run/NetworkManager/resolv.conf instead,
+# which the image bakes /etc/resolv.conf as a symlink to. See image/build.sh.
+# Both keys live in [main]; putting them under [global] only earns an
+# "unknown key" warn.
+rc-manager=symlink
 EOF
+ln -sfn /run/NetworkManager/resolv.conf "$R/etc/resolv.conf"
 # Three vendor tmpfiles.d entries re-assert every boot rather than create when
 # missing, so they hit the read-only wall and log errors even though what
 # they want is already true on the card:
@@ -1104,8 +1112,14 @@ rot=$(debugfs -R 'ls -l /etc/systemd/system/timers.target.wants' "${LOOP}p2" 2>/
     grep -c 'logrotate.timer' || true)
 [ "${rot:-0}" -eq 0 ] || die "logrotate.timer is still enabled in the image"
 nmconf=$(debugfs -R 'cat /etc/NetworkManager/conf.d/10-ro-root.conf' "${LOOP}p2" 2>/dev/null || true)
-printf '%s\n' "$nmconf" | grep -q '^rc-manager=file' ||
+printf '%s\n' "$nmconf" | grep -q '^rc-manager=symlink' ||
     die "the image does not carry the NetworkManager resolv.conf hand-off"
+# The other half of the hand-off: if the vendor's static resolv.conf survived
+# next to the new conf, NM would write to /run and nothing would read it,
+# which is the silent half of a half-done fix.
+reslink=$(debugfs -R 'ls -l /etc/resolv.conf' "${LOOP}p2" 2>/dev/null || true)
+printf '%s\n' "$reslink" | grep -q -- '-> /run/NetworkManager/resolv.conf' ||
+    die "/etc/resolv.conf in the image is not the symlink to NetworkManager's /run file"
 log "  vendor tmpfiles edits, logrotate off, NM hand-off: read back from the image"
 
 # The data partition's filesystem was made, seeded, checked and stamped as a
