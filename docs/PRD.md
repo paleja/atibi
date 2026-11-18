@@ -377,8 +377,17 @@ corruptable itself if the cut lands mid-overlay-writeback):
   on `/data` would be left dirty at exactly the instant of a hard cut — the one
   thing this design is supposed to avoid — and journald running before
   `local-fs.target` cannot reach a `/data` bind mount anyway. The durable record
-  is `boot.log`: one line per event, appended and trimmed by the single writer
-  `streamer-bootlog`, read back with `streamer boots`.
+  is `boot.log`: one line per event, appended and trimmed as one operation by the
+  single writer `streamer-bootlog`, under a lock held on the log file itself —
+  no second lock file to litter the partition or get its ownership wrong —
+  because a boot that keeps failing writes it from attempts that overlap. That
+  writer also puts the log's ownership right whenever it can, since a log first
+  written by a root SSH session would otherwise close its lines out to the
+  service, which runs as `pi`: it chowns the file, and where the mode will not
+  allow that it replaces the file through the directory, which the boot user owns,
+  keeping what could be read of it. A log it cannot reach at all is dropped
+  quietly — one message per unwritable line filled the journal on the card. Read
+  back with `streamer boots`.
 - **Boot self-healing was removed** (a boot counter, a known-good copy of
   `config.txt`/`cmdline.txt`, and a unit that rolled them back after three bad
   boots). It protected against one scenario — a `streamer audio dac` on a box
@@ -530,9 +539,12 @@ corruptable itself if the cut lands mid-overlay-writeback):
   needs — a route and a source address, which is what `ip route get` answers —
   inside `STREAMER_NET_WAIT`, the same budget the name check uses, and gives up
   with `FAIL no network route for provider <id>` in boot.log rather than
-  spending the call. No retry: the wait is the fix, and `Restart=on-failure` on
-  the unit stays as the backstop for transients nobody predicted, not as the
-  designed path.
+  spending the call. A wait that actually waits writes one `WARN network not up,
+  waiting Ns for <kind> <target>` line, once rather than once per probe: the
+  journal is volatile here, so a boot that spent seconds without a route is
+  otherwise invisible after the fact. No retry: the wait is the fix, and
+  `Restart=on-failure` on the unit stays as the backstop for transients nobody
+  predicted, not as the designed path.
 - `streamer remember <what> <target>` records intent without touching playback.
   The page needs it: a tapped playlist has already started the music, and
   `streamer playlist` on top of that restarts the boot sequence underneath it —
@@ -542,10 +554,11 @@ corruptable itself if the cut lands mid-overlay-writeback):
   instantly, so a power-cut can never produce a full-power first sample even
   when the saved level was loud. Resume must not, and cannot, bypass the floor.
 - What each boot did is recorded in `/data/streamer/boot.log`, written by the
-  single appender `streamer-bootlog`: an `OK <kind> <target> at N dB (target M)`
-  line or a `FAIL …` line, read back with `streamer boots`. It is also where
-  intent changes and audio-output switches are logged, so the file reads as the
-  box's history rather than only its failures.
+  single appender `streamer-bootlog`, which locks the file against the other
+  attempts of a boot that keeps failing (§7): an `OK <kind> <target> at N dB
+  (target M)` line or a `FAIL …` line, read back with `streamer boots`. It is
+  also where intent changes and audio-output switches are logged, so the file
+  reads as the box's history rather than only its failures.
 
 ## 9. Control surface
 
@@ -641,7 +654,7 @@ These criteria are not all verified the same way, and the distinction matters
 when reading a green result:
 
 - **Script level** (automated, on the build host, no root, no Pi, no network):
-  `tests/appliance-scripts.sh`, nineteen scenarios and 257 assertions — ramp from
+  `tests/appliance-scripts.sh`, twenty scenarios and 277 assertions — ramp from
   the floor (including that the floor reaches the player *before* anything is
   told to make a sound), starting from a saved target and level, saving on change
   (the level a person set lands in the record at once, a playlist tapped on a
@@ -653,7 +666,10 @@ when reading a green result:
   the jack/dac splice leaving the rest
   of `config.txt` alone and being idempotent, a saved level parked at the floor,
   the three ramp guards of §6.4, a provider boot that waits for a route before
-  asking the service for its list, the factory reset of §7, the packaging: every
+  asking the service for its list, the durable boot log keeping its window and
+  its whole lines when a boot that keeps failing writes it from several attempts
+  at once, and that same log when a root session has closed it out to the boot
+  user, the factory reset of §7, the packaging: every
   script a unit execs names its interpreter on its first line and parses as
   shell, and every `ExecStart` in every unit points at a file the payload
   actually ships, and the mutation tool's own two guards: its anchor pass has to
@@ -691,7 +707,7 @@ when reading a green result:
   -u=S`) proves nothing except that the author believed it. Running the real
   tools on an image file is the only way to check that belief short of a card.
 - **Meta level** (automated): `tests/mutation-check.py` breaks one shipped
-  behaviour at a time (forty-seven: the boot floor and the order it is set in, the
+  behaviour at a time (fifty-two: the boot floor and the order it is set in, the
   parked-level rule, the ceiling, `url.load` versus plain queueing, a provider
   list fetched as a local playlist, a second start on top of a provider list that
   `provider.load` already started, a provider playlist stored as a kind nothing
@@ -701,7 +717,10 @@ when reading a green result:
   player instead of only the record, both ramp guards, the set-elsewhere guard,
   an https target handed to TLS with the clock still wrong, a provider playlist
   fetched with no route to fetch it over, a provider route probe that asks for a
-  hostname the target never names, a network budget divided by four, the boot-log window,
+  hostname the target never names, a network budget divided by four, a wait for
+  the network that leaves no trace in the logs, the boot-log window under a pile
+  of writers, a log whose owner was not the boot user, a helper that gives up when
+  the log is closed to it, and one that answers a closed log with noise,
   the reset asking before it wipes / using a glob / wiping under a running
   player, `streamer ro`, the LAN server's token and station guards, the page
   setting the level on the player but not in the record, a tapped playlist that
@@ -745,7 +764,8 @@ when reading a green result:
 |---|---|---|
 | ≤10s not reached on stock-Debian userspace (Pi 4 SD I/O) | Goal miss | Critical-chain work is incremental; fallback ladder: faster SD → USB3 SSD → trimmed userspace, in that order, before considering Buildroot. A2 microSD is the starting point; the SSD is bought only if the first five-boot median misses |
 | Resume-last (§8.3) not natively supported by cliamp | Feature gap | Built and tested here: the appliance keeps its own `state` record and replays it through IPC. Checked against a live cliamp 2.4.1: `status --json` pretty-prints with two-space indent, and a streaming-service playlist needs `provider.load` — `cliamp load` only resolves lists saved on the card. What still has to be seen on the card is `cliamp remote call capabilities` confirming that `provider.load` takes exactly `{"provider":…,"playlist":…}` |
-| A cold boot's DHCP lease arrives after the boot script asks the service for its list | Silent card, one failed unit in that boot's journal | Seen on the 2026-11-18 card: `provider.load` eight seconds before the lease, answered `sign-in required`. Fixed as §8.3 describes: the boot waits for a route within `STREAMER_NET_WAIT` before asking, scenario 18 checks both the late lease and no lease at all, and three mutation entries cover the wait, the probe and its budget |
+| A cold boot's DHCP lease arrives after the boot script asks the service for its list | Silent card, one failed unit in that boot's journal | Seen on the 2026-11-18 card: `provider.load` eight seconds before the lease, answered `sign-in required`. Fixed as §8.3 describes: the boot waits for a route within `STREAMER_NET_WAIT` before asking, scenario 18 checks both the late lease and no lease at all, and four mutation entries cover the wait, the probe, its budget and the log line the wait leaves. Seen fixed on the card: lease at `02:27:51.09`, `provider.load` created at `02:27:51.389` and succeeded 0.5s later, boot.log `OK provider … at -4 dB`, 0 failed units, 0 `sign-in required` in the whole cliamp log |
+| Overlapping attempts of a failing boot write `/data/streamer/boot.log` at once | The one durable record of a boot comes back with holes in it, or stops coming at all | Seen on the 2026-11-18 card: 384 NUL bytes mid-file, where two lines used to be, after a boot loop (`FAIL no network route`, retried every `RestartSec`) ran the trim's rename under a writer still appending at its old offset, and two trims raced on one shared `.tmp` name. Fixed by making the append and the trim one `flock`-guarded operation, with a per-process temp name and the lock held on the log file itself: a separate lock file turned out to be a way to lose lines rather than a way to keep them, because one created by a root SSH session could not be opened by the service that runs as `pi`. The same card then showed the ownership hole directly — a root-owned, root-only-readable log left the service unable to add a line, and answered it with one journal message per attempt. The writer now puts the log back in the boot user's hands, replacing it through the directory that belongs to them if its mode will not do, and stays silent about a log it cannot write. Scenario 19 checks the visible effects (the window holds, whole lines, no NULs, nothing but the log left on the partition, the closed log replaced and still carrying the lines that could be read of it, and no stderr); the races themselves are device observations, not something a build host reproduces. Seen fixed on the card: 210 writers into a window of 200 left 200 distinct whole lines, 0 NULs, one file in `/data/streamer`, and a root-owned log came back `pi:pi` with its earlier line kept and 0 bytes on stderr |
 | Tidal revokes shared OAuth client IDs | Provider breakage | `client_id`/`client_secret` override in config; re-login path documented; alert on status code in logs |
 | cliamp updates change socket protocol (1.x → 2.x was a breaking change) | Control breakage | Pin cliamp version in image; upgrade deliberately via reflash/overlay update |
 | HAT EEPROM misdetection | No audio | `force_eeprom_read=0` plus an explicit `dtoverlay=iqaudio-dacplus` matched to the black board bought (§6.4); `/proc/device-tree/hat/product` confirms it on first boot, and `streamer audio jack` is one command away if it is wrong |

@@ -320,6 +320,9 @@ chmod +x "$T/bin/cliamp" "$T/bin/systemctl" "$T/bin/mount" "$T/bin/ip" "$T/bin/c
 
 cat >"$T/bin/chown" <<'EOF'
 #!/bin/sh
+# recorded, not performed: the sandbox has one user, so ownership itself cannot
+# be tested here. What can be tested is that a script asked for it.
+echo "$*" >>"$TESTROOT/chown.log"
 exit 0
 EOF
 chmod +x "$T/bin/chown"
@@ -376,7 +379,7 @@ reset() { # the data partition as the card ships it, a player as a live daemon
     for d in $DATA_DIRS; do install -d "$T/data/$d"; done
     "$T/bin/cliamp" --default-state >"$T/state.json"
     rm -f "$T/player.log"
-    rm -f "$T/ip.log" "$T/net-down"
+    rm -f "$T/ip.log" "$T/net-down" "$T/chown.log"
     fw_seed jack
 }
 
@@ -604,6 +607,7 @@ run() { # run <scenario number>
         sed 's/^/  /' "$T/logs/s3"; player
         socket_off
         ck_eq "exit status 0" "$rc" "0"
+        ck_not "a network that is already up is not waited for" "$T/logs/s3" "network not up"
         ck_has "the boot asked the player for the provider playlist" "$(cat "$T/player.log")" "provider.load"
         ck_eq "the provider playlist is loaded" "$(jrow 0)" "e407f56e: row 0"
         ck "provider.load started it, so the boot did not start it again" \
@@ -1327,6 +1331,13 @@ run() { # run <scenario number>
         ck_eq "at the level that was saved" "$(jnum volume)" "-9"
         ck_not "a boot that got there wrote no failure" "$T/data/streamer/boot.log" "FAIL"
         ck_in "the one line it did write is the play" "$T/data/streamer/boot.log" "OK provider pl-42"
+        # And it said so while it waited: the journal here is volatile, so a
+        # boot that spent four seconds without a route is only findable
+        # afterwards if the waiting leaves a line of its own.
+        ck_in "the journal says it was waiting for a route" "$T/logs/s18a" "network not up yet"
+        ck_in "and boot.log says so too, once" "$T/data/streamer/boot.log" "WARN network not up"
+        ck_eq "once, not once per probe" \
+            "$(grep -c "WARN network not up" "$T/data/streamer/boot.log")" "1"
         # No network at all, the other half: it has to stop, inside the budget it
         # was given, and without ever asking the player for something the player
         # could not have fetched.
@@ -1341,9 +1352,86 @@ run() { # run <scenario number>
             "$(wc -l <"$T/ip.log")" "$((2 * 4 + 1))"
         ck_in "boot.log says what was missing" \
             "$T/data/streamer/boot.log" "FAIL no network route for provider pl-42"
+        ck_in "after first saying it had waited" "$T/logs/s18b" "network not up yet"
         ck_not "and it never asked the player for the playlist" \
             "$T/player.log" "provider.load" ;;
-    19) note "19. the tool that breaks the payloads on purpose: its own guards"
+    19) note "19. the durable log under several writers at once: a boot that keeps failing logs over its own earlier attempts"
+        # A boot that fails is tried again by systemd every RestartSec, and the
+        # attempts overlap: each one writes boot.log while a previous one is
+        # still writing. The helper appends and then trims the file to a window,
+        # so the question is what two such helpers do to each other. On the card
+        # 2026-11-18, after a boot looped on a provider with no network, the
+        # answer was 384 NUL bytes in the middle of the log where two lines used
+        # to be: a trim had renamed a short file over the log under a writer that
+        # was still appending at its old offset.
+        reset; socket_on
+        sed -i 's/^STREAMER_BOOTLOG_KEEP=.*$/STREAMER_BOOTLOG_KEEP=8/' "$T/streamer.conf"
+        echo "-- 200 writers at one time into a window of 8"
+        for i in $(seq 1 200); do "$T/streamer-bootlog" "event $i" & done
+        wait
+        echo "  kept: $(wc -l <"$T/data/streamer/boot.log") lines, \
+$(wc -c <"$T/data/streamer/boot.log") bytes, \
+$(tr -dc '\000' <"$T/data/streamer/boot.log" | wc -c) NUL bytes"
+        sed 's/^/  /' "$T/data/streamer/boot.log"
+        ck_eq "the window holds, however many writers collide" \
+            "$(wc -l <"$T/data/streamer/boot.log")" "8"
+        ck_eq "not one NUL byte in it, which is what an unlocked trim leaves behind" \
+            "$(tr -dc '\000' <"$T/data/streamer/boot.log" | wc -c)" "0"
+        ck_eq "and every kept line is a whole line, not a fragment of two" \
+            "$(grep -c '^[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9:]*Z event [0-9]*$' \
+                "$T/data/streamer/boot.log")" "8"
+        ck_eq "the log is still readable as a log" \
+            "$("$T/streamer" boots | grep -c "event ")" "8"
+        ck_eq "a helper that only logs leaves nothing but the log behind" \
+            "$(find "$T/data" -name 'boot.log*' | wc -l)" "1"
+        # Ownership is the part that cannot be enacted in a sandbox with one
+        # user. What can be tested is that the writer asks for it: the log is
+        # written both by the service, as pi, and by a `streamer` command typed
+        # over SSH, as root, and whichever came first owns the file.
+        ck_in "it puts the log back in the boot user's hands, if it can" \
+            "$T/chown.log" "pi:pi $T/data/streamer/boot.log"
+        echo "-- and one writer, the ordinary case, still keeps the window"
+        for i in 1 2 3; do "$T/streamer-bootlog" "solo $i"; done
+        ck_eq "three more events leave the same window, oldest gone" \
+            "$(wc -l <"$T/data/streamer/boot.log")" "8"
+        ck_in "the newest event is in it" "$T/data/streamer/boot.log" "solo 3"
+        ck_eq "the oldest of the collisions is not" \
+            "$(grep -c " event 1$" "$T/data/streamer/boot.log")" "0"
+        # The other half of the same device lesson: the log had been made
+        # unreadable-by-the-boot-user by a root SSH session, and the service's
+        # lines stopped coming. With one user in the sandbox the ownership cannot
+        # be enacted, but a file the writer cannot write can be: mode 444 takes
+        # the same path, and the helper has to come back with the log working,
+        # the lines it could read kept, and no complaint on stderr.
+        echo "-- then the log is closed to the writer, as a root session left it"
+        chmod 444 "$T/data/streamer/boot.log"
+        "$T/streamer-bootlog" "after the lockout" 2>"$T/logs/s19perm"
+        echo "  stderr: $(sed 's/^/  /' "$T/logs/s19perm")"
+        ck_eq "it makes no noise about not being able to write" \
+            "$(wc -l <"$T/logs/s19perm")" "0"
+        ck_in "its line still lands" "$T/data/streamer/boot.log" "after the lockout"
+        ck_in "and the line it could read of the old one is kept" \
+            "$T/data/streamer/boot.log" "solo 3"
+        ck_eq "the log is writable again, and only the log is there" \
+            "$([ -w "$T/data/streamer/boot.log" ] && echo w)$(find "$T/data" -name 'boot.log*' | wc -l)" "w1"
+        # Where the rewrite is not possible - no directory to write in at all -
+        # the only thing left to get right is silence. Two redirects make that a
+        # matter of their order: a redirect the shell cannot open is reported at
+        # the point in the list where it fails, so a `9>>` that comes before the
+        # 2>/dev/null speaks to whoever is watching. On the card that was 210
+        # messages in the journal from one boot.
+        echo "-- and a log with nowhere to be created at all"
+        install -d "$T/data/ro"
+        chmod 555 "$T/data/ro"
+        sed -i "s#^STREAMER_BOOTLOG=.*#STREAMER_BOOTLOG=$T/data/ro/gone/boot.log#" "$T/streamer.conf"
+        "$T/streamer-bootlog" "into a closed directory" 2>"$T/logs/s19ro"
+        ck_eq "it succeeds, because a log that cannot be written must not fail a boot" \
+            "$?" "0"
+        ck_eq "and it keeps the complaint to itself" \
+            "$(wc -l <"$T/logs/s19ro")" "0"
+        chmod 755 "$T/data/ro" ;;
+
+    20) note "20. the tool that breaks the payloads on purpose: its own guards"
         # tests/mutation-check.py rewrites the payload files, so two of its
         # guards are worth checking here, in a tenth of a second, rather than
         # only inside a nine-minute sweep: the anchor pass it runs before
@@ -1418,7 +1506,7 @@ echo "sandbox: $T"
 if [ $# -gt 0 ]; then
     for n in "$@"; do run "$n"; done
 else
-    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19; do run "$n"; done
+    for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do run "$n"; done
 fi
 
 printf '\n%d checks, %d failed\n' "$((pass + fail))" "$fail"

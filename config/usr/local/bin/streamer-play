@@ -76,6 +76,15 @@ if [ -n "$host" ] || [ "$kind" = provider ]; then
     i=0
     until net_ready; do
         i=$((i + 1))
+        if [ "$i" -eq 1 ]; then
+            # The journal on this box is volatile: a boot that had to wait is
+            # only findable afterwards if the waiting itself says so once.
+            # provider targets name no host, so say what is actually being
+            # waited for there: a route.
+            [ -n "$host" ] && waiting="to resolve $host" || waiting="for a route"
+            echo "network not up yet, waiting up to ${STREAMER_NET_WAIT}s $waiting" >&2
+            log_boot "WARN network not up, waiting ${STREAMER_NET_WAIT}s for $kind $target"
+        fi
         [ "$i" -gt "$((STREAMER_NET_WAIT * 4))" ] && {
             if [ -n "$host" ]; then
                 echo "cannot resolve $host" >&2

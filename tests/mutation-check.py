@@ -99,8 +99,39 @@ MUTATIONS = [
      'if [ "$lines" -gt "$STREAMER_BOOTLOG_KEEP" ]; then',
      "if false; then",
      "boot.log keeps the configured window"),
-
-
+    # A boot that keeps failing writes this log from attempts that overlap, and
+    # the append and the trim have to be one operation under a lock: unlocked,
+    # the trim renames a short file over the log under a writer still appending
+    # at its old offset, which is how 384 NUL bytes got into the card's boot.log
+    # on 2026-11-18. That race needs a real rename under a live writer, which a
+    # build host does not reliably produce, so what these two entries are caught
+    # by is the writer's visible trace, not the corruption. The corruption
+    # itself is a device observation.
+    ("the boot log's append and trim race each other", BOOTLOG,
+     '(boot_log "$*") 2>/dev/null 9>>"$STREAMER_BOOTLOG" || true',
+     '(boot_log "$*") 2>/dev/null || true',
+     "a helper that only logs leaves nothing but the log behind"),
+    # The log is written from two identities: the service as pi, and whoever
+    # types a `streamer` command over SSH, which is root. A file that the first
+    # of those created is closed to the second.
+    ("the boot log leaves the log owned by whoever happened to write it first", BOOTLOG,
+     'chown "$STREAMER_USER:$STREAMER_GROUP" "$STREAMER_BOOTLOG" 2>/dev/null || true',
+     ":",
+     "it puts the log back in the boot user's hands, if it can"),
+    # Proved on the card: a root SSH session closed the log, and the service had
+    # no way to open it again. The directory is the boot user's, and that is what
+    # gives the helper a way out.
+    ("the boot log gives up when the log is closed to it", BOOTLOG,
+     'if [ -e "$STREAMER_BOOTLOG" ] && [ ! -w "$STREAMER_BOOTLOG" ]; then',
+     "if false; then",
+     "its line still lands"),
+    # The order of the two redirects is the whole of this one: a redirect that
+    # cannot be opened is reported at the point in the list where it fails, so
+    # `9>>... 2>/dev/null` shouted one line per unwritable log at the journal.
+    ("the boot log complains to whoever is watching when it cannot write", BOOTLOG,
+     '(boot_log "$*") 2>/dev/null 9>>"$STREAMER_BOOTLOG" || true',
+     '(boot_log "$*") 9>>"$STREAMER_BOOTLOG" 2>/dev/null || true',
+     "and it keeps the complaint to itself"),
     ("a parked volume is replayed verbatim", PLAY,
      r"""elif awk -v l="$level" -v f="$STREAMER_VOL_FLOOR" 'BEGIN{ exit (l+0 <= f+0) ? 0 : 1 }'; then""",
      "elif false; then",
@@ -145,6 +176,11 @@ MUTATIONS = [
      '        [ "$i" -gt "$((STREAMER_NET_WAIT * 4))" ] && {',
      '        [ "$i" -gt "$STREAMER_NET_WAIT" ] && {',
      "inside the seconds it was given, not one more"),
+
+    ("a boot that waits for the network leaves no trace of it in the logs", PLAY,
+     '        if [ "$i" -eq 1 ]; then',
+     "        if false; then",
+     "the journal says it was waiting for a route"),
 
     ("the status reader insists on no space after the colon again", PLAY,
      'sed -n "s/.*\\"$2\\": *\\(-\\{0,1\\}[0-9][0-9.]*\\).*/\\1/p" | tail -n 1',

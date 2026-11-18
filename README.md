@@ -52,7 +52,11 @@ boot.
   - `usr/local/bin/streamer-{daemon,play}` — the player daemon, and the
     boot-time play
   - `usr/local/bin/streamer-bootlog` — one durable line per event; it is the only
-    record that outlives a power cut
+    record that outlives a power cut. A boot that keeps failing writes it from
+    overlapping attempts, so its append and its trim are one operation under a
+    lock held on the log file itself, and because a log first created by a root
+    SSH session would otherwise close the service's lines out, the helper puts
+    that log back in the boot user's hands whenever it can
   - `usr/local/bin/streamer-http` — the LAN control server: a token-guarded
     HTTP API and a phone-sized web page on port 8077, talking to the player
     over its own IPC socket. Boot intent still only ever goes through the
@@ -65,8 +69,8 @@ boot.
   volatile, on purpose), the hostname and timezone if you ask for them, the SSH
   `authorized_keys`, a fresh machine-id and SSH host keys for this build, and the
   `systemctl enable` symlinks for the units above.
-- `tests/appliance-scripts.sh` — the regression suite for those scripts: nineteen
-  scenarios and 257 checks, each one asserting rather than merely running. It
+- `tests/appliance-scripts.sh` — the regression suite for those scripts: twenty
+  scenarios and 277 checks, each one asserting rather than merely running. It
   checks the boot-time ramp from the floor (including that the floor is set
   before the player is told to make a sound), starting from a saved target and
   level, saving on change (the level you set lands in the record at once, a
@@ -77,11 +81,14 @@ boot.
   step budget, a volume somebody else moved mid-ramp), the jack/dac switch
   leaving the rest of `config.txt` alone, the `streamer` command's reporting,
   waiting for the clock before an https target, and waiting for a route before
-  fetching a playlist from a streaming service, the factory reset, the packaging
-  (every script that systemd starts names its interpreter, and every unit points
-  at a file that exists), the LAN control server (token-guarded, browsing and
-  searching providers through the player's own socket, and writing boot intent
-  only through the `streamer` command), and the image recipe itself: the real
+  fetching a playlist from a streaming service, the durable boot log's window
+  when a boot that keeps failing writes it from several attempts at once, and
+  that same log closed out to the boot user by a root session, the
+  factory reset, the packaging (every script that systemd starts names its
+  interpreter, and every unit points at a file that exists), the LAN control
+  server (token-guarded, browsing and searching providers through the player's
+  own socket, and writing boot intent only through the `streamer` command), and
+  the image recipe itself: the real
   `sfdisk`, `mkfs.ext4 -d`, `e2fsck`, `tune2fs`, `blkid`, `dumpe2fs` and `dd`,
   run without root on an image file, plus the fstab editor run against a real
   fstab. No root, no Pi and no real cliamp: a stand-in covers the parts of the
@@ -98,7 +105,7 @@ boot.
   exit status; `bash tests/appliance-scripts.sh` runs all of them, or pass
   scenario numbers to run a few.
 - `tests/mutation-check.py` — the test of the tests. It deliberately breaks one
-  shipped behaviour at a time (forty-seven of them) and requires the suite to go
+  shipped behaviour at a time (fifty-two of them) and requires the suite to go
   red on the check that cares about that behaviour; anything it misses is a check
   that looks meaningful and is not. It checks its own anchors before it starts —
   each break has to name exactly one line, and each one has to name a check that
