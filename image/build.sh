@@ -120,7 +120,7 @@ esac
 case $NEW_HOSTNAME in
     *[!a-z0-9-]*|'') die "hostname has to be lower case letters, digits and dashes: $NEW_HOSTNAME" ;;
 esac
-for tool in curl sfdisk losetup blkid e2fsck tune2fs fsck.fat bsdtar xz ssh-keygen; do
+for tool in curl sfdisk losetup blkid e2fsck tune2fs mkfs.ext4 dumpe2fs fsck.fat dd truncate mount umount bsdtar xz ssh-keygen; do
     command -v "$tool" >/dev/null || die "$tool is missing"
 done
 
@@ -256,12 +256,30 @@ step "work image"
 mkdir -p "$STAGE"
 IMG=$STAGE/card.img
 LOOP=""
+
+# Anything the desktop's volume manager has put on this loop device has to go
+# before the loop device can be released: udisks2 here mounts a new labelled
+# ext4 partition read-write under /run/media the moment its node appears, and a
+# busy loop device cannot be detached, which is how five 3.4 GB work images
+# ended up stranded on this machine.
+drop_automounts() {
+    local m
+    [ -n "$LOOP" ] || return 0
+    for m in $(awk -v l="$LOOP" '$3 == l || $3 ~ "^" l "p[0-9]+$" {print $2}' /proc/mounts |
+                   sort -r); do
+        log "  unmounting what the volume manager mounted at $m"
+        umount "$m" 2>/dev/null || true
+    done
+}
+
 cleanup() {
     set +e
     umount "$STAGE/fw" 2>/dev/null
     umount "$STAGE/root" 2>/dev/null
+    drop_automounts
     [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
     [ -n "$IMG" ] && rm -f "$IMG"
+    rm -f "$STAGE/data-fs.img"
     rmdir "$STAGE" 2>/dev/null
 }
 trap cleanup EXIT
@@ -320,6 +338,61 @@ log "the new partition table:"
 sfdisk -d "$IMG" | grep ' : start=' |
     awk -F' : ' '{split($1, a, "/"); printf "  %-12s %s\n", a[length(a)], $2}' >&2
 
+# --- the /data filesystem ---------------------------------------------------------------------
+
+# p3's filesystem is made in a plain file and spliced into the image at the
+# partition's offset, rather than written through ${LOOP}p3. Identical bytes,
+# and they are the bytes the card will hold. The reason for doing it the
+# roundabout way is that this filesystem has to be checked with e2fsck, and on
+# a machine with a volume manager that is only possible while nothing holds the
+# filesystem: udisks2 here mounts a new labelled ext4 partition read-write
+# under /run/media the moment the partition node appears, and e2fsck then
+# refuses to run at all. A file cannot be automounted.
+#
+# That p3 ships mounted-ready is a design decision, and the first card paid for
+# it: a partition entry with no filesystem means data.mount fails, every unit
+# that says Requires=data.mount fails with it, and the one script that could
+# undo the damage is the one that cannot run, because the password-free sudo
+# rule it writes lives on the far side of that same failure. A card that ships
+# with a mountable /data can only ever be left with a small /data, never an
+# unbootable one.
+step "the /data filesystem"
+fsimg=$STAGE/data-fs.img
+rm -f "$fsimg"
+truncate -s $((DATA_SECTORS * 512)) "$fsimg"
+# -b 4096 is not decoration: mkfs.ext4 sizes its block size from what it is
+# handed, and on a plain file it chose 1 KiB blocks for a 256 MiB filesystem.
+mkfs.ext4 -q -F -b 4096 -L streamer-data -m 0 "$fsimg" >"$STAGE/data-mkfs.log" 2>&1 ||
+    die "making the $((DATA_SECTORS / 2048)) MiB /data filesystem failed:
+$(cat "$STAGE/data-mkfs.log")"
+# e2fsck exits 0 for clean and 1 for "errors corrected"; 1 is a pass here, and
+# 2 and above means the filesystem this card would boot with is not sound.
+ec=0
+e2fsck -fy "$fsimg" >"$STAGE/data-fsck.log" 2>&1 || ec=$?
+[ "$ec" -le 1 ] || die "the fresh /data filesystem fails e2fsck (status $ec):
+$(cat "$STAGE/data-fsck.log")"
+tune2fs -C 0 -i 0 -T now "$fsimg" >"$STAGE/data-tune.log" 2>&1 ||
+    die "tune2fs could not reset the /data filesystem's check counters:
+$(cat "$STAGE/data-tune.log")"
+# The filesystem has to fill the partition exactly: too small and the first
+# resize2fs on the card has more work than the geometry allows, too large and
+# the superblock is written past the end of the partition.
+super=$(dumpe2fs -h "$fsimg" 2>&1) || die "the /data filesystem has no readable superblock:
+$super"
+blocks=$(printf '%s\n' "$super" | sed -n 's/^Block count:[[:space:]]*\([0-9]*\)$/\1/p')
+block_size=$(printf '%s\n' "$super" | sed -n 's/^Block size:[[:space:]]*\([0-9]*\)$/\1/p')
+[ "$((blocks * block_size))" -eq "$((DATA_SECTORS * 512))" ] ||
+    die "the /data filesystem is $blocks x $block_size bytes, not the partition's $((DATA_SECTORS / 2048)) MiB"
+if [ $((p3_start % 2048)) -eq 0 ]; then
+    dd if="$fsimg" of="$IMG" bs=1M seek=$((p3_start / 2048)) conv=notrunc status=none ||
+        die "could not splice the /data filesystem into the image at sector $p3_start"
+else
+    dd if="$fsimg" of="$IMG" bs=512 seek="$p3_start" conv=notrunc status=none ||
+        die "could not splice the /data filesystem into the image at sector $p3_start"
+fi
+rm -f "$fsimg"
+log "  data      ext4, $((DATA_SECTORS / 2048)) MiB ($blocks x $block_size), spliced in at sector $p3_start: e2fsck clean, resize2fs grows it on the card"
+
 # --- mount ------------------------------------------------------------------------------------
 
 step "mount"
@@ -329,6 +402,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.2
 done
 [ -b "${LOOP}p3" ] || die "udev created no partition devices for $LOOP"
+drop_automounts
 
 R=$STAGE/root
 FW=$STAGE/fw
@@ -336,17 +410,6 @@ mkdir -p "$R" "$FW"
 mount -o noatime "${LOOP}p2" "$R"
 mount -o noatime "${LOOP}p1" "$FW"
 log "$LOOP: p2 -> $R, p1 -> $FW"
-
-# p3 gets its filesystem here, in the image, not on the card. That is a design
-# decision and the first card paid for it: a partition entry with no filesystem
-# means data.mount fails, every unit that says Requires=data.mount fails with
-# it, and the one script that could undo the damage is the one that cannot run,
-# because the password-free sudo rule it writes lives on the far side of that
-# same failure. A card that ships with a mountable /data can only ever be left
-# with a small /data, never an unbootable one.
-mkfs.ext4 -q -F -L streamer-data -m 0 "${LOOP}p3" >/dev/null ||
-    die "mkfs.ext4 on the data partition failed"
-log "  data      ext4 made in the build: $((DATA_SECTORS / 2048)) MiB, resize2fs grows it on the card"
 
 DISK_ID=$(printf '%s\n' "$dump" | sed -n 's/^label-id:[[:space:]]*0x\([0-9a-fA-F]*\)$/\1/p' | tr 'A-F' 'a-f')
 [ -n "$DISK_ID" ] || die "the base image has no DOS disk identifier in its partition table"
@@ -554,6 +617,7 @@ log "cmdline: $line"
 step "checks"
 umount "$FW"
 umount "$R"
+drop_automounts
 sync
 
 # A vfat partition edited through Linux usually needs its FS info sector
@@ -567,27 +631,42 @@ fsck.fat -n "${LOOP}p1" >/dev/null || die "the firmware partition fails fsck.fat
 $(cat "$STAGE/fat.log")"
 log "firmware partition passes fsck.fat"
 
-e2fsck -fy "${LOOP}p2" >/dev/null || die "the root partition fails e2fsck"
-# Reset the forced-check bookkeeping so the first real boot is not the one that
-# decides to fsck: -C 0 clears the mount counter, -i 0 disables the periodic
-# check interval, -T now stamps the superblock as just checked. (`-T never` is
-# not a thing: `never` is only a keyword for -c/-i, and e2fsprogs 1.47.4 takes
-# the usage line and exits non-zero on it.)
-tune2fs -C 0 -i 0 -T now "${LOOP}p2" >/dev/null \
-    || die "tune2fs could not reset the root partition's check counters"
-log "root partition passes e2fsck, forced-check counters reset"
+# e2fsck again: 0 is clean, 1 is "problems corrected", and anything above that
+# means the filesystem the Pi would boot from is not sound. Output goes to a
+# log because a die message that says only "fails e2fsck" is how this build
+# lost half an hour to a volume manager.
+ec=0
+e2fsck -fy "${LOOP}p2" >"$STAGE/root-fsck.log" 2>&1 || ec=$?
+[ "$ec" -le 1 ] || die "the root partition fails e2fsck (status $ec):
+$(cat "$STAGE/root-fsck.log")"
+# One tune2fs run, on the partition while it is unmounted:
+#   -U random  a fresh filesystem UUID, so two cards from this build are never
+#              the same filesystem to whatever mounts them
+#   -C 0       clears the mount counter
+#   -i 0       disables the periodic check, which on this box could only ever
+#              fire on a boot that is already racing a timer
+#   -T now     stamps the superblock as just checked
+# (`-T never` is not a thing: `never` is only a keyword for -c/-i, and
+# e2fsprogs 1.47.4 prints the usage line and exits non-zero on it.)
+tune2fs -U random -C 0 -i 0 -T now "${LOOP}p2" >"$STAGE/root-tune.log" 2>&1 \
+    || die "tune2fs could not give the root partition a fresh UUID and reset its
+check counters:
+$(cat "$STAGE/root-tune.log")"
+log "root partition passes e2fsck, UUID and forced-check counters reset"
 
-# The data partition is handed to the card with a filesystem in it, so it gets
-# the same treatment; it is also the only chance to see that the filesystem the
-# card will boot with really exists and says what fstab expects.
-e2fsck -fy "${LOOP}p3" >/dev/null || die "the data partition fails e2fsck"
-tune2fs -C 0 -i 0 -T now "${LOOP}p3" >/dev/null \
-    || die "tune2fs could not reset the data partition's check counters"
+# The data partition's filesystem was made, checked and stamped as a file a few
+# minutes ago; here it is only read back, to prove the splice landed where the
+# partition table says it did. Nothing writes to a loop partition the desktop
+# may have mounted.
 data_label=$(blkid -o value -s LABEL "${LOOP}p3")
 data_type=$(blkid -o value -s TYPE "${LOOP}p3")
 [ "$data_type" = ext4 ] && [ "$data_label" = streamer-data ] ||
     die "the data partition is $data_type/$data_label, expected ext4/streamer-data"
-log "data partition passes e2fsck: $(blkid -o value -s LABEL "${LOOP}p3") ($data_type), $((DATA_SECTORS / 2048)) MiB"
+data_blocks=$(dumpe2fs -h "${LOOP}p3" 2>/dev/null |
+    sed -n 's/^Block count:[[:space:]]*\([0-9]*\)$/\1/p')
+[ "$data_blocks" -gt 0 ] || die "the data partition has no readable ext4 superblock:
+the filesystem did not land at sector $p3_start"
+log "data partition reads back as $(blkid -o value -s LABEL "${LOOP}p3") ($data_type), $data_blocks blocks, $((DATA_SECTORS / 2048)) MiB"
 
 # Read the patched files back through a fresh mount: what matters is what the
 # Pi firmware will read, not what this script thinks it wrote.
@@ -598,7 +677,11 @@ sed -n '/^# --- streamer appliance ---$/,/^# --- streamer audio end ---$/p' "$FW
 log "cmdline.txt: $(cat "$FW/cmdline.txt")"
 umount "$FW"
 
-losetup -d "$LOOP"
+# Reap anything the volume manager mounted in the meantime, or losetup -d fails
+# and the loop device is left holding this image for the rest of the session.
+drop_automounts
+losetup -d "$LOOP" || die "could not release the loop device $LOOP: something still
+holds one of its partitions"
 LOOP=""
 
 # --- output -----------------------------------------------------------------------------------
