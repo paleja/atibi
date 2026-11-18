@@ -1058,8 +1058,10 @@ baked=$(debugfs -R 'ls -l /var/lib' "${LOOP}p2" 2>/dev/null | awk '{ print $NF }
     grep -cxE 'dbus|udisks2|NetworkManager' || true)
 [ "${baked:-0}" -eq 3 ] ||
     die "the root filesystem is missing baked-in /var/lib state (found $baked of 3: dbus, udisks2, NetworkManager)"
-dbus_link=$(debugfs -R 'ls -l /var/lib/dbus' "${LOOP}p2" 2>/dev/null |
-    grep -c 'machine-id -> /etc/machine-id' || true)
+# debugfs ls -l never shows a symlink's target, but stat prints it for a fast
+# link (target stored in the inode, which /etc/machine-id at 15 characters is).
+dbus_link=$(debugfs -R 'stat /var/lib/dbus/machine-id' "${LOOP}p2" 2>/dev/null |
+    grep -c 'Fast link dest: "/etc/machine-id"' || true)
 [ "${dbus_link:-0}" -eq 1 ] ||
     die "the root filesystem does not hold the /var/lib/dbus/machine-id -> /etc/machine-id symlink"
 nm_key=$(debugfs -R 'ls -l /var/lib/NetworkManager' "${LOOP}p2" 2>/dev/null |
