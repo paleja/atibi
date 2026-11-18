@@ -1153,6 +1153,16 @@ run() { # run <scenario number>
             "$(http GET '/api/playlists?provider=tidal')" '"name":"Toni"'
         ck_has "Tidal search over the API" \
             "$(http GET '/api/search?provider=tidal&q=jamiroquai')" '"artist":"Jamiroquai"'
+        # The fake, like the real daemon, keeps a provider job queued for a
+        # couple of polls. A poller that spins without waiting or times out
+        # in milliseconds passes every content check here and only fails on
+        # the card, where a 50-track Tidal load takes tens of seconds. So
+        # two queued answers must cost the caller at least a second.
+        t0=$(date +%s%N)
+        http GET '/api/search?provider=tidal&q=sting' >/dev/null
+        t1=$(date +%s%N)
+        ck "the job poller waits between checks instead of giving up at once" \
+            "[ $(( (t1 - t0) / 1000000 )) -ge 900 ]"
         ck_has "a searched row plays through the player's own track.play" \
             "$(http POST /api/play '{"track":{"title":"x","path":"tidal://album/1"}}')" '"ok":true'
         ck_eq "the player was asked for that exact row, once" \

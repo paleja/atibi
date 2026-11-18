@@ -50,6 +50,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 
 CONF_PATH_DEFAULT = "/etc/streamer.conf"
@@ -136,10 +137,16 @@ def _recv_line(sock_file):
     return line
 
 
-def ipc(method, params=None, id_hint="h"):
-    """One V2 request/reply, no job waiting: for the reads (state.get,
-    provider.*) whose replies carry the whole answer inline."""
+def ipc(method, params=None, id_hint="h", envelope=None):
+    """One V2 request/reply. Envelope fields are not a style choice: the real
+    daemon answers invalid_request unless operation.submit carries its
+    operation name on the envelope, beside method rather than inside params,
+    and invalid_params unless job.get carries job_id the same way. Only
+    operation.submit has a params object at all. Verified against cliamp
+    2.4.1 on the card."""
     req = {"version": 2, "id": id_hint, "method": method}
+    if envelope:
+        req.update(envelope)
     if params is not None:
         req["params"] = params
     with IPC_LOCK:
@@ -174,20 +181,28 @@ def _job_wait(job, hint_base):
     tries = 0
     while job.get("state") not in final:
         tries += 1
-        if tries > 40:  # 40 * 0.5 s = 20 s, then the caller gets an error
+        if tries > 240:  # 240 * 0.5 s = 120 s. A 50-track Tidal playlist load
+                         # resolves every URL, and the docs say slow work
+                         # stays async; a load that gives up early would stop
+                         # being waitable at all, so patience is the rule.
             raise IpcError("job %s did not finish in time" % job.get("id"))
-        reply = ipc("job.get", {"job_id": job["id"]}, id_hint=hint_base + ".j%d" % tries)
+        if not job.get("id"):
+            raise IpcError("the player submitted no job")
+        reply = ipc("job.get", id_hint=hint_base + ".j%d" % tries,
+                    envelope={"job_id": job["id"]})
         if not reply.get("ok"):
             raise IpcError(reply.get("error", "job vanished"))
         job = reply.get("job", job)
+        if job.get("state") not in final:
+            time.sleep(0.5)  # the comment about 0.5 s per try only means
+                             # something if the loop actually waits
     return job
 
 
 def ipc_op(operation, params=None):
     """One V2 operation, waited. Returns the job's result, or raises."""
-    req_params = params if params is not None else {}
-    reply = ipc("operation.submit",
-                {"operation": operation, "params": req_params}, id_hint="h")
+    reply = ipc("operation.submit", params, id_hint="h",
+                envelope={"operation": operation})
     if not reply.get("ok"):
         raise IpcError(reply.get("error", "operation refused"))
     job = _job_wait(reply.get("job", {}), "h")
@@ -335,13 +350,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not provider:
                 self._json_out({"ok": False, "error": "provider= required"}, 400)
                 return
-            res = ipc("operation.submit",
-                      {"operation": "provider.playlists",
-                       "params": {"provider": provider, "limit": 100}},
-                      id_hint="h")
-            job = _job_wait(res.get("job", {}), "h")
-            items = job.get("result", {}).get("playlists", [])
-            self._json_out({"ok": True, "playlists": items})
+            res = ipc_op("provider.playlists",
+                         {"provider": provider, "limit": 100})
+            self._json_out({"ok": True, "playlists": res.get("playlists", [])})
             return
         if path == "/api/search":
             provider = query.get("provider", [""])[0]
@@ -349,22 +360,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not provider or not q:
                 self._json_out({"ok": False, "error": "provider= and q= required"}, 400)
                 return
-            res = ipc("operation.submit",
-                      {"operation": "provider.search",
-                       "params": {"provider": provider, "query": q,
-                                  "limit": 30}},
-                      id_hint="h")
-            job = _job_wait(res.get("job", {}), "h")
-            tracks = job.get("result", {}).get("tracks", [])
-            self._json_out({"ok": True, "tracks": tracks})
+            res = ipc_op("provider.search",
+                         {"provider": provider, "query": q, "limit": 30})
+            self._json_out({"ok": True, "tracks": res.get("tracks", [])})
             return
         if path == "/api/queue":
-            res = ipc("operation.submit",
-                      {"operation": "queue.list", "params": {"limit": 200}},
-                      id_hint="h")
-            job = _job_wait(res.get("job", {}), "h")
-            self._json_out({"ok": True,
-                            "tracks": job.get("result", {}).get("tracks", [])})
+            res = ipc_op("queue.list", {"limit": 200})
+            self._json_out({"ok": True, "tracks": res.get("tracks", [])})
             return
         self._json_out({"ok": False, "error": "not found"}, 404)
 
@@ -460,11 +462,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         import time
         now = time.monotonic()
         if now - PROVIDERS_CACHE["at"] < 15 or not PROVIDERS_CACHE["data"]:
-            res = ipc("operation.submit",
-                      {"operation": "provider.list", "params": {}}, id_hint="h")
-            job = _job_wait(res.get("job", {}), "h")
+            res = ipc_op("provider.list", {})
             PROVIDERS_CACHE["at"] = now
-            PROVIDERS_CACHE["data"] = job.get("result", {}).get("providers", [])
+            PROVIDERS_CACHE["data"] = res.get("providers", [])
         return PROVIDERS_CACHE["data"]
 
 

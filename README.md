@@ -87,7 +87,7 @@ boot.
   exit status; `bash tests/appliance-scripts.sh` runs all of them, or pass
   scenario numbers to run a few.
 - `tests/mutation-check.py` — the test of the tests. It deliberately breaks one
-  shipped behaviour at a time (twenty-nine of them) and requires the suite to go
+  shipped behaviour at a time (thirty of them) and requires the suite to go
   red on the check that cares about that behaviour; anything it misses is a check
   that looks meaningful and is not. `python3 tests/mutation-check.py`, a few
   minutes, and it restores every file it touched even if a scenario hangs.

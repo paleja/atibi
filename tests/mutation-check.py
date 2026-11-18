@@ -171,6 +171,26 @@ MUTATIONS = [
      'out = run_streamer("station", target)',
      'out = ""',
      "the intent file says the new station plays next boot"),
+    ("the submit envelope nests its operation inside params, as the fixture "
+     "used to allow and the real player never did", HTTP,
+     'reply = ipc("operation.submit", params, id_hint="h",\n'
+     '                envelope={"operation": operation})',
+     'reply = ipc("operation.submit",\n'
+     '                {"operation": operation, "params": params or {}}, id_hint="h")',
+     "the provider list names Tidal"),
+    ("job.get looks for its id inside params, where the real player says it "
+     "is not", HTTP,
+     'reply = ipc("job.get", id_hint=hint_base + ".j%d" % tries,\n'
+     '                    envelope={"job_id": job["id"]})',
+     'reply = ipc("job.get", {"job_id": job["id"]},\n'
+     '                    id_hint=hint_base + ".j%d" % tries)',
+     "Tidal's playlists list over the API"),
+    ("the job poller stops waiting between checks, as it did when the 0.5 s "
+     "budget was only a comment", HTTP,
+     'time.sleep(0.5)  # the comment about 0.5 s per try only means\n'
+     '                             # something if the loop actually waits',
+     "pass",
+     "the job poller waits between checks instead of giving up at once"),
     ("the build stops checking payload interpreters against the base image", BUILD,
      'die "$(basename "$script") runs python3, which this base image does not ship: "',
      'log "$(basename "$script") is probably fine"',

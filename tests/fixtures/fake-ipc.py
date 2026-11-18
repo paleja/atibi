@@ -5,10 +5,19 @@ Models what the real daemon actually does, verified against cliamp 2.4.1 on
 the card, because the shape of the replies is exactly the kind of thing an
 HTTP layer gets wrong:
 
-  * method calls (state.get) answer inline, with a "snapshot" object;
-  * operation.submit answers with a "job" object that is already "succeeded"
-    for everything cheap, carrying its own "result";
-  * provider.search/playlists results only ever arrive inside a job.
+  * method calls (state.get, job.get) answer inline, with a "snapshot" or a
+    "job" object;
+  * operation.submit carries its operation name on the envelope itself,
+    beside method, never inside params. A nested request is answered with
+    invalid_request, the exact reply the real 2.4.1 daemon gives: this is
+    the fixture's most important behaviour, because a fake that accepts the
+    wrong shape ships a server that no player will answer;
+  * cheap operations answer with a job that is already "succeeded", carrying
+    its own "result"; provider.* work is slow in the real daemon, so the
+    fake hands back a "queued" job and the result only arrives through
+    job.get, which is exactly the path _job_wait has to survive;
+  * every frame is answered on the same connection and carries back the
+    request's id.
 
 State (play/pause/volume/playlist) persists across requests, so the harness
 can read back what the server under test really asked the player to do.
@@ -124,23 +133,66 @@ def handle(conn):
             reply = {"version": 2, "id": id_hint, "ok": True,
                      "snapshot": snapshot(d)}
         elif method == "operation.submit":
-            params = req.get("params", {}) or {}
-            op = params.get("operation", "")
-            with open(LOG, "a", encoding="utf-8") as lg:
-                lg.write("%s %s\n" % (op, json.dumps(params.get("params", {}),
-                                                     separators=(",", ":"))))
-            result = apply_op(op, params.get("params", {}) or {}, d)
-            save(d)
-            if op == "provider.list":
-                result = providers()
-            elif op == "provider.playlists":
-                result = playlists()
-            elif op == "provider.search":
-                result = search()
-            job = {"id": "job1", "operation": op, "state": "succeeded",
-                   "result": result}
-            reply = {"version": 2, "id": id_hint, "ok": True, "job": job,
-                     "snapshot": snapshot(d)}
+            # The envelope, not the params, carries the operation name: the
+            # real daemon's one honest opinion about client framing, kept here
+            # so a server that frames it wrong fails the suite instead of
+            # only the card.
+            op = req.get("operation", "")
+            if not op:
+                reply = {"version": 2, "id": id_hint, "ok": False,
+                         "error": {"code": "invalid_request",
+                                   "message": "invalid request"}}
+            else:
+                params = req.get("params", {}) or {}
+                with open(LOG, "a", encoding="utf-8") as lg:
+                    lg.write("%s %s\n" % (op, json.dumps(params,
+                                                         separators=(",", ":"))))
+                result = apply_op(op, params, d)
+                if op == "provider.list":
+                    result = providers()
+                elif op == "provider.playlists":
+                    result = playlists()
+                elif op == "provider.search":
+                    result = search()
+                if op.startswith("provider."):
+                    # Provider work is slow in the real daemon: submit hands
+                    # back a queued job, and even the read of a finished job
+                    # can answer queued a couple of times before it succeeds.
+                    # A client that polls without pausing, or that gives up
+                    # on the first queued answer, only fails on the card
+                    # unless the fake makes people wait too.
+                    d["job_seq"] = d.get("job_seq", 0) + 1
+                    job_id = "job%d" % d["job_seq"]
+                    d.setdefault("jobs", {})[job_id] = {
+                        "id": job_id, "operation": op, "state": "succeeded",
+                        "result": result, "polls_left": 2}
+                    save(d)
+                    job = {"id": job_id, "operation": op, "state": "queued"}
+                else:
+                    save(d)
+                    job = {"id": "fast", "operation": op,
+                           "state": "succeeded", "result": result}
+                reply = {"version": 2, "id": id_hint, "ok": True, "job": job,
+                         "snapshot": snapshot(d)}
+        elif method == "job.get":
+            # job_id lives on the envelope, not in params: the only method
+            # with a params object is operation.submit, and the real daemon
+            # says invalid_params when a client forgets.
+            jid = req.get("job_id", "")
+            job = d.get("jobs", {}).get(jid) if jid else None
+            if job is None:
+                reply = {"version": 2, "id": id_hint, "ok": False,
+                         "error": {"code": "not_found",
+                                   "message": "no such job"}}
+            elif job.get("polls_left", 0) > 0:
+                job["polls_left"] -= 1
+                save(d)
+                reply = {"version": 2, "id": id_hint, "ok": True,
+                         "job": {"id": job["id"],
+                                 "operation": job["operation"],
+                                 "state": "queued"}}
+            else:
+                reply = {"version": 2, "id": id_hint, "ok": True, "job": job}
         else:
             reply = {"version": 2, "id": id_hint, "ok": False,
                      "error": "fake: no such method %r" % method}
