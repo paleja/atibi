@@ -3,7 +3,6 @@ Description=cliamp headless player daemon
 Documentation=file:/data/cliamp/cliamp.log
 After=network.target
 RequiresMountsFor=/data
-ConditionPathExists=/data/.ready
 
 [Service]
 Type=simple

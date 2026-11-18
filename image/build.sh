@@ -1,31 +1,33 @@
 #!/usr/bin/env bash
-# Build the streamer appliance card image.
+# build.sh - make the card image this appliance boots from.
 #
-#   image/build.sh [--audio jack|dac] [--output DIR]
-#                  [--ssh-key PATH | --new-key] [--hostname NAME] [--tz ZONE]
-#                  [--keep-raw] [--no-compress]
+#   ./image/build.sh [--audio jack|dac] [--ssh-key PATH | --new-key]
+#                    [--hostname streamer] [--tz Europe/Bratislava]
+#                    [--data-size 1024] [--output DIR] [--keep-raw] [--no-compress]
 #
-# The partition work needs root, because it mounts filesystems. The script
-# therefore does the fetching and the key handling as the invoking user and
-# then re-runs itself under sudo. Run it from a terminal, where sudo can ask
-# for a password.
+# It needs root, because it mounts filesystems. Run it from a terminal and it
+# will ask for your password once, at the point where that is needed.
 #
 # What it does, in order:
-#   1. Fetch and verify the pinned base image, cliamp release and ffmpeg
-#      build. A SHA256 mismatch stops the build; nothing comes from a floating
+#   1. fetch and verify the pinned base image, cliamp release and ffmpeg build.
+#      A SHA256 mismatch stops the build; nothing here comes from a floating
 #      "latest" tag.
-#   2. Set up SSH access: an existing public key, or a freshly generated
+#   2. settle SSH access: an existing public key, or a freshly generated
 #      keypair whose private half stays on this machine.
-#   3. Copy the base image, add the /data partition entry without a filesystem
-#      (its real size is only known once the card it lands on is known), and
-#      read back the PARTUUID the fstab entry will use.
-#   4. Mount both populated partitions and install the appliance payload:
-#      units, scripts, binaries, ssh authorisation, the /data fstab line.
-#   5. Patch the firmware partition: audio setup, boot options.
-#   6. Check both filesystems, read the patched firmware files back, compress.
+#   3. make the tree /data starts with, as one directory, once.
+#   4. copy the base image, add a third partition entry, and put a finished,
+#      seeded, checked ext4 filesystem in it. The size is decided here, at
+#      build time, and the card never changes it.
+#   5. mount the two stock partitions and install the appliance: units, scripts,
+#      the player binaries, the SSH key, the sudoers rule, /etc/fstab, hostname
+#      and timezone, and the few things a read-only root cannot make later.
+#   6. patch the firmware partition: the audio setup and the boot options.
+#   7. check both filesystems, read the patched boot files back, compress.
 #
-# Everything that depends on the real card size happens on the first boot, in
-# /usr/local/bin/streamer-firstboot.
+# Everything that has to be true when the card boots is written here, into the
+# image. There is no first-boot setup script, no resizing at boot, and nothing
+# that has to go right on the card before the first note is audible: the card
+# plays the first time it is powered on.
 
 set -euo pipefail
 
@@ -43,20 +45,13 @@ CLIAMP_TAG=v2.4.1
 CLIAMP_URL=https://github.com/bjarneo/cliamp/releases/download/$CLIAMP_TAG/cliamp-linux-arm64
 CLIAMP_SHA=f4e591542bb834fdff2ca21a85101e9b41a1dd35e28756eccfa1a42c265babb3
 
-# BtbN autobuild, pinned to a named release rather than latest. The binary
-# needs only libraries the base image already ships.
+# BtbN autobuild, pinned to a named release rather than latest. The binary needs
+# only libraries the base image already ships. Never johnvansickle.com: it
+# returns 403 to curl and has no named releases to pin.
 FFMPEG_TAG=autobuild-2026-11-17-12-40
 FFMPEG_ASSET=ffmpeg-N-129000-g64f6bcffaf-linuxarm64-gpl.tar.xz
 FFMPEG_URL=https://github.com/BtbN/FFmpeg-Builds/releases/download/$FFMPEG_TAG/$FFMPEG_ASSET
 FFMPEG_SHA=6cdd6eae6bdb4ce8be9a751d17209cd1a0f237bc8fcc866ddbc92a501df0e8e0
-
-# The /data partition entry written into the image, with a real ext4 in it.
-# It is deliberately small: streamer-firstboot grows the partition to the end
-# of the card and then runs resize2fs, so this only has to be big enough to
-# hold cliamp's state on a card whose size the build cannot know. 256 MiB
-# costs a few hundred KB in the xz and keeps /data mountable even if the grow
-# goes wrong, which is the whole point (see streamer-firstboot).
-DATA_SECTORS=524288
 
 # --- paths and defaults -----------------------------------------------------------------------
 
@@ -66,6 +61,27 @@ CONFIG=$REPO/config
 CACHE=$REPO/.cache
 OUT_DIR=$REPO/output
 STAGE=$CACHE/stage
+
+# The starting tree on the writable partition, and the same tree on the read-only
+# root as a template for a factory reset (see `streamer reset`). Everything
+# belongs to the appliance user, and everything sits at the top of /data, so a
+# single `rm -rf /data/*` is a clean slate: nested directories invite
+# half-cleaned state.
+#   cliamp   the player's configuration, its Tidal credentials, its socket, its
+#            log, and where it had got to in a local playlist
+#   state    what to play next boot: one small file
+#   bin      your own scripts, on PATH ahead of /usr/local/bin
+#   music    local files, if you put any there
+#   streamer boot.log, the one record of a boot that outlives a power cut
+DATA_DIRS="cliamp state bin music streamer"
+
+# /data, in MiB. Fixed at build time, and never changed on the card: cliamp's
+# state is a few hundred kilobytes, so this is room for playlists and a small
+# local library, not for a music collection. A card is sold as 8 GB and holds
+# 7.4 GiB, so 1024 leaves room on anything you can buy. If you want more, pass
+# --data-size and use a bigger card; if you want to grow an existing card's
+# /data later, `growpart` and `resize2fs` do it from the shell.
+DATA_SIZE_MIB=1024
 
 AUDIO=jack
 SSH_KEY=""
@@ -81,16 +97,20 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat >&2 <<'EOF'
-usage: image/build.sh [options]
+usage: ./image/build.sh [options]
 
-  --audio jack|dac   which output is live on the first boot (default jack)
-  --output DIR       where the finished image goes (default output/)
-  --ssh-key PATH     public key to authorise for the appliance user
-  --new-key          generate a keypair instead, under <output>/keys/
-  --hostname NAME    appliance hostname, for ssh <name>.local (default streamer)
-  --tz ZONE          timezone, for example Europe/Bratislava
-  --keep-raw         keep the uncompressed .img next to the .xz
-  --no-compress      leave the image uncompressed
+  --audio jack|dac     which output is live on the first boot (default jack)
+  --ssh-key PATH       public key to authorise for the appliance user
+  --new-key            generate a keypair instead, under <output>/keys/
+  --hostname NAME      appliance hostname, for ssh <name>.local (default streamer)
+  --tz ZONE            timezone, for example Europe/Bratislava
+  --data-size MIB      size of the /data partition in MiB (default 1024)
+  --output DIR         where the finished image goes (default output/)
+  --keep-raw           keep the uncompressed .img next to the .xz
+  --no-compress        leave the image uncompressed
+
+The base image, cliamp and ffmpeg are downloaded once into .cache/ and checked
+against the hashes pinned at the top of this file.
 EOF
     exit 2
 }
@@ -99,18 +119,21 @@ EOF
 
 while [ $# -gt 0 ]; do
     case $1 in
-        --audio)       AUDIO=${2:?--audio needs jack or dac};        shift 2 ;;
-        --output)      OUT_DIR=$(realpath -m "${2:?--output needs a directory}"); shift 2 ;;
-        --ssh-key)     SSH_KEY=$(realpath -e "${2:?--ssh-key needs a file}");     shift 2 ;;
-        --new-key)     NEW_KEY=1;                                    shift ;;
-        --hostname)    NEW_HOSTNAME=${2:?--hostname needs a name};   shift 2 ;;
-        --tz)          TZONE=${2:?--tz needs a zone};                shift 2 ;;
-        --keep-raw)    KEEP_RAW=1;                                   shift ;;
-        --no-compress) COMPRESS=0;                                   shift ;;
-        -h|--help)     usage ;;
-        *)             die "unknown option: $1" ;;
+        --audio)      AUDIO=${2:?--audio needs jack or dac};                   shift 2 ;;
+        --ssh-key)    SSH_KEY=$(realpath -e "${2:?--ssh-key needs a file}");   shift 2 ;;
+        --new-key)    NEW_KEY=1;                                               shift ;;
+        --hostname)   NEW_HOSTNAME=${2:?--hostname needs a name};              shift 2 ;;
+        --tz)         TZONE=${2:?--tz needs a zone};                           shift 2 ;;
+        --data-size)  DATA_SIZE_MIB=${2:?--data-size needs a number of MiB};   shift 2 ;;
+        --output)     OUT_DIR=$(realpath -m "${2:?--output needs a directory}"); shift 2 ;;
+        --keep-raw)   KEEP_RAW=1;                                              shift ;;
+        --no-compress) COMPRESS=0;                                             shift ;;
+        -h|--help)    usage ;;
+        *)            die "unknown option: $1" ;;
     esac
 done
+
+# --- before anything is downloaded or written -------------------------------------------------
 
 case $AUDIO in
     jack|dac) ;;
@@ -120,84 +143,41 @@ esac
 case $NEW_HOSTNAME in
     *[!a-z0-9-]*|'') die "hostname has to be lower case letters, digits and dashes: $NEW_HOSTNAME" ;;
 esac
-for tool in curl sfdisk losetup blkid e2fsck tune2fs mkfs.ext4 dumpe2fs fsck.fat dd truncate mount umount bsdtar xz ssh-keygen; do
+case $DATA_SIZE_MIB in
+    ''|*[!0-9]*) die "--data-size is a number of MiB: $DATA_SIZE_MIB" ;;
+esac
+[ "$DATA_SIZE_MIB" -ge 64 ] || die "--data-size below 64 MiB leaves no room for lost+found and a fsck log"
+DATA_SECTORS=$((DATA_SIZE_MIB * 2048))
+
+for tool in curl sfdisk losetup blkid e2fsck tune2fs mkfs.ext4 dumpe2fs debugfs fsck.fat dd \
+            truncate mount umount bsdtar xz ssh-keygen sha256sum stat awk sed grep; do
     command -v "$tool" >/dev/null || die "$tool is missing"
 done
 
-# Arguments for the sudo pass, with whatever gets resolved here filled in, so
-# nothing is asked twice and nothing is downloaded twice.
-RUN_ARGS=(--audio "$AUDIO" --output "$OUT_DIR" --hostname "$NEW_HOSTNAME")
-[ -z "$TZONE" ]     || RUN_ARGS+=(--tz "$TZONE")
-[ "$KEEP_RAW" = 0 ] || RUN_ARGS+=(--keep-raw)
-[ "$COMPRESS" = 1 ] || RUN_ARGS+=(--no-compress)
+# Every script a systemd unit starts has to name its interpreter on the first
+# line. A file that is executable but has no #! line is handed to execve() and
+# dies with "Exec format error" (status 203), which on a headless box means a
+# silent speaker and one journal line nobody reads. This check has earned its
+# place: one such file, lost in a commit, cost a whole afternoon of chasing a
+# card that was otherwise built correctly.
+for script in "$CONFIG"/usr/local/bin/*; do
+    [ "$(head -c 2 "$script")" = "#!" ] ||
+        die "$(basename "$script") has no #! line: systemd cannot start it"
+done
 
-# --- fetch and verify -------------------------------------------------------------------------
-
-sha_check() { # sha_check <file> <expected>
-    have=$(sha256sum "$1" | cut -d' ' -f1)
-    [ "$have" = "$2" ] && return 0
-    die "SHA256 mismatch for $1
-  expected $2
-  found    $have
-If the download was truncated, delete the file from $CACHE and run again.
-If upstream really has changed, update the pin at the top of $SELF."
-}
-
-fetch() { # fetch <url> <target> <sha>
-    if [ -f "$2" ]; then
-        sha_check "$2" "$3"
-        log "  cached  $(basename "$2")"
-        return 0
-    fi
-    log "  getting $1"
-    curl -fL --retry 3 --retry-delay 2 -o "$2.part" "$1"
-    sha_check "$2.part" "$3"
-    mv -f "$2.part" "$2"
-}
-
-step "artefacts"
-mkdir -p "$CACHE" "$OUT_DIR"
-
-BASE_XZ=$CACHE/$BASE_NAME.img.xz
-RAW=$CACHE/raw.img
-CLIAMP=$CACHE/cliamp-$CLIAMP_TAG-arm64
-FFMPEG_TARBALL=$CACHE/$FFMPEG_ASSET
-FFMPEG=$CACHE/ffmpeg-$FFMPEG_TAG
-
-fetch "$BASE_URL" "$BASE_XZ" "$BASE_SHA"
-# The pin is the hash of the compressed download, which is what Raspberry Pi
-# publish. The uncompressed working copy underneath it is only trusted when it
-# was made by this script while that same pin was in force, which is what the
-# sidecar records: anything else gets uncompressed again from the verified .xz.
-RAW_SHA=$CACHE/raw.img.sha256
-if [ ! -f "$RAW" ] || ! cmp -s "$RAW_SHA" <(printf '%s  raw.img\n' "$BASE_SHA"); then
-    log "  uncompressing the base image"
-    xz -dc "$BASE_XZ" >"$RAW.part"
-    mv -f "$RAW.part" "$RAW"
-    printf '%s  raw.img\n' "$BASE_SHA" >"$RAW_SHA"
-else
-    log "  cached  $(basename "$RAW")"
-fi
-
-fetch "$CLIAMP_URL" "$CLIAMP" "$CLIAMP_SHA"
-fetch "$FFMPEG_URL" "$FFMPEG_TARBALL" "$FFMPEG_SHA"
-if [ ! -f "$FFMPEG" ]; then
-    # Only the decoder is wanted: ffprobe and ffplay are dead weight on a
-    # headless box.
-    log "  extracting bin/ffmpeg from the pinned autobuild"
-    tmp=$(mktemp -d "$CACHE/ff.XXXXXX")
-    bsdtar -xJf "$FFMPEG_TARBALL" -C "$tmp" "*/bin/ffmpeg"
-    found=$(find "$tmp" -type f -name ffmpeg | head -1)
-    [ -n "$found" ] || die "no bin/ffmpeg inside $FFMPEG_ASSET"
-    mv -f "$found" "$FFMPEG"
-    rm -rf "$tmp"
-fi
-chmod 755 "$CLIAMP" "$FFMPEG"
-log "  cliamp $(du -h "$CLIAMP" | cut -f1), ffmpeg $(du -h "$FFMPEG" | cut -f1)"
+# The build also edits a file on the card with a program of its own. Checking for
+# it here is dull, and much clearer than awk's error a hundred lines into a
+# session that has the card's partitions mounted.
+[ -f "$REPO/image/fstab-ro.awk" ] ||
+    die "image/fstab-ro.awk is missing: this script edits /etc/fstab with it"
 
 # --- ssh access -------------------------------------------------------------------------------
 
 step "ssh access"
+# No password is written into the image, in any form: the account password stays
+# locked and the only way in is the key chosen here. That is why this is a
+# question and not a default - an image with a password baked into it is an
+# image everybody can log into.
 KEYS=$OUT_DIR/keys
 KEY_PRIVATE=""
 
@@ -240,15 +220,133 @@ else
 Pass --ssh-key /path/to/id_ed25519.pub, or --new-key to make a keypair."
 fi
 log "  $(ssh-keygen -lf "$SSH_KEY")"
-RUN_ARGS+=(--ssh-key "$SSH_KEY")
 
-# --- from here on the script needs root --------------------------------------------------------
+# --- root ------------------------------------------------------------------------------------
 
+# Partition tables, loop devices and mounts: there is no way to do any of that
+# unprivileged, and a build that fails halfway because the password was never
+# asked for is worse than one that asks up front. Passing the arguments through
+# unchanged means nothing is resolved twice.
 if [ "$(id -u)" -ne 0 ]; then
     log ""
-    log "the rest of the build writes a partition table and mounts filesystems"
-    exec sudo -E "$SELF" "${RUN_ARGS[@]}"
+    log "the build writes a partition table and mounts filesystems: asking for sudo now"
+    exec sudo -E "$SELF" "$@"
 fi
+
+# --- fetch and verify -------------------------------------------------------------------------
+
+sha_check() { # sha_check <file> <expected>
+    have=$(sha256sum "$1" | cut -d' ' -f1)
+    [ "$have" = "$2" ] && return 0
+    die "SHA256 mismatch for $1
+  expected $2
+  found    $have
+If the download was truncated, delete the file from $CACHE and run again.
+If upstream really has changed, update the pin at the top of $SELF."
+}
+
+fetch() { # fetch <url> <target> <sha>
+    if [ -f "$2" ]; then
+        sha_check "$2" "$3"
+        log "  cached  $(basename "$2")"
+        return 0
+    fi
+    log "  getting $1"
+    curl -fL --retry 3 --retry-delay 2 -o "$2.part" "$1"
+    sha_check "$2.part" "$3"
+    mv -f "$2.part" "$2"
+}
+
+step "artefacts"
+mkdir -p "$CACHE" "$OUT_DIR"
+
+BASE_XZ=$CACHE/$BASE_NAME.img.xz
+RAW=$CACHE/raw.img
+CLIAMP=$CACHE/cliamp-$CLIAMP_TAG-arm64
+FFMPEG_TARBALL=$CACHE/$FFMPEG_ASSET
+FFMPEG=$CACHE/ffmpeg-$FFMPEG_TAG
+
+fetch "$BASE_URL" "$BASE_XZ" "$BASE_SHA"
+# The pin is the hash of the compressed download, which is what Raspberry Pi
+# publish. The uncompressed working copy underneath it is only trusted when it
+# was made by this script while that same pin was in force, which is what the
+# sidecar records: anything else is uncompressed again from the verified .xz.
+RAW_SHA=$CACHE/raw.img.sha256
+if [ ! -f "$RAW" ] || ! cmp -s "$RAW_SHA" <(printf '%s  raw.img\n' "$BASE_SHA"); then
+    log "  uncompressing the base image"
+    xz -dc "$BASE_XZ" >"$RAW.part"
+    mv -f "$RAW.part" "$RAW"
+    printf '%s  raw.img\n' "$BASE_SHA" >"$RAW_SHA"
+else
+    log "  cached  $(basename "$RAW")"
+fi
+
+fetch "$CLIAMP_URL" "$CLIAMP" "$CLIAMP_SHA"
+fetch "$FFMPEG_URL" "$FFMPEG_TARBALL" "$FFMPEG_SHA"
+if [ ! -f "$FFMPEG" ]; then
+    # Only the decoder is wanted: ffprobe and ffplay are dead weight on a
+    # headless box. bsdtar unpacks one member out of a 30 MB tarball.
+    log "  extracting bin/ffmpeg from the pinned autobuild"
+    tmp=$(mktemp -d "$CACHE/ff.XXXXXX")
+    bsdtar -xJf "$FFMPEG_TARBALL" -C "$tmp" "*/bin/ffmpeg"
+    found=$(find "$tmp" -type f -name ffmpeg | head -1)
+    [ -n "$found" ] || die "no bin/ffmpeg inside $FFMPEG_ASSET"
+    mv -f "$found" "$FFMPEG"
+    rm -rf "$tmp"
+fi
+chmod 755 "$CLIAMP" "$FFMPEG"
+# A friendly check on the two downloaded binaries: an x86 binary in
+# /usr/local/bin on a Pi fails with "Exec format error", which for the player
+# means a silent speaker. Only a warning, because this machine cannot run an
+# arm64 binary to prove it.
+if command -v file >/dev/null; then
+    for b in "$CLIAMP" "$FFMPEG"; do
+        file "$b" | grep -q 'ARM aarch64' ||
+            log "  warning: $(basename "$b") does not look like an arm64 binary"
+    done
+fi
+log "  cliamp $(du -h "$CLIAMP" | cut -f1), ffmpeg $(du -h "$FFMPEG" | cut -f1)"
+
+# --- the tree /data starts with ---------------------------------------------------------------
+
+step "the /data tree"
+# Made once, here, as a plain directory. Two things are built from it: the
+# filesystem that goes into the image, and the copy that stays on the read-only
+# root as the template for `streamer reset`. That is deliberate: a reset and a
+# fresh card end up with exactly the same starting tree, and there is one place
+# where that tree is defined.
+#
+# It belongs to uid/gid 1000, which is the appliance user on Raspberry Pi OS,
+# because mkfs.ext4 -d copies the ownership it sees, and so does cp -a on the
+# card later. A tree owned by whoever ran this script would leave the player
+# unable to write its own configuration directory.
+SEED=$STAGE/seed
+rm -rf "$SEED"
+install -d -m 755 -o 1000 -g 1000 "$SEED"
+for d in $DATA_DIRS; do
+    install -d -m 775 -o 1000 -g 1000 "$SEED/$d"
+done
+cat >"$SEED/README" <<EOF
+This is what the data partition held when the card was built, and the template a
+factory reset copies back over an emptied data partition:
+
+    streamer reset --yes
+
+Everything in it is lost by that command, including the Tidal sign-in. The
+template lives in the read-only part of the image, at /usr/share/streamer/seed.
+
+The directories at the top of the data partition:
+
+    cliamp   the player's configuration and its Tidal credentials, its socket,
+             its log, and where it had got to in a local playlist
+    state    what to play next boot: one small file
+    bin      your own scripts, on PATH ahead of /usr/local/bin
+    music    local files, if you put any there
+    streamer boot.log, the one record of a boot that outlives a power cut
+
+A card that has never been set up plays the station named in /etc/streamer.conf.
+EOF
+log "  $(find "$SEED" -mindepth 1 -maxdepth 1 -type d | wc -l) directories, owned by 1000:1000"
 
 # --- work image -------------------------------------------------------------------------------
 
@@ -258,10 +356,10 @@ IMG=$STAGE/card.img
 LOOP=""
 
 # Anything the desktop's volume manager has put on this loop device has to go
-# before the loop device can be released: udisks2 here mounts a new labelled
-# ext4 partition read-write under /run/media the moment its node appears, and a
-# busy loop device cannot be detached, which is how five 3.4 GB work images
-# ended up stranded on this machine.
+# before the loop device can be released: udisks2 on a desktop Linux mounts a
+# new labelled ext4 partition read-write under /run/media the moment its node
+# appears, and a busy loop device cannot be detached, which is how several work
+# images once ended up stranded on the machine this was developed on.
 drop_automounts() {
     local m
     [ -n "$LOOP" ] || return 0
@@ -280,7 +378,6 @@ cleanup() {
     [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
     [ -n "$IMG" ] && rm -f "$IMG"
     rm -f "$STAGE/data-fs.img"
-    rmdir "$STAGE" 2>/dev/null
 }
 trap cleanup EXIT
 rm -f "$IMG"
@@ -290,7 +387,8 @@ rm -f "$IMG"
 cp --reflink=auto "$RAW" "$IMG"
 
 # The stock image leaves no free sectors after the root partition, so the image
-# file has to grow before a partition can be added to it.
+# file has to grow before a third partition can be added to it. This is the only
+# size the image ever is: nothing on the card resizes anything at boot.
 truncate -s +$((DATA_SECTORS * 512)) "$IMG"
 
 dump=$(sfdisk -d "$IMG")
@@ -310,23 +408,23 @@ p1_start=$(field "$first" start)
 p2_start=$(field "$last" start)
 p2_size=$(field "$last" size)
 p3_start=$((p2_start + p2_size))
+p3_end=$((p3_start + DATA_SECTORS))
 sectors=$(( $(stat -c%s "$IMG") / 512 ))
 [ -n "$p1_start" ] && [ -n "$p2_start" ] && [ -n "$p2_size" ] ||
     die "cannot read the partition table of the base image:
 $parts"
-[ "$sectors" -ge $((p3_start + DATA_SECTORS)) ] ||
+[ "$sectors" -ge "$p3_end" ] ||
     die "$sectors sectors is not enough room for /data at $p3_start"
 
 log "  firmware  start=$p1_start size=$(field "$first" size)"
 log "  root      start=$p2_start size=$p2_size"
-log "  data      start=$p3_start size=$DATA_SECTORS (ext4 is made a few lines later, after the loop device exists)"
+log "  data      start=$p3_start size=$DATA_SECTORS"
 
-# Rewriting the whole table from the dump is what keeps the disk identifier,
-# the partition types and the boot flag of the firmware partition exactly as
-# the vendor left them. The device: line in the dump names the file the dump
-# came from, so it goes: sfdisk gets the target on its command line. The new
-# entry is named the way the existing ones are, so its partition number is
-# unambiguous.
+# Rewriting the whole table from the dump is what keeps the disk identifier, the
+# partition types and the boot flag of the firmware partition exactly as the
+# vendor left them. The device: line in the dump names the file the dump came
+# from, so it goes: sfdisk gets the target on its command line. The new entry is
+# named the way the existing ones are, so its partition number is unambiguous.
 last_name=${last%% *}
 new_name="${last_name%2}3"
 {
@@ -334,55 +432,59 @@ new_name="${last_name%2}3"
     printf '%s : start=%s, size=%s, type=83\n' "$new_name" "$p3_start" "$DATA_SECTORS"
 } | sfdisk -q "$IMG"
 
+# Read the table back, and stop if it is not the table that was asked for. This
+# is the one place where a silent no-op would be unrecoverable later on the
+# card, and sfdisk has versions that answer a partial request by changing
+# nothing and exiting 0.
+back=$(sfdisk -d "$IMG" | grep ' : start=')
+[ "$(printf '%s\n' "$back" | grep -c 'start=')" -eq 3 ] ||
+    die "the partition table did not gain a third entry:
+$back"
+[ "$(printf '%s\n' "$back" | tail -1 | grep -o "start=$p3_start")" = "start=$p3_start" ] ||
+    die "the third partition is not where it was asked for:
+$back"
 log "the new partition table:"
-sfdisk -d "$IMG" | grep ' : start=' |
-    awk -F' : ' '{split($1, a, "/"); printf "  %-12s %s\n", a[length(a)], $2}' >&2
+printf '%s\n' "$back" | awk -F' : ' '{split($1, a, "/"); printf "  %-12s %s\n", a[length(a)], $2}' >&2
 
 # --- the /data filesystem ---------------------------------------------------------------------
 
-# p3's filesystem is made in a plain file and spliced into the image at the
-# partition's offset, rather than written through ${LOOP}p3. Identical bytes,
-# and they are the bytes the card will hold. The reason for doing it the
-# roundabout way is that this filesystem has to be checked with e2fsck, and on
-# a machine with a volume manager that is only possible while nothing holds the
-# filesystem: udisks2 here mounts a new labelled ext4 partition read-write
-# under /run/media the moment the partition node appears, and e2fsck then
-# refuses to run at all. A file cannot be automounted.
-#
-# That p3 ships mounted-ready is a design decision, and the first card paid for
-# it: a partition entry with no filesystem means data.mount fails, every unit
-# that says Requires=data.mount fails with it, and the one script that could
-# undo the damage is the one that cannot run, because the password-free sudo
-# rule it writes lives on the far side of that same failure. A card that ships
-# with a mountable /data can only ever be left with a small /data, never an
-# unbootable one.
 step "the /data filesystem"
+# Built in a plain file, and spliced into the image at the partition's offset:
+# identical bytes to the ones the card will hold, and a file cannot be
+# automounted by a volume manager, which is what makes it possible to run
+# e2fsck on it here.
+#
+# That p3 ships as a finished, mountable filesystem is a decision, and the first
+# card paid for the opposite: a partition entry with nothing in it means
+# data.mount fails, every unit that asks for data.mount fails with it, and the
+# one script that could undo the damage cannot run, because the password-free
+# sudo rule it writes lives on the far side of that same failure. A card that
+# ships with a working /data can only ever be left with a small /data, never an
+# unbootable one.
 fsimg=$STAGE/data-fs.img
 rm -f "$fsimg"
 truncate -s $((DATA_SECTORS * 512)) "$fsimg"
 # -b 4096 is not decoration: mkfs.ext4 sizes its block size from what it is
-# handed, and on a plain file it chose 1 KiB blocks for a 256 MiB filesystem.
-mkfs.ext4 -q -F -b 4096 -L streamer-data -m 0 "$fsimg" >"$STAGE/data-mkfs.log" 2>&1 ||
-    die "making the $((DATA_SECTORS / 2048)) MiB /data filesystem failed:
+# handed, and on a plain file it picked 1 KiB blocks for a small filesystem.
+# -d seeds the tree without mounting or copying anything: the directories are
+# written straight into the fresh filesystem with the ownership they have.
+# -m 0 skips the 5% root reserve, which on a data volume of this size is simply
+# space the player is not allowed to use.
+mkfs.ext4 -q -F -b 4096 -L streamer-data -m 0 -d "$SEED" "$fsimg" >"$STAGE/data-mkfs.log" 2>&1 ||
+    die "making the ${DATA_SIZE_MIB} MiB /data filesystem failed:
 $(cat "$STAGE/data-mkfs.log")"
 # e2fsck exits 0 for clean and 1 for "errors corrected"; 1 is a pass here, and
-# 2 and above means the filesystem this card would boot with is not sound.
+# anything above means the filesystem this card boots with is not sound.
 ec=0
 e2fsck -fy "$fsimg" >"$STAGE/data-fsck.log" 2>&1 || ec=$?
 [ "$ec" -le 1 ] || die "the fresh /data filesystem fails e2fsck (status $ec):
 $(cat "$STAGE/data-fsck.log")"
+# Stamp it as just checked, with the counters cleared, so the fsck the stock
+# fstab pass asks for stays asleep until something actually leaves the volume
+# dirty. (`-T never` is not a thing: `never` is only a keyword for -c/-i.)
 tune2fs -C 0 -i 0 -T now "$fsimg" >"$STAGE/data-tune.log" 2>&1 ||
     die "tune2fs could not reset the /data filesystem's check counters:
 $(cat "$STAGE/data-tune.log")"
-# The filesystem has to fill the partition exactly: too small and the first
-# resize2fs on the card has more work than the geometry allows, too large and
-# the superblock is written past the end of the partition.
-super=$(dumpe2fs -h "$fsimg" 2>&1) || die "the /data filesystem has no readable superblock:
-$super"
-blocks=$(printf '%s\n' "$super" | sed -n 's/^Block count:[[:space:]]*\([0-9]*\)$/\1/p')
-block_size=$(printf '%s\n' "$super" | sed -n 's/^Block size:[[:space:]]*\([0-9]*\)$/\1/p')
-[ "$((blocks * block_size))" -eq "$((DATA_SECTORS * 512))" ] ||
-    die "the /data filesystem is $blocks x $block_size bytes, not the partition's $((DATA_SECTORS / 2048)) MiB"
 if [ $((p3_start % 2048)) -eq 0 ]; then
     dd if="$fsimg" of="$IMG" bs=1M seek=$((p3_start / 2048)) conv=notrunc status=none ||
         die "could not splice the /data filesystem into the image at sector $p3_start"
@@ -391,7 +493,7 @@ else
         die "could not splice the /data filesystem into the image at sector $p3_start"
 fi
 rm -f "$fsimg"
-log "  data      ext4, $((DATA_SECTORS / 2048)) MiB ($blocks x $block_size), spliced in at sector $p3_start: e2fsck clean, resize2fs grows it on the card"
+log "  ext4, ${DATA_SIZE_MIB} MiB, seeded from $SEED, e2fsck clean, spliced in at sector $p3_start"
 
 # --- mount ------------------------------------------------------------------------------------
 
@@ -411,21 +513,10 @@ mount -o noatime "${LOOP}p2" "$R"
 mount -o noatime "${LOOP}p1" "$FW"
 log "$LOOP: p2 -> $R, p1 -> $FW"
 
-DISK_ID=$(printf '%s\n' "$dump" | sed -n 's/^label-id:[[:space:]]*0x\([0-9a-fA-F]*\)$/\1/p' | tr 'A-F' 'a-f')
-[ -n "$DISK_ID" ] || die "the base image has no DOS disk identifier in its partition table"
-# A DOS table spells a partition's PARTUUID as the disk identifier plus the
-# partition number, which is exactly what udev puts in /dev/disk/by-partuuid on
-# the card. Deriving it here means the fstab entry cannot point at some other
-# card, and it does not depend on what blkid chooses to report for a partition
-# that has no filesystem yet.
-DATA_UUID="$DISK_ID-03"
-log "/data PARTUUID $DATA_UUID"
+# --- the appliance ----------------------------------------------------------------------------
 
-# --- root filesystem payload ------------------------------------------------------------------
-
-step "appliance payload"
-
-install -d "$R/etc/streamer" "$R/usr/local/bin"
+step "files"
+install -d "$R/etc/streamer" "$R/usr/local/bin" "$R/data"
 cp -a "$CONFIG/etc/systemd/system/." "$R/etc/systemd/system/"
 cp -a "$CONFIG/etc/streamer/." "$R/etc/streamer/"
 install -m 644 "$CONFIG/etc/streamer.conf" "$R/etc/streamer.conf"
@@ -434,101 +525,158 @@ for script in "$CONFIG"/usr/local/bin/*; do
 done
 install -m 755 "$CLIAMP" "$R/usr/local/bin/cliamp"
 install -m 755 "$FFMPEG" "$R/usr/local/bin/ffmpeg"
-log "cliamp and ffmpeg in /usr/local/bin, plus $(ls "$CONFIG"/usr/local/bin | wc -l) scripts"
+# The factory-reset template, the same directories the filesystem above was
+# made from. It sits on the read-only root, owned by the appliance user, so that
+# `cp -a` of it onto /data lands with the ownership the player needs. The path
+# is the one `streamer reset` and /data/README name.
+rm -rf "$R/usr/share/streamer"
+install -d -m 755 "$R/usr/share/streamer/seed"
+cp -a "$SEED/." "$R/usr/share/streamer/seed/"
+log "  $(ls "$CONFIG"/usr/local/bin | wc -l) scripts, cliamp and ffmpeg in /usr/local/bin"
+log "  reset template in /usr/share/streamer"
 
-# Enabling the units: these are the symlinks systemctl enable would create.
-# Creating them here keeps the build independent of this host's systemd, and
-# the [Install] sections in the unit files say the same thing.
+step "units"
+# Enabling the units: these are the symlinks `systemctl enable` would create.
+# Creating them here keeps the build independent of this host's systemd, and the
+# [Install] sections in the unit files say the same thing.
 enable() { # enable <unit> <target>
     install -d "$R/etc/systemd/system/$2.wants"
     ln -sfn "/etc/systemd/system/$1" "$R/etc/systemd/system/$2.wants/$1"
     log "  $1 -> $2"
 }
-enable streamer.target            multi-user.target
-enable streamer-cliamp.service    streamer.target
-enable streamer-play.service      streamer.target
-enable streamer-firstboot.service sysinit.target
-enable streamer-bootcount.service basic.target
-enable streamer-booted.service    multi-user.target
-enable streamer-save.timer        timers.target
+enable streamer.target         multi-user.target
+enable streamer-cliamp.service streamer.target
+enable streamer-play.service   streamer.target
+enable streamer-save.timer     timers.target
+
 # Stock Raspberry Pi OS leaves ssh switched off unless a /boot/firmware/ssh
 # marker happens to exist at boot. There is no screen or keyboard on this box,
 # so ssh comes up on its own from the first boot.
-install -d "$R/etc/systemd/system/multi-user.target.wants"
 ln -sfn /usr/lib/systemd/system/ssh.service "$R/etc/systemd/system/multi-user.target.wants/ssh.service"
 log "  ssh.service -> multi-user.target"
 
-# And one stock unit switched off. userconfig.service is the first-boot dialog
-# that asks on /dev/tty8 for a password and a user name: on a box with no
-# screen it can only be a stall, and it is free to rename the uid 1000 account
-# the units assume. Access here is the SSH key installed below, so the dialog
-# has nothing to do. The unit file stays where it is: removing the symlink is
-# exactly what systemctl enable would undo.
-rm -f "$R/etc/systemd/system/multi-user.target.wants/userconfig.service"
-log "  userconfig.service -> not started"
+# And stock units switched off, because on a read-only root they are writers
+# with nothing useful to write:
+#   userconfig.service  the first-boot dialog that asks on /dev/tty8 for a
+#     password and a user name. On a box with no screen it can only stall, and
+#     it is free to rename the uid 1000 account the units assume. Access here is
+#     the SSH key installed below, so it has nothing to do.
+#   apt-daily timers    fetch indexes and upgrade packages, which means a
+#     background writer that can turn a read-only root into a half-written one
+#     at a moment nobody chose. Updating this box is `streamer rw` and apt, by
+#     hand.
+#   e2scrub_all.timer   checks LVM thin volumes; this box has no LVM.
+# The unit files stay where the packages put them: removing the symlinks is
+# exactly what `systemctl disable` does.
+for off in userconfig.service apt-daily.timer apt-daily-upgrade.timer e2scrub_all.timer; do
+    rm -f "$R/etc/systemd/system/"*".target.wants/$off"
+    log "  $off -> not started"
+done
 
-# The appliance user is whatever account Raspberry Pi OS made with uid 1000.
-# The stock image gives it /usr/sbin/nologin as its shell, which lets ssh
+step "the appliance user"
+# The appliance user is whatever account Raspberry Pi OS made with uid 1000. The
+# stock image gives it /usr/sbin/nologin as its shell, which lets ssh
 # authenticate and then hang up straight away: unusable.
+user_name=$(awk -F: '$3 == 1000 {print $1; exit}' "$R/etc/passwd")
 user_home=$(awk -F: '$3 == 1000 {print $6; exit}' "$R/etc/passwd")
 [ -n "$user_home" ] || die "the base image has no uid 1000 account"
 # The player units say User=pi and Environment=HOME=/home/pi, because that is
 # the account Raspberry Pi OS makes. If a future base image names it something
 # else, the units would fail to start with no obvious reason, so the build says
 # so here instead.
-user_name=$(awk -F: '$3 == 1000 {print $1; exit}' "$R/etc/passwd")
 [ "$user_name" = pi ] || die "the uid 1000 account is called $user_name, but the
    player units assume pi: update User=/Group=/HOME= in
    $CONFIG/etc/systemd/system/streamer-*.service"
 awk -F: -v OFS=: '$3 == 1000 { $7 = "/bin/bash" } 1' "$R/etc/passwd" >"$R/etc/passwd.new"
 install -m 644 "$R/etc/passwd.new" "$R/etc/passwd"
 rm -f "$R/etc/passwd.new"
-log "uid 1000 home $user_home, shell /bin/bash"
+log "  $user_name, home $user_home, shell /bin/bash"
 
-# Key-only login: no password of any kind is written into the image, and the
-# account password stays locked.
 install -d -m 700 -o 1000 -g 1000 "$R$user_home/.ssh"
 install -m 600 -o 1000 -g 1000 "$SSH_KEY" "$R$user_home/.ssh/authorized_keys"
-log "authorised the key in $user_home/.ssh/authorized_keys"
+log "  authorised $(ssh-keygen -lf "$SSH_KEY")"
 
-# cliamp keeps its configuration, and the Tidal credentials, on the writable
-# partition. Until first boot makes /data/cliamp this link dangles, which is
-# fine: nothing runs cliamp before /data is ready.
+# cliamp keeps its configuration, and the Tidal credentials with it, on the
+# writable partition, so that signing in to Tidal survives a reflash of the card
+# and nothing in the home directory ever needs a writable root.
 install -d -m 755 -o 1000 -g 1000 "$R$user_home/.config"
 ln -sfn /data/cliamp "$R$user_home/.config/cliamp"
 chown -h 1000:1000 "$R$user_home/.config/cliamp"
 
-# The /data fstab line is generated from the PARTUUID of this image. A copied
-# one would point at some other card, and the box would then be silent forever.
-# The stock root line says what this image's own disk identifier is, so use it
-# as a check on the derivation above: if the two ever disagree, the fstab the Pi
-# boots from is not the one the partition table belongs to.
-install -d -m 755 "$R/data"
-root_uuid=$(sed -n 's/^PARTUUID=\([0-9a-f]\{8\}\)-02[[:space:]]\+\/[[:space:]].*/\1/p' "$R/etc/fstab" | head -1)
-if [ -n "$root_uuid" ] && [ "$root_uuid" != "$DISK_ID" ]; then
-    die "the partition table says the disk identifier is $DISK_ID, but /etc/fstab mounts
-  / from PARTUUID=$root_uuid-02. The cached base image and the pins in $SELF
-  no longer describe the same file: re-check them."
+# Password-free sudo for the appliance user. The account has no password and the
+# only way in is an SSH key, so a password prompt here is not a security
+# boundary, it is an obstacle: `streamer audio dac` and `streamer rw` both
+# re-run themselves through sudo, and there is no screen to type a password
+# into. visudo is used when this machine has it, because a sudoers file with a
+# syntax error locks everybody out of a box that has no password.
+step "sudoers"
+tmp=$(mktemp)
+printf '%s\n' 'Defaults!streamer !requiretty' 'pi ALL=(ALL) NOPASSWD:ALL' >"$tmp"
+if command -v visudo >/dev/null; then
+    visudo -cf "$tmp" >/dev/null || die "the sudoers fragment this script writes is invalid"
+else
+    log "  no visudo on this machine, so the fragment goes in unchecked"
 fi
+install -d "$R/etc/sudoers.d"
+install -m 0440 "$tmp" "$R/etc/sudoers.d/streamer"
+rm -f "$tmp"
+log "  streamer commands need no password"
+
+step "fstab"
+# Two changes to the file the vendor shipped, and no new syntax.
+#
+# The root and the firmware partition go read-only. That is what makes pulling
+# the power out of this box safe: nothing is ever left mid-write on the card,
+# and the only partition that is ever written to is /data, which holds nothing
+# but small files the player can do without. It is written here because fstab is
+# what mounts them: a kernel command line that says ro is overridden by an
+# fstab line that says defaults, which is how the first card ended up running
+# with a writable root while every comment said otherwise.
+#
+# /data is mounted by its filesystem label, because the label is inside the
+# filesystem: it was set when the volume was made a few minutes ago, and it
+# stays true whatever the partition number or the disk identifier happens to be.
+#
+# nofail: a /data that cannot be mounted must not stop the boot. The player
+# units ask for data.mount and fail with it, and the box stays reachable over
+# ssh so somebody can fix it.
+#
+# The last field of the /data line is 2, so the stock fsck at boot looks at the
+# volume if something left it dirty. fsck.repair=yes is already on the kernel
+# command line, so it repairs without asking, and there is no keyboard on this
+# box to answer a prompt.
+#
+# Editing the text rather than rebuilding the lines from fields keeps the column
+# alignment that makes this file readable by eye over SSH.
+#
+# The program is a file, not a quote inside this script: the suite runs it
+# against the fstab a real card shipped (tests/fixtures/fstab.orig) and shows
+# what it does, instead of trusting a program buried in a build script that
+# nobody can run without a card and root.
+awk -f "$REPO/image/fstab-ro.awk" "$R/etc/fstab" >"$R/etc/fstab.new"
+for mp in / /boot/firmware; do
+    got=$(awk -v m="$mp" '$2 == m { print ($4 ~ /(^|,)ro(,|$)/) ? "ro" : "rw"; exit }' "$R/etc/fstab.new")
+    [ "$got" = ro ] || die "the $mp line of $R/etc/fstab did not gain ro (got: ${got:-nothing})"
+done
+install -m 644 "$R/etc/fstab.new" "$R/etc/fstab"
+rm -f "$R/etc/fstab.new"
+
 if ! grep -qsE '^[^#][^[:space:]]+[[:space:]]+/data[[:space:]]' "$R/etc/fstab"; then
     {
-        printf '\n# streamer data partition: cliamp state, playlists, downloads.\n'
-        printf '# The filesystem is made at build time and streamer-firstboot grows it\n'
-        printf '# into the rest of the card, so it is mountable from the very first boot.\n'
-        printf '# nofail is for the case where the partition entry itself is gone (a card\n'
-        printf '# written from an older image): a missing /data must not stop the boot.\n'
-        printf '# The last two fields are zero: the fsck pass is skipped at boot because\n'
-        printf '# streamer-firstboot runs e2fsck itself, before it resizes anything.\n'
-        printf 'PARTUUID=%s  /data  ext4  defaults,nofail,noatime  0  0\n' "$DATA_UUID"
+        printf '\n# streamer data partition: the player state, and nothing else.\n'
+        printf '# Made at build time, %s MiB, labelled streamer-data: the label lives\n' "$DATA_SIZE_MIB"
+        printf '# inside the filesystem, so this line is true whatever the card is.\n'
+        printf '# nofail: a /data that cannot be mounted must not stop the boot.\n'
+        printf '# fsck runs here only when the volume was left dirty by a power cut.\n'
+        printf 'LABEL=streamer-data  /data  ext4  defaults,nofail,noatime  0  2\n'
     } >>"$R/etc/fstab"
 fi
 grep -qsE '^[^#][^[:space:]]+[[:space:]]+/data[[:space:]]' "$R/etc/fstab" ||
-    die "the /data fstab line did not land"
+    die "the /data line did not land in $R/etc/fstab"
+install -d -m 755 "$R/data"
 sed -n '/streamer data partition/,$p' "$R/etc/fstab" | sed 's/^/  /' >&2
 
-# The root filesystem stays writable for the first boot, which is the one that
-# has to write to it. streamer-firstboot appends ,ro for every boot after that.
-
+step "identity"
 if [ -n "$NEW_HOSTNAME" ]; then
     printf '%s\n' "$NEW_HOSTNAME" >"$R/etc/hostname"
     if grep -qs '^127\.0\.1\.1' "$R/etc/hosts"; then
@@ -536,26 +684,61 @@ if [ -n "$NEW_HOSTNAME" ]; then
     else
         printf '127.0.1.1\t%s\n' "$NEW_HOSTNAME" >>"$R/etc/hosts"
     fi
-    log "hostname $NEW_HOSTNAME, so ssh to $NEW_HOSTNAME.local"
+    log "  hostname $NEW_HOSTNAME, so ssh to $NEW_HOSTNAME.local"
 fi
 if [ -n "$TZONE" ]; then
     [ -f "$R/usr/share/zoneinfo/$TZONE" ] || die "no zoneinfo entry for $TZONE"
     ln -sfn "/usr/share/zoneinfo/$TZONE" "$R/etc/localtime"
     printf '%s\n' "$TZONE" >"$R/etc/timezone"
-    log "timezone $TZONE"
+    log "  timezone $TZONE"
 fi
 
-step "journal"
-# journald kept in memory, which is what a read-only root without /var/log/
-# journal already implies. Saying it out loud is the point: the alternative is
-# logs on the writable partition, and a hard power cut is exactly the moment
-# that journal gets left dirty, on a card that is being written to by the
-# player at the same time. The journald that starts before local-fs.target
-# could not reach a /data bind mount either way.
+# Three things a stock Raspberry Pi OS expects its own first boot to make, and
+# a read-only root from the first boot means there is no such write to fall back
+# on. Doing them here also means a published image is not a shared secret:
+#
+#   machine-id     the base image ships one, stamped when the vendor built it,
+#     so every stock card on earth starts with the same. It leaks into DHCP
+#     requests and mDNS names.
+#   ssh host keys  the base image ships these too, in the clear for anyone who
+#     downloads it. If every streamer on a network answered with the same
+#     private host key, the first ssh session to any of them is a session
+#     somebody else could have set up. Regenerating them per build is the fix,
+#     and printing the fingerprint at the end is what lets you check it landed.
+#   ssh login banner  the stock /etc/ssh/sshd_config.d/rename_user.conf prints
+#     "SSH may not work until a valid user has been set up" on every login.
+#     This box has a user, with a key, so the message is wrong every time and
+#     would have every reader of this project checking whether their card was
+#     broken. sshd takes the first value it finds for Banner, so the drop-in has
+#     to be replaced rather than overridden. It is package-owned, so it is
+#     rewritten with a note instead of deleted; an update of that package can
+#     bring the message back.
+if [ -s "$R/etc/machine-id" ]; then
+    log "  machine-id: replacing the one the base image shipped"
+fi
+od -An -tx1 -N16 /dev/urandom | tr -d ' \n' >"$R/etc/machine-id"
+rm -f "$R"/etc/ssh/ssh_host_*_key "$R"/etc/ssh/ssh_host_*_key.pub
+install -d -m 755 "$R/etc/ssh"
+ssh-keygen -q -A -f "$R"
+log "  ssh host keys generated for this build"
+if [ -f "$R/etc/ssh/sshd_config.d/rename_user.conf" ]; then
+    printf '%s\n' \
+        '# streamer: the stock banner talks about setting up a user. This box has' \
+        '# one, and it is reached with an SSH key. See image/build.sh.' >"$R/etc/ssh/sshd_config.d/rename_user.conf"
+    log "  stock ssh login banner replaced"
+fi
+
+# journald kept in memory, which is what a read-only root without
+# /var/log/journal already implies. Saying it out loud is the point: the
+# alternative is logs on the writable partition, and a hard power cut is exactly
+# the moment that journal gets left dirty, on a card the player is writing to at
+# the same time. The journald that starts before local-fs.target could not reach
+# a /data bind mount either way.
 #
 # What survives a power cut is instead the one-line-per-boot record in
-# /data/streamer/boot.log, written by streamer-bootcount and streamer-play:
+# /data/streamer/boot.log, written by the scripts at both ends of the boot:
 # small, append-only, and the thing worth having after the box was yanked.
+step "journal"
 install -d -m 755 "$R/etc/journald.conf.d"
 cat >"$R/etc/journald.conf.d/streamer.conf" <<'EOF'
 [Journal]
@@ -593,18 +776,40 @@ rm -f "$CFG.new"
 
 # config.txt is read top to bottom and a later section overrides an earlier one,
 # so the appliance block goes at the end, under its own [all] header. The audio
-# fragment is dropped in between the two markers, which is the block
-# `streamer audio jack|dac` rewrites later on.
-sed '/^# --- streamer audio begin ---$/,$d' "$CONFIG/boot/appliance-config.txt" >>"$CFG"
-printf '# --- streamer audio begin ---\n' >>"$CFG"
-cat "$CONFIG/etc/streamer/audio-$AUDIO.txt" >>"$CFG"
-printf '# --- streamer audio end ---\n' >>"$CFG"
+# text from etc/streamer/audio-<output>.txt is spliced into it between the two
+# markers, which is the block `streamer audio jack|dac` rewrites later on.
+tail_new=$(mktemp)
+{
+    sed -e '/^# --- streamer audio begin ---$/,/^# --- streamer audio end ---$/d' \
+        "$CONFIG/boot/appliance-config.txt"
+    printf '# --- streamer audio begin ---\n'
+    cat "$CONFIG/etc/streamer/audio-$AUDIO.txt"
+    printf '# --- streamer audio end ---\n'
+} >"$tail_new"
+# Anything of ours from an earlier run goes first, from our own header to the
+# end of the file, so a config.txt never ends up with two appliance blocks.
+awk '/^# --- streamer appliance ---$/ { exit } { print }' "$CFG" >"$CFG.new"
+cat "$tail_new" >>"$CFG.new"
+install -m 644 "$CFG.new" "$CFG"
+rm -f "$CFG.new" "$tail_new"
 log "audio for the first boot: $AUDIO"
 
-# The Raspberry Pi OS initrd honours a resize token; this box resizes nothing at
-# boot, and ro matches what streamer-firstboot puts in fstab.
-line=$(tr -d '\n\r' <"$CMDLINE")
-line=${line// resize/}
+# Raspberry Pi OS puts a bare `resize` token on the kernel command line, and its
+# initrd acts on it by growing the last partition of the card at boot. Ours is
+# the /data partition and it is already the size it will ever be, so the token
+# goes: leaving it in means a second, uncontrolled writer of the partition table
+# at every boot until it notices it has nothing to do. `ro` matches fstab.
+#
+# Splitting the line into words and rebuilding it is why the token cannot come
+# back as part of another word. A kernel command line has no quoting in it, so
+# there is nothing to lose by splitting.
+line=$(tr '\n\r' '  ' <"$CMDLINE")
+kept=""
+for word in $line; do
+    [ "$word" = resize ] && continue
+    kept="$kept $word"
+done
+line=${kept# }
 case " $line " in
     *" ro "*) ;;
     *) line="$line ro" ;;
@@ -620,8 +825,8 @@ umount "$R"
 drop_automounts
 sync
 
-# A vfat partition edited through Linux usually needs its FS info sector
-# tidied; it is worth knowing the Pi firmware is not being handed a dirty one.
+# A vfat partition edited through Linux usually needs its FS info sector tidied;
+# it is worth knowing the Pi firmware is not being handed a dirty one.
 fsck.fat -n "${LOOP}p1" >"$STAGE/fat.log" 2>&1 || true
 if grep -qiE 'dirty|should be removed|correcting|errors' "$STAGE/fat.log"; then
     log "fsck.fat: $(tail -1 "$STAGE/fat.log")"
@@ -633,8 +838,8 @@ log "firmware partition passes fsck.fat"
 
 # e2fsck again: 0 is clean, 1 is "problems corrected", and anything above that
 # means the filesystem the Pi would boot from is not sound. Output goes to a
-# log because a die message that says only "fails e2fsck" is how this build
-# lost half an hour to a volume manager.
+# log, because a die message that says only "fails e2fsck" is how this build
+# once lost half an hour to a volume manager.
 ec=0
 e2fsck -fy "${LOOP}p2" >"$STAGE/root-fsck.log" 2>&1 || ec=$?
 [ "$ec" -le 1 ] || die "the root partition fails e2fsck (status $ec):
@@ -646,30 +851,37 @@ $(cat "$STAGE/root-fsck.log")"
 #   -i 0       disables the periodic check, which on this box could only ever
 #              fire on a boot that is already racing a timer
 #   -T now     stamps the superblock as just checked
-# (`-T never` is not a thing: `never` is only a keyword for -c/-i, and
-# e2fsprogs 1.47.4 prints the usage line and exits non-zero on it.)
 tune2fs -U random -C 0 -i 0 -T now "${LOOP}p2" >"$STAGE/root-tune.log" 2>&1 \
     || die "tune2fs could not give the root partition a fresh UUID and reset its
 check counters:
 $(cat "$STAGE/root-tune.log")"
 log "root partition passes e2fsck, UUID and forced-check counters reset"
 
-# The data partition's filesystem was made, checked and stamped as a file a few
-# minutes ago; here it is only read back, to prove the splice landed where the
-# partition table says it did. Nothing writes to a loop partition the desktop
-# may have mounted.
-data_label=$(blkid -o value -s LABEL "${LOOP}p3")
+# The data partition's filesystem was made, seeded, checked and stamped as a
+# file a few minutes ago. Here it is only read back, to prove the splice landed
+# where the partition table says it did, and that the label fstab mounts by is
+# really on it. Nothing writes to a loop partition a desktop may have mounted.
 data_type=$(blkid -o value -s TYPE "${LOOP}p3")
+data_label=$(blkid -o value -s LABEL "${LOOP}p3")
 [ "$data_type" = ext4 ] && [ "$data_label" = streamer-data ] ||
     die "the data partition is $data_type/$data_label, expected ext4/streamer-data"
+# Read-only debugfs: this is the one place the build looks *inside* the spliced
+# filesystem without mounting it, to prove the seeded tree really is in there.
+# Nothing is ever written through debugfs: writes that matter go through a real
+# mount, by tools that check the filesystem afterwards.
+seeded=$(debugfs -R 'ls -l /' "${LOOP}p3" 2>/dev/null | awk '{ print $NF }' |
+    grep -cxE 'cliamp|state|bin|music|streamer' || true)
+[ "${seeded:-0}" -eq 5 ] ||
+    die "the /data filesystem does not hold the seeded tree (found $seeded of 5 directories):
+the filesystem did not land at sector $p3_start"
 data_blocks=$(dumpe2fs -h "${LOOP}p3" 2>/dev/null |
     sed -n 's/^Block count:[[:space:]]*\([0-9]*\)$/\1/p')
-[ "$data_blocks" -gt 0 ] || die "the data partition has no readable ext4 superblock:
+[ "${data_blocks:-0}" -gt 0 ] || die "the data partition has no readable ext4 superblock:
 the filesystem did not land at sector $p3_start"
-log "data partition reads back as $(blkid -o value -s LABEL "${LOOP}p3") ($data_type), $data_blocks blocks, $((DATA_SECTORS / 2048)) MiB"
+log "data partition reads back as $data_label ($data_type), $data_blocks blocks, ${DATA_SIZE_MIB} MiB, seeded"
 
-# Read the patched files back through a fresh mount: what matters is what the
-# Pi firmware will read, not what this script thinks it wrote.
+# Read the patched files back through a fresh mount: what matters is what the Pi
+# firmware will read, not what this script thinks it wrote.
 mount -o ro "${LOOP}p1" "$FW"
 log "config.txt, the block the Pi will apply:"
 sed -n '/^# --- streamer appliance ---$/,/^# --- streamer audio end ---$/p' "$FW/config.txt" |
@@ -700,22 +912,41 @@ if [ "$COMPRESS" = 1 ]; then
     printf '%s  %s\n' "$(sha256sum "$final.xz" | cut -d' ' -f1)" "$(basename "$final").xz" >"$final.xz.sha256"
     [ "$KEEP_RAW" = 1 ] || rm -f "$final"
 fi
+
+# The public host key of this build, next to the image. On first login ssh
+# prints a fingerprint of its own; comparing it against this file, once, is how
+# you know the card you are talking to is the card you built.
+cp "$R/etc/ssh/ssh_host_ed25519_key.pub" "$OUT_DIR/$name.ssh_host_ed25519.pub"
+fpr=$(ssh-keygen -lf "$OUT_DIR/$name.ssh_host_ed25519.pub" | awk '{print $2}')
+
+# This script ran as root, so the files it made belong to root: give them back to
+# whoever asked for the build.
 if [ -n "${SUDO_UID:-}" ]; then
-    chown -R "$SUDO_UID:${SUDO_GID:-0}" "$OUT_DIR" 2>/dev/null || true
+    chown -R "$SUDO_UID:${SUDO_GID:-0}" "$OUT_DIR" "$CACHE" 2>/dev/null || true
 fi
+
+min_bytes=$(awk -v s="$p3_end" 'BEGIN { printf "%.1f", s * 512 / 1e9 }')
 
 log ""
 ls -1sh "$OUT_DIR" | grep -v '^total' | sed 's/^/  /' >&2
 log ""
-log "login: ssh -i <key> pi@$NEW_HOSTNAME.local"
+log "this image needs a card of at least ${min_bytes} GB (use 8 GB or bigger)."
+log "write it, checking the device name first:"
+log "  sudo xz -dc $OUT_DIR/$name.img.xz | sudo dd of=/dev/sdX bs=8M status=progress conv=fsync"
+log "  (or pick the .xz in Raspberry Pi Imager, as a custom image)"
+log ""
+log "it plays the first time it is powered on, with no setup step in between."
+log "then, over ssh:"
+log "  ssh -i <key> pi@$NEW_HOSTNAME.local"
+log "  cliamp            # sign in to Tidal: https://link.tidal.com/<code>"
+log "  streamer stations # pick a radio station"
+log "  streamer station <url>"
 if [ -n "$KEY_PRIVATE" ]; then
-    log "  the private key is $KEY_PRIVATE, and is not anywhere in the image"
-    log "  keep a copy: it is the only way in"
+    log ""
+    log "the private key is $KEY_PRIVATE, and is nowhere in the image."
+    log "keep a copy: it is the only way in."
 fi
 log ""
-log "write the card, checking the device name first:"
-log "  sudo xz -dc $OUT_DIR/$name.img.xz | sudo dd of=/dev/sdX bs=8M status=progress conv=fsync"
-log "  (or pick the .xz in Raspberry Pi Imager: use it as a custom image)"
-log ""
-log "first boot lays out /data and reboots; the second boot plays."
-log "then, over ssh: cliamp          # to sign in to Tidal (link.tidal.com)"
+log "this build's ssh host key fingerprint, which ssh shows once and can then be"
+log "checked against $OUT_DIR/$name.ssh_host_ed25519.pub:"
+log "  $fpr"

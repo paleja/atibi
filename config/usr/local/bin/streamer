@@ -21,7 +21,7 @@
 #   streamer reload             restart daemon and playback
 #   streamer audio [jack|dac]   show or switch the audio output
 #   streamer rw | ro            make / writable, then read-only again
-#   streamer save               record the current boot config as known-good
+#   streamer reset --yes        wipe /data and put back what the card shipped with
 set -eu
 
 . /etc/streamer.conf
@@ -31,14 +31,14 @@ usage() { # the command list at the top of this file, which is its own help text
 }
 
 # Some of these need root: systemctl on system units, the read-only root, the
-# boot partition. The first boot installs /etc/sudoers.d/streamer for exactly
+# boot partition, /data. The image ships /etc/sudoers.d/streamer for exactly
 # this, so ssh in as the normal user and the command says what it is doing
 # rather than failing with an access error. STREAMER_SUDO marks the second pass,
-# so a sudo that cannot escalate (before the first boot has run, or without the
-# sudoers drop-in) reports the failure instead of re-running itself forever.
+# so a sudo that cannot escalate (no sudoers drop-in, say) reports the failure
+# instead of re-running itself forever.
 needs_root() { # needs_root <command> [argument]
     case "$1" in
-        play|station|playlist|reload|rw|ro|save) return 0 ;;
+        play|station|playlist|reload|reset|rw|ro) return 0 ;;
         audio) [ -n "${2:-}" ] && return 0 ; return 1 ;;
         *) return 1 ;;
     esac
@@ -158,9 +158,36 @@ case "$cmd" in
         [ "$cmd" = down ] && sign=-
         cliamp remote call volume.adjust --params "{\"value\":$sign$n}" --wait >/dev/null
         ;;
-    save)
-        /usr/local/bin/streamer-booted
-        echo "boot config recorded as known-good"
+    reset)
+        # Put /data back exactly as it was when the card was built. The template
+        # it copies is the same tree the /data filesystem was made from at build
+        # time (see image/build.sh), so a reset card and a fresh card really are
+        # the same box. What it costs is everything you put on /data: the local
+        # music, and the Tidal sign-in, which lives in /data/cliamp.
+        if [ "${1:-}" != --yes ]; then
+            echo "this removes everything on $STREAMER_DATA, the Tidal sign-in with it:" >&2
+            ls -1A "$STREAMER_DATA" 2>/dev/null | sed 's/^/  /' >&2
+            echo "to go ahead: streamer reset --yes" >&2
+            exit 2
+        fi
+        # Stop the player before wiping the ground under it: it holds the IPC
+        # socket and the configuration directory open, and its exit handler
+        # writes to both.
+        systemctl stop streamer-play.service streamer-cliamp.service
+        # -mindepth/-maxdepth rather than `rm -rf "$STREAMER_DATA"/*`, because a
+        # shell glob skips dotfiles and leaves half of a stale state behind the
+        # new tree.
+        find "$STREAMER_DATA" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        cp -a "$STREAMER_SEED/." "$STREAMER_DATA/"
+        # cp -a already keeps the ownership the template has (the appliance
+        # user), so this is only insurance against a hand-made template.
+        chown -R "$STREAMER_USER:$STREAMER_GROUP" "$STREAMER_DATA"
+        sync
+        /usr/local/bin/streamer-bootlog \
+            "factory reset: $STREAMER_DATA restored to the built-in template"
+        systemctl restart streamer-cliamp.service streamer-play.service
+        echo "$STREAMER_DATA is back to the state the card was built with"
+        echo "it is playing the default station; sign in to Tidal again with: cliamp"
         ;;
     log)
         journalctl -u streamer-cliamp.service -u streamer-play.service -b --no-pager

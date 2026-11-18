@@ -1,7 +1,8 @@
 [Unit]
 Description=Music streamer appliance
-# Pulled up by multi-user.target. Both members are gated on /data/.ready,
-# so an incomplete first boot stays silent instead of half-starting.
+# Pulled up by multi-user.target. Its members ask for the data mount with
+# RequiresMountsFor=/data, so they wait for it and fail with it if it is missing;
+# nothing here has to be set up first for the box to make a sound.
 
 [Install]
 WantedBy=multi-user.target

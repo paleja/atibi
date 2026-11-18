@@ -11,8 +11,18 @@ or the scripts change.
 
 Two things make this safe to leave running unattended:
 
-* The unmutated text of each file is held in memory and restored in a finally
-  block, so a scenario that hangs cannot leave the appliance code broken.
+* The unmutated text of every file the run can touch is read once, before the
+  first mutation, and the restore in the finally block writes that text back. It
+  is not re-read from disk for each mutation: a baseline read from disk would be
+  whatever the last iteration left behind, so damage from a hard-killed run would
+  quietly become the truth and the next run would restore the damage instead of
+  undoing it. That happened once: a payload script lost its #! line and stayed
+  lost, which is the exact defect the packaging scenario exists to catch.
+* On the way out, the tree is compared with that baseline twice more: once for a
+  mutation that escaped its own restore, once for a scenario that turns out to
+  write into the code it is meant to only read. Either is repaired and reported,
+  and the run fails, because a clean verdict over a changed tree is worth
+  nothing.
 * A journal under /tmp/opencode names the file being mutated before it is
   touched and the original text. If the process is killed hard enough to skip
   the finally block, the next run restores from the journal first and says so,
@@ -31,127 +41,60 @@ ROOT = Path(__file__).resolve().parent.parent
 JOURNAL = Path("/tmp/opencode/rpi-streamer-mutation.journal")
 PLAY = "config/usr/local/bin/streamer-play"
 CTRL = "config/usr/local/bin/streamer"
-BOOTCOUNT = "config/usr/local/bin/streamer-bootcount"
-FIRSTBOOT = "config/usr/local/bin/streamer-firstboot"
-FIRSTBOOT_UNIT = "config/etc/systemd/system/streamer-firstboot.service"
+BOOTLOG = "config/usr/local/bin/streamer-bootlog"
+BUILD = "image/build.sh"
+FSTAB_AWK = "image/fstab-ro.awk"
 
 # what gets broken, which file, the anchor, the replacement, and the check label
 # that has to go red
 MUTATIONS = [
-    ("firstboot invents a blockdev flag again", FIRSTBOOT,
-     'disk_sectors=$(blockdev --getsz "$DISK_DEV")',
-     'disk_sectors=$(blockdev --getstart "$DISK_DEV")',
-     "every blockdev option used exists on a real util-linux"),
-    ("firstboot revives the dead -u=S sfdisk flag", FIRSTBOOT,
-     'sfdisk -q -f -N "$PART" "$DISK_DEV"; then',
-     'sfdisk -q -f -u=S -N "$PART" "$DISK_DEV"; then',
-     "no dead -u=S flag on an sfdisk command line"),
-    ("firstboot treats a no-op resize as a note again", FIRSTBOOT,
-     '    if [ "$disk_size" != "$want" ]; then',
-     "    if false; then",
-     "a resize that quietly did nothing stops the boot"),
+    # The image recipe. Nothing in the sandbox runs a disk tool: the suite reads
+    # build.sh and runs the recipe itself, so these mutations are how we find out
+    # whether that reading is worth anything. Each one is a flag or a tool that
+    # looked obvious and was wrong, which is how the first real card ended up
+    # booting with no /data at all.
+    ("the build invents a blockdev flag again", BUILD,
+     'back=$(sfdisk -d "$IMG" | grep \' : start=\')',
+     'back=$(blockdev --getstart "${LOOP}p3"; sfdisk -d "$IMG" | grep \' : start=\')',
+     "no blockdev --getstart in the build recipe"),
+    ("the build stops reading the partition table back", BUILD,
+     'back=$(sfdisk -d "$IMG" | grep \' : start=\')',
+     'back=',
+     "the build reads the partition table back after writing it"),
+    ("the build lets mkfs choose the block size", BUILD,
+     'mkfs.ext4 -q -F -b 4096',
+     'mkfs.ext4 -q -F',
+     "the command the build runs asks for 4096-byte blocks"),
+    ("the build patches the spliced volume through debugfs", BUILD,
+     "debugfs -R 'ls -l /'",
+     "debugfs -w -R 'ls -l /'",
+     "the build never writes through debugfs"),
 
-    # The read-back has to come off the sectors. The kernel keeps the old
-    # geometry after a write to a busy disk, so asking it what just happened
-    # reports the size from before the write and stops a boot that worked.
-    ("firstboot reads the new size back from the kernel", FIRSTBOOT,
-     """    disk_size=$(sfdisk -d "$DISK_DEV" |
-        awk -v pat="${DISK}p$PART :" '$0 ~ pat {
-            if (match($0, /size=[[:space:]]*[0-9]+/))
-                print substr($0, RSTART + 5, RLENGTH - 5) + 0 }')""",
-     '    disk_size=$(blockdev --getsz "$DATA_DEV")',
-     "the provisioning boot ends cleanly"),
-
-    # The blocks comparison is what stops the unit doing an e2fsck and a
-    # resize2fs on every single boot: a partition is 512-byte sectors and an
-    # ext4 is 4096-byte blocks, and the slack of an odd sector count can never
-    # be filled. Comparing bytes looks equivalent and never settles.
-    ("filesystem size is compared in bytes, not blocks", FIRSTBOOT,
-     '    if [ "$fs_blocks" -lt "$part_blocks" ]; then',
-     '    if [ "$((fs_blocks * fs_bsize))" -lt "$(( $(blockdev --getsz "$DATA_DEV") * 512 ))" ]; then',
-     "a mature boot touched no tool that moves data"),
-
-    # Two halves of the same hand-off: firstboot records the geometry it asked
-    # for, bootcount measures the kernel against that record and asks for the
-    # extra boot. Losing either end leaves a card sitting on a 256 MiB /data
-    # forever, and a record whose keys are not one per line is read as garbage.
-    ("firstboot writes the geometry record on one line", FIRSTBOOT,
-     """    {
-        printf 'dev=%s\\n'    "$DATA_DEV"
-        printf 'disk=%s\\n'   "$DISK"
-        printf 'part=%s\\n'   "$PART"
-        printf 'start=%s\\n'  "$part_start"
-        printf 'want=%s\\n'   "$want"
-    } > /etc/streamer/geometry-target""",
-     """    printf 'dev=%s disk=%s part=%s start=%s want=%s\\n' \\
-        "$DATA_DEV" "$DISK" "$PART" "$part_start" "$want" \\
-        > /etc/streamer/geometry-target""",
-     "a data partition still short of its record asks for one more boot"),
-    ("bootcount ignores the geometry record", BOOTCOUNT,
-     "if [ -f /etc/streamer/geometry-target ]; then",
+    # streamer, the command a person types over SSH. What is worth breaking here
+    # is the damage it can do: the data partition, and the read-only root.
+    ("reset wipes without being asked twice", CTRL,
+     'if [ "${1:-}" != --yes ]; then',
      "if false; then",
-     "a data partition still short of its record asks for one more boot"),
-    ("bootcount trusts the record even when the kernel agrees", BOOTCOUNT,
-     'if [ -n "$geo_now" ] && [ "$geo_now" -lt "$geo_want" ]; then',
-     'if [ -n "$geo_now" ]; then',
-     "asks for no second boot"),
-    ("firstboot never records the geometry it asked for", FIRSTBOOT,
-     """if [ "$grew" = 1 ]; then
-    # mkdir -p on an existing directory succeeds even on a read-only root""",
-     """if false; then
-    # mkdir -p on an existing directory succeeds even on a read-only root""",
-     "boot A says a second boot is owed"),
-    ("the hand-off is a flag in /etc that a later boot must clear", FIRSTBOOT,
-     """if [ "$grew" = 1 ]; then
-    # mkdir -p on an existing directory succeeds even on a read-only root""",
-     """if [ "$grew" = 1 ]; then
-    rm -f /etc/streamer/geometry-target
-    # mkdir -p on an existing directory succeeds even on a read-only root""",
-     "nothing tries to remove that record from the scripts"),
-    ("firstboot remounts the root writable on every boot", FIRSTBOOT,
-     'if [ "$root_dirty" = 1 ]; then\n    # The kernel command line mounts the root read-only',
-     'if true; then\n    # The kernel command line mounts the root read-only',
-     "the provisioning boot is the only one that made the root writable"),
-    ("firstboot decides the tree is there without looking at the partition",
-     FIRSTBOOT,
-     '[ -f "$DATA_MNT/.ready" ] && seeded=1',
-     "seeded=1",
-     "the tree is on the data partition, not on its mount point"),
-    ("firstboot seeds through the /data mount point, which the mount buries",
-     FIRSTBOOT,
-     """    for d in cliamp state bin music; do
-        mkdir -p "$DATA_MNT/$d"
-    done""",
-     """    for d in /data/cliamp /data/state /data/bin /data/music; do
-        mkdir -p "$d"
-    done
-    mkdir -p "$DATA_MNT\"""",
-     "the tree is on the data partition, not on its mount point"),
-    ("the firstboot unit is gated on provisioning again", FIRSTBOOT_UNIT,
-     "DefaultDependencies=no",
-     "DefaultDependencies=no\nConditionPathExists=!/etc/streamer/provisioned",
-     "the firstboot unit is not gated on /etc/streamer/provisioned"),
+     "without --yes it refuses, exit 2"),
+    ("reset clears the data partition with a shell glob", CTRL,
+     'find "$STREAMER_DATA" -mindepth 1 -maxdepth 1 -exec rm -rf {} +',
+     'rm -rf "$STREAMER_DATA"/*',
+     "and so is the dotfile, which is why this does not use a glob"),
+    ("reset wipes under a player that is still running", CTRL,
+     "systemctl stop streamer-play.service streamer-cliamp.service",
+     "true",
+     "the player is stopped first, then both units come back"),
+    ("streamer ro leaves the root writable", CTRL,
+     "        mount -o remount,ro /\n",
+     "        mount -o remount,rw /\n",
+     "streamer rw then ro leaves the root read-only, in that order"),
+    # The durable boot log is the only record of a boot that survives a hard
+    # power cut, because the journal on this appliance is deliberately volatile.
+    ("the boot log is never trimmed", BOOTLOG,
+     'if [ "$lines" -gt "$STREAMER_BOOTLOG_KEEP" ]; then',
+     "if false; then",
+     "boot.log keeps the configured window"),
 
-    # fsck's exit status is a protocol (0 clean, 1 fixed something, 2+ needs a
-    # human), and reading it wrongly goes two ways: treating a repair as a
-    # failure, which under `set -e` happens just by writing `cmd; var=$?`, and
-    # treating something unfixable as merely untidy.
-    ("firstboot aborts when fsck has repaired the data volume", FIRSTBOOT,
-     '        ec=0; e2fsck -fy "$DATA_DEV" >/dev/null || ec=$?',
-     '        e2fsck -fy "$DATA_DEV" >/dev/null; ec=$?',
-     "a filesystem that fsck repaired still gets grown"),
-    ("a data volume that will not mount is never checked", FIRSTBOOT,
-     """    echo "mounting $DATA_DEV failed: checking it while nothing else holds it" >&2
-    ec=0; e2fsck -fy "$DATA_DEV" >/dev/null || ec=$?""",
-     """    echo "mounting $DATA_DEV failed: checking it while nothing else holds it" >&2
-    ec=0""",
-     "the check really ran once more than before"),
-    ("a data volume fsck could not fix is mounted anyway", FIRSTBOOT,
-     """    [ "$ec" -le 1 ] || { echo "e2fsck on $DATA_DEV reports $ec" >&2; exit 1; }
-    mount "$DATA_DEV" "$DATA_MNT" ||""",
-     """    [ "$ec" -le 9 ] || { echo "e2fsck on $DATA_DEV reports $ec" >&2; exit 1; }
-    mount "$DATA_DEV" "$DATA_MNT" ||""",
-     "an unfixable data partition stops the boot"),
 
     ("a parked volume is replayed verbatim", PLAY,
      r"""elif awk -v l="$level" -v f="$STREAMER_VOL_FLOOR" 'BEGIN{ exit (l+0 <= f+0) ? 0 : 1 }'; then""",
@@ -198,10 +141,23 @@ MUTATIONS = [
      "if true; then",
      "the boot floor is set on the player"),
 
-    ("boot rollback never fires", BOOTCOUNT,
-     r"""[ "$n" -ge "$RECOVERY_AT" ]""",
-     r"""[ "$n" -ge 99 ]""",
-     "restored the DAC fragment"),
+    # fstab-ro.awk is the one program the build runs against a file whose whole
+    # job is to keep the root read-only, which is the thing that makes pulling
+    # the power out safe. The expected output is written by hand, so a mutation
+    # here is a bug in a program, not a change of mind about a design.
+    ("the fstab editor leaves the root writable", FSTAB_AWK,
+     'if ($4 !~ /(^|,)ro(,|$)/) $0 = addro($0, $4)',
+     "if (0) { }",
+     "it makes the root and the firmware partition read-only and touches nothing else"),
+    ("the fstab editor rebuilds the line from its fields", FSTAB_AWK,
+     'return substr(line, 1, at + length(opts) - 1) ",ro" substr(line, at + length(opts))',
+     'return $1 " " $2 " " $3 " " $4 ",ro" " " $5 " " $6',
+     "it makes the root and the firmware partition read-only and touches nothing else"),
+    ("the fstab editor makes the data partition read-only too", FSTAB_AWK,
+     '$2 == "/" || $2 == "/boot/firmware"',
+     '$2 == "/" || $2 == "/boot/firmware" || $2 == "/data"',
+     "and the data partition, which is meant to be written, stays writable"),
+
 ]
 
 
@@ -282,10 +238,22 @@ def main():
     if bad:
         print("%d mutation definition(s) need fixing; nothing was broken" % bad)
         return 2
+    # Every file this run can touch, read once, before anything is broken. The
+    # restore below writes exactly this text. Reading the file again for each
+    # mutation would make the baseline whatever the last iteration left behind: a
+    # mutation that escaped its own restore (a hard-killed run, a scenario that
+    # wrote somewhere it should not have) would then quietly become the truth,
+    # and the next run would restore the damage instead of undoing it. That is
+    # not hypothetical: one run ended with a payload script missing its #! line,
+    # which is the exact defect the packaging scenario exists to catch.
+    clean = {}
+    for _, rel, _, _, _ in MUTATIONS:
+        if rel not in clean:
+            clean[rel] = (ROOT / rel).read_text()
     missed = 0
     for what, rel, old, new, must_notice in MUTATIONS:
         path = ROOT / rel
-        original = path.read_text()
+        original = clean[rel]
         if old not in original:
             print("ANCHOR MISSING, not applied: %-46s" % what)
             missed += 1
@@ -298,6 +266,10 @@ def main():
         finally:
             path.write_text(original)
             JOURNAL.unlink()
+            if path.read_text() != original:
+                print("INTEGRITY: %s is not what it was after mutating it for %r"
+                      % (rel, what), file=sys.stderr)
+                sys.exit(1)
         took = time.time() - began
         # red is {scenario title: [failed check labels]}, and it is the label
         # that has to go red: a mutation that breaks something else is not this
@@ -324,10 +296,27 @@ def main():
                  else "(none)")))
         sys.stdout.flush()
 
+    # Two integrity sweeps around the last run: one for a mutation that escaped
+    # its restore, one for a suite that turns out to write into the payload it is
+    # supposed to only read. Both fix the tree on the way out and make the run
+    # fail, because a passing verdict over a changed tree is worth nothing.
+    def untouched(when):
+        left = [rel for rel, text in sorted(clean.items())
+                if (ROOT / rel).read_text() != text]
+        for rel in left:
+            (ROOT / rel).write_text(clean[rel])
+        if left:
+            print("INTEGRITY: %s %s; restored from the copy taken before the run"
+                  % (", ".join(left), when), file=sys.stderr)
+        return len(left)
+
+    damage = untouched("were still mutated after their own run")
     rc, red = run_suite()
-    print("%-7s %-52s %s" % ("clean" if rc == 0 else "DIRTY", "everything restored",
-                             "all checks pass" if rc == 0 else str(red)))
-    return 1 if missed or rc else 0
+    damage += untouched("were changed by the unmutated suite itself")
+    print("%-7s %-52s %s" % ("clean" if rc == 0 and not damage else "DIRTY",
+                             "everything restored",
+                             "all checks pass" if rc == 0 and not damage else str(red)))
+    return 1 if missed or rc or damage else 0
 
 
 if __name__ == "__main__":

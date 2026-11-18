@@ -4,7 +4,6 @@ Documentation=file:/etc/streamer.conf
 Requires=streamer-cliamp.service
 After=streamer-cliamp.service
 RequiresMountsFor=/data
-ConditionPathExists=/data/.ready
 
 [Service]
 Type=oneshot
