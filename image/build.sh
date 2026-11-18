@@ -6,23 +6,25 @@
 #                    [--data-size 1024] [--output DIR] [--keep-raw] [--no-compress]
 #
 # It needs root, because it mounts filesystems. Run it from a terminal and it
-# will ask for your password once, at the point where that is needed.
+# asks for your password first, and then for an SSH key if you did not name one
+# on the command line.
 #
 # What it does, in order:
-#   1. fetch and verify the pinned base image, cliamp release and ffmpeg build.
-#      A SHA256 mismatch stops the build; nothing here comes from a floating
-#      "latest" tag.
+#   1. become root, re-running with the same options, so nothing is asked twice.
 #   2. settle SSH access: an existing public key, or a freshly generated
 #      keypair whose private half stays on this machine.
-#   3. make the tree /data starts with, as one directory, once.
-#   4. copy the base image, add a third partition entry, and put a finished,
+#   3. fetch and verify the pinned base image, cliamp release and ffmpeg build.
+#      A SHA256 mismatch stops the build; nothing here comes from a floating
+#      "latest" tag.
+#   4. make the tree /data starts with, as one directory, once.
+#   5. copy the base image, add a third partition entry, and put a finished,
 #      seeded, checked ext4 filesystem in it. The size is decided here, at
 #      build time, and the card never changes it.
-#   5. mount the two stock partitions and install the appliance: units, scripts,
+#   6. mount the two stock partitions and install the appliance: units, scripts,
 #      the player binaries, the SSH key, the sudoers rule, /etc/fstab, hostname
 #      and timezone, and the few things a read-only root cannot make later.
-#   6. patch the firmware partition: the audio setup and the boot options.
-#   7. check both filesystems, read the patched boot files back, compress.
+#   7. patch the firmware partition: the audio setup and the boot options.
+#   8. check both filesystems, read the patched boot files back, compress.
 #
 # Everything that has to be true when the card boots is written here, into the
 # image. There is no first-boot setup script, no resizing at boot, and nothing
@@ -61,6 +63,9 @@ CONFIG=$REPO/config
 CACHE=$REPO/.cache
 OUT_DIR=$REPO/output
 STAGE=$CACHE/stage
+# Where the public half of this build's ssh host key is kept while the root
+# partition is still mounted: see the identity step and the output step.
+hostkey=$STAGE/ssh_host_ed25519_key.pub
 
 # The starting tree on the writable partition, and the same tree on the read-only
 # root as a template for a factory reset (see `streamer reset`). Everything
@@ -117,10 +122,16 @@ EOF
 
 # --- arguments --------------------------------------------------------------------------------
 
+# The options below are shifted away as they are read, and the build then runs
+# itself again as root. Keep what was typed so the second run gets the same
+# options: a re-exec that passes nothing would silently build the default
+# configuration, and ask for the SSH key a second time.
+RAW_ARGS=("$@")
+
 while [ $# -gt 0 ]; do
     case $1 in
         --audio)      AUDIO=${2:?--audio needs jack or dac};                   shift 2 ;;
-        --ssh-key)    SSH_KEY=$(realpath -e "${2:?--ssh-key needs a file}");   shift 2 ;;
+        --ssh-key)    SSH_KEY=${2:?--ssh-key needs a file};                    shift 2 ;;
         --new-key)    NEW_KEY=1;                                               shift ;;
         --hostname)   NEW_HOSTNAME=${2:?--hostname needs a name};              shift 2 ;;
         --tz)         TZONE=${2:?--tz needs a zone};                           shift 2 ;;
@@ -149,7 +160,7 @@ esac
 [ "$DATA_SIZE_MIB" -ge 64 ] || die "--data-size below 64 MiB leaves no room for lost+found and a fsck log"
 DATA_SECTORS=$((DATA_SIZE_MIB * 2048))
 
-for tool in curl sfdisk losetup blkid e2fsck tune2fs mkfs.ext4 dumpe2fs debugfs fsck.fat dd \
+for tool in curl sfdisk losetup blkid e2fsck tune2fs mkfs.ext4 dumpe2fs debugfs fsck.fat dd sudo \
             truncate mount umount bsdtar xz ssh-keygen sha256sum stat awk sed grep; do
     command -v "$tool" >/dev/null || die "$tool is missing"
 done
@@ -170,6 +181,21 @@ done
 # session that has the card's partitions mounted.
 [ -f "$REPO/image/fstab-ro.awk" ] ||
     die "image/fstab-ro.awk is missing: this script edits /etc/fstab with it"
+
+# --- root ------------------------------------------------------------------------------------
+
+# Partition tables, loop devices and mounts: there is no way to do any of that
+# unprivileged, and a build that fails halfway because the password was never
+# asked for is worse than one that asks up front. Re-running with the options as
+# they were typed is what keeps the SSH key question from being asked twice.
+if [ "$(id -u)" -ne 0 ]; then
+    # Only ever one re-exec: if sudo hands back a shell that is still not root,
+    # say so instead of asking for the password forever.
+    [ -z "${STREAMER_BECAME_ROOT:-}" ] || die "sudo ran the build again, still without root privileges"
+    log ""
+    log "the build writes a partition table and mounts filesystems: asking for sudo now"
+    STREAMER_BECAME_ROOT=1 exec sudo -E "$SELF" ${RAW_ARGS[@]+"${RAW_ARGS[@]}"}
+fi
 
 # --- ssh access -------------------------------------------------------------------------------
 
@@ -194,44 +220,52 @@ make_keypair() {
         ssh-keygen -q -t ed25519 -C "$NEW_HOSTNAME" -f "$KEY_PRIVATE" -N ''
         log "  generated a keypair: $KEY_PRIVATE"
     fi
+    # The build runs as root, and a private key only root can read is no use to
+    # the person who just built the image.
+    if [ -n "${SUDO_USER:-}" ]; then chown -R "$SUDO_USER" "$KEYS"; fi
     SSH_KEY=$KEY_PRIVATE.pub
 }
 
+# Resolve one answer into a public key. Returns 1 when it is not one, so the
+# question gets asked again instead of a typo ending the build.
+use_key_file() {
+    local path=${1/#\~/$HOME}
+    path=$(realpath -e -- "$path" 2>/dev/null) || return 1
+    looks_like_pubkey "$path" || return 1
+    SSH_KEY=$path
+}
+
 if [ -n "$SSH_KEY" ]; then
-    looks_like_pubkey "$SSH_KEY" || die "$SSH_KEY is not a public key file"
+    given=$SSH_KEY
+    use_key_file "$given" || die "$given is not a readable public key file"
     log "  authorising the key in $SSH_KEY"
 elif [ "$NEW_KEY" = 1 ]; then
     make_keypair
 elif [ -t 0 ]; then
-    log "Which SSH public key should be able to log in? Press Enter to have a
-new keypair generated instead."
-    printf 'path: ' >&2
-    read -r answer
-    if [ -n "$answer" ]; then
-        answer=${answer/#\~/$HOME}
-        SSH_KEY=$(realpath -e -- "$answer" 2>/dev/null) ||
-            die "$answer is not a readable file"
-        looks_like_pubkey "$SSH_KEY" || die "$SSH_KEY is not a public key file"
-    else
-        make_keypair
-    fi
+    log "The account on the appliance has no password, so with no authorised key the
+first login needs a monitor and a keyboard. Name a public key to authorise, for
+example ~/.ssh/id_ed25519.pub, or press Enter for a new keypair in $KEYS."
+    while :; do
+        printf 'path: ' >&2
+        IFS= read -r answer || die "no SSH public key given, and the terminal closed.
+Pass --ssh-key /path/to/id_ed25519.pub, or --new-key to make a keypair."
+        if [ -z "$answer" ]; then
+            make_keypair
+            break
+        fi
+        if use_key_file "$answer"; then
+            log "  authorising the key in $SSH_KEY"
+            break
+        fi
+        log "
+  $answer is not a readable public key: check the path, or press Enter for a
+  new keypair."
+    done
 else
     die "no SSH public key given, and there is no terminal to ask on.
 Pass --ssh-key /path/to/id_ed25519.pub, or --new-key to make a keypair."
 fi
 log "  $(ssh-keygen -lf "$SSH_KEY")"
-
-# --- root ------------------------------------------------------------------------------------
-
-# Partition tables, loop devices and mounts: there is no way to do any of that
-# unprivileged, and a build that fails halfway because the password was never
-# asked for is worse than one that asks up front. Passing the arguments through
-# unchanged means nothing is resolved twice.
-if [ "$(id -u)" -ne 0 ]; then
-    log ""
-    log "the build writes a partition table and mounts filesystems: asking for sudo now"
-    exec sudo -E "$SELF" "$@"
-fi
 
 # --- fetch and verify -------------------------------------------------------------------------
 
@@ -377,7 +411,7 @@ cleanup() {
     drop_automounts
     [ -n "$LOOP" ] && losetup -d "$LOOP" 2>/dev/null
     [ -n "$IMG" ] && rm -f "$IMG"
-    rm -f "$STAGE/data-fs.img"
+    rm -f "$STAGE/data-fs.img" "$hostkey"
 }
 trap cleanup EXIT
 rm -f "$IMG"
@@ -440,9 +474,15 @@ back=$(sfdisk -d "$IMG" | grep ' : start=')
 [ "$(printf '%s\n' "$back" | grep -c 'start=')" -eq 3 ] ||
     die "the partition table did not gain a third entry:
 $back"
-[ "$(printf '%s\n' "$back" | tail -1 | grep -o "start=$p3_start")" = "start=$p3_start" ] ||
+# Compare the numbers, not the text: sfdisk pads the values it writes back
+# (start=     6012928), so a literal match against what was asked for fails on a
+# table that is correct.
+third=$(printf '%s\n' "$back" | tail -1)
+[ "$(field "$third" start)" = "$p3_start" ] &&
+    [ "$(field "$third" size)" = "$DATA_SECTORS" ] ||
     die "the third partition is not where it was asked for:
-$back"
+  asked for  start=$p3_start size=$DATA_SECTORS
+  found      $third"
 log "the new partition table:"
 printf '%s\n' "$back" | awk -F' : ' '{split($1, a, "/"); printf "  %-12s %s\n", a[length(a)], $2}' >&2
 
@@ -607,11 +647,14 @@ chown -h 1000:1000 "$R$user_home/.config/cliamp"
 # only way in is an SSH key, so a password prompt here is not a security
 # boundary, it is an obstacle: `streamer audio dac` and `streamer rw` both
 # re-run themselves through sudo, and there is no screen to type a password
-# into. visudo is used when this machine has it, because a sudoers file with a
-# syntax error locks everybody out of a box that has no password.
+# into. NOPASSWD is all that is needed for that: sudo only wants a terminal when
+# it has to ask for a password, and `requiretty` is off by default in the sudo
+# Raspberry Pi OS ships, so a line for it could only ever be wrong. visudo is
+# used when this machine has it, because a sudoers file with a syntax error
+# locks everybody out of a box that has no password.
 step "sudoers"
 tmp=$(mktemp)
-printf '%s\n' 'Defaults!streamer !requiretty' 'pi ALL=(ALL) NOPASSWD:ALL' >"$tmp"
+printf '%s\n' "$user_name ALL=(ALL) NOPASSWD:ALL" >"$tmp"
 if command -v visudo >/dev/null; then
     visudo -cf "$tmp" >/dev/null || die "the sudoers fragment this script writes is invalid"
 else
@@ -619,6 +662,8 @@ else
 fi
 install -d "$R/etc/sudoers.d"
 install -m 0440 "$tmp" "$R/etc/sudoers.d/streamer"
+rm -f "$tmp"
+log "  $user_name ALL=(ALL) NOPASSWD:ALL"
 rm -f "$tmp"
 log "  streamer commands need no password"
 
@@ -720,6 +765,12 @@ od -An -tx1 -N16 /dev/urandom | tr -d ' \n' >"$R/etc/machine-id"
 rm -f "$R"/etc/ssh/ssh_host_*_key "$R"/etc/ssh/ssh_host_*_key.pub
 install -d -m 755 "$R/etc/ssh"
 ssh-keygen -q -A -f "$R"
+# The root partition is unmounted before it can be checked, and the loop device
+# that carries it is released afterwards, so nothing can be read out of it any
+# more by the time the image gets its name. Take the public half out now, while
+# it is still reachable: the fingerprint printed at the end is only worth
+# comparing if it comes from the key that is really in this image.
+install -m 644 "$R/etc/ssh/ssh_host_ed25519_key.pub" "$hostkey"
 log "  ssh host keys generated for this build"
 if [ -f "$R/etc/ssh/sshd_config.d/rename_user.conf" ]; then
     printf '%s\n' \
@@ -916,7 +967,7 @@ fi
 # The public host key of this build, next to the image. On first login ssh
 # prints a fingerprint of its own; comparing it against this file, once, is how
 # you know the card you are talking to is the card you built.
-cp "$R/etc/ssh/ssh_host_ed25519_key.pub" "$OUT_DIR/$name.ssh_host_ed25519.pub"
+cp "$hostkey" "$OUT_DIR/$name.ssh_host_ed25519.pub"
 fpr=$(ssh-keygen -lf "$OUT_DIR/$name.ssh_host_ed25519.pub" | awk '{print $2}')
 
 # This script ran as root, so the files it made belong to root: give them back to
