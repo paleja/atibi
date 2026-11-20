@@ -37,6 +37,8 @@ Environment overrides (used by the test suite; systemd sets none):
   STREAMER_EXECUTABLE the streamer command   (default /usr/local/bin/streamer)
   STREAMER_HTTP_PIDFILE   write our pid here (test harness only; setsid detaches)
   STREAMER_HTTP_TEST_NO_LISTEN  print the config and exit 0 (packaging checks)
+  STREAMER_RADIO_SIZE     how many similar songs the radio offers (streamer.conf, then 50)
+  STREAMER_TIDAL_CRED     the Tidal login this server borrows (streamer.conf, then <data>/cliamp/tidal_credentials.json)
 """
 
 import errno
@@ -51,7 +53,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 
 CONF_PATH_DEFAULT = "/etc/streamer.conf"
 IPC_LOCK = threading.Lock()
@@ -94,6 +98,11 @@ class Config:
             os.path.join(home, ".config", "cliamp", "cliamp.sock"))
         self.streamer = os.environ.get("STREAMER_EXECUTABLE",
                                        "/usr/local/bin/streamer")
+        self.radio_size = int(os.environ.get(
+            "STREAMER_RADIO_SIZE", conf.get("STREAMER_RADIO_SIZE", "50")))
+        self.tidal_cred = os.environ.get("STREAMER_TIDAL_CRED") or expand(
+            conf.get("STREAMER_TIDAL_CRED",
+                     "$STREAMER_DATA/cliamp/tidal_credentials.json"), conf)
 
     def token(self):
         """The LAN secret, made once and kept on /data. Printed to the journal
@@ -244,6 +253,130 @@ def read_intent():
     return intent
 
 
+# --- Tidal radio ---------------------------------------------------------------
+#
+# "Similar songs" for what is playing - Tidal's own track radio - is not
+# something cliamp 2.4.1 can do: none of its 77 IPC operations mentions radio,
+# similar, mix or autoplay (its autoplay code is Spotify-only), and the
+# plugin command channel answers nothing. Tidal's own HTTP API does answer it,
+# and the card already holds a Tidal login - the session file cliamp keeps in
+# its data directory - so this server borrows that login rather than having an
+# account of its own. Verified against the card 2026-11-20:
+#
+#   GET /v1/tracks/<id>/radio?countryCode=..  answers real track rows; the
+#   siblings /tracks/<id>/similar, /trackradio/<id> and /mixes do not exist.
+#   GET /v2/my-collection/playlists/folders/create-playlist + the ETag'd POST
+#   to /v1/playlists/<uuid>/items create and fill a real playlist in the
+#   account (it shows up in the Tidal app's own list); DELETE removes it.
+#
+# Rules this borrowing keeps to:
+# - The session file is read fresh on every call, never cached, and never
+#   refreshed here. cliamp owns that login; a second refresher of one OAuth
+#   session is the surest way to end the card's Tidal access for good. A token
+#   that turns out stale is reported, not chased.
+# - The /v1 (or /v2) path segment and countryCode are not decoration: without
+#   the segment the CDN answers a plain 404 page, and playlist calls 400
+#   without the country.
+# - Saving writes into the owner's Tidal account, so the only sequence used is
+#   the one verified end to end that day, and a playlist left empty by a
+#   failed fill is deleted again rather than left behind.
+
+TIDAL_API = "https://api.tidal.com"
+
+
+class TidalError(Exception):
+    pass
+
+
+def tidal_login():
+    """(access token, country code) from cliamp's session file, read fresh."""
+    try:
+        with open(CFG.tidal_cred, encoding="utf-8") as f:
+            cred = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise TidalError("no Tidal login on this card to borrow (%s)" % exc) from exc
+    token = str(cred.get("access_token") or "")
+    if not token:
+        raise TidalError("the stored Tidal login has no access token")
+    return token, str(cred.get("country_code") or "US")
+
+
+def tidal_call(method, path, params=None, form=None, headers=None):
+    """One Tidal API call. Returns (status, json-or-text, response headers);
+    raises TidalError for transport failures and for the one status code with
+    a known meaning here: 401, the saved login having gone stale."""
+    token, country = tidal_login()
+    query = {"countryCode": country}
+    query.update(params or {})
+    url = TIDAL_API + path + "?" + urllib.parse.urlencode(query)
+    data = urllib.parse.urlencode(form).encode() if form is not None else None
+    hd = {"Authorization": "Bearer " + token, "Accept": "application/json"}
+    hd.update(headers or {})
+    if data is not None:
+        hd["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(url, data=data, method=method, headers=hd)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw, status, hdrs = resp.read().decode(), resp.status, resp.headers
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise TidalError("Tidal refused the login saved on this card - "
+                             "play something from Tidal once to sign it in "
+                             "again") from exc
+        raise TidalError("Tidal said %s to %s %s" % (exc.code, method, path)) from exc
+    except OSError as exc:
+        raise TidalError("cannot reach Tidal: %s" % exc) from exc
+    try:
+        return status, json.loads(raw), hdrs
+    except ValueError:
+        return status, raw, hdrs
+
+
+def tidal_seed():
+    """(tidal track id, playing row) for whatever the player is on, or
+    (None, None) when it is not on a Tidal track. The id prefers the row's own
+    provider_meta, with the path's tail as the fallback the /api/play route
+    already trusts."""
+    snap = ipc("state.get").get("snapshot", {})
+    for key in ("track", "logical_track"):
+        row = snap.get(key) or {}
+        hit = TRACK_ROW.match(str(row.get("path", "")))
+        if hit and hit.group(1) == "tidal":
+            meta = row.get("provider_meta") or {}
+            return str(meta.get("tidal.id") or hit.group(2)), row
+    return None, None
+
+
+def radio_tracks(seed):
+    """Tidal's similar songs for one track, in Tidal's own order: the seed
+    itself dropped (the first row of the answer is usually it), unstreamable
+    rows dropped, cut at STREAMER_RADIO_SIZE. The rows carry everything the
+    player needs to queue them without resolving them again - track.queue
+    asked for a bare path leaves an unresolved stub row, verified on the card
+    - and no year key at all rather than an empty one, which the player
+    refuses."""
+    _, body, _ = tidal_call("GET", "/v1/tracks/%s/radio" % seed,
+                            {"limit": str(CFG.radio_size + 1)})
+    items = body.get("items") if isinstance(body, dict) else None
+    out = []
+    for t in items or []:
+        tid = str(t.get("id", ""))
+        if not tid or tid == seed or not t.get("allowStreaming", True):
+            continue
+        row = {"path": "tidal://track/%s" % tid,
+               "title": str(t.get("title", "")),
+               "artist": str((t.get("artist") or {}).get("name", "")),
+               "album": str((t.get("album") or {}).get("title", "")),
+               "duration_secs": t.get("duration"),
+               "track_number": t.get("trackNumber"),
+               "stream": True,
+               "provider_meta": {"tidal.id": tid}}
+        out.append({k: v for k, v in row.items() if v is not None})
+        if len(out) >= CFG.radio_size:
+            break
+    return out
+
+
 # --- HTTP ---------------------------------------------------------------------
 
 TRANSPORT_OPS = {"play", "pause", "toggle", "next", "prev", "stop"}
@@ -388,6 +521,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # what numbers the list and what marks the row it is playing now.
             self._json_out({"ok": True, "tracks": res.get("tracks", []),
                             "index": res.get("index"), "total": res.get("total")})
+            return
+        if path == "/api/radio":
+            # The preview: what Tidal says is similar to the track playing
+            # now. Nothing changes; the page shows these and the two POST
+            # routes below act on them.
+            seed, _playing = tidal_seed()
+            if not seed:
+                self._json_out({"ok": False,
+                                "error": "radio follows the Tidal track that "
+                                         "is playing, and nothing Tidal is"}, 409)
+                return
+            try:
+                tracks = radio_tracks(seed)
+            except TidalError as exc:
+                self._json_out({"ok": False, "error": str(exc)}, 502)
+                return
+            self._json_out({"ok": True, "seed": seed, "tracks": tracks})
             return
         self._json_out({"ok": False, "error": "not found"}, 404)
 
@@ -545,6 +695,99 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json_out({"ok": True, "streamer": out,
                             "intent": read_intent()})
             return
+        if path == "/api/radio/queue":
+            # Extend the live queue with the similar songs. The list is read
+            # from Tidal again here rather than taken from the page's preview:
+            # the preview is a look, the action is whatever Tidal calls similar
+            # now, and a body full of hand-written ids would let a page push
+            # arbitrary rows into the player — the same reason the boot intent
+            # is only ever written by the streamer command.
+            seed, _playing = tidal_seed()
+            if not seed:
+                self._json_out({"ok": False,
+                                "error": "radio follows the Tidal track that "
+                                         "is playing, and nothing Tidal is"}, 409)
+                return
+            try:
+                tracks = radio_tracks(seed)
+            except TidalError as exc:
+                self._json_out({"ok": False, "error": str(exc)}, 502)
+                return
+            # track.queue, not queue: verified on the card 2026-11-20 that
+            # repeated calls land in the player's play-next area, keep the
+            # order asked for, and play before the rest of the loaded list —
+            # and that each row must carry its fetched metadata, a bare path
+            # makes an unresolved stub. No boot intent touched: the saved
+            # list, and what a reboot brings back, stay exactly as they were.
+            for row in tracks:
+                ipc_op("track.queue", {"track": row})
+            self._json_out({"ok": True, "queued": len(tracks)})
+            return
+        if path == "/api/radio/save":
+            # The other half: keep the same similar songs as a real playlist
+            # in the owner's Tidal account, under a title they typed. This is
+            # the only place in this server that writes to a provider account,
+            # with the create/fill sequence verified end to end on the card
+            # 2026-11-20, and a playlist left empty by a failed fill is
+            # deleted again rather than left behind in the account.
+            title = str(body.get("title", "")).strip()[:120]
+            if not title:
+                self._json_out({"ok": False,
+                                "error": "playlist title required"}, 400)
+                return
+            seed, playing = tidal_seed()
+            if not seed:
+                self._json_out({"ok": False,
+                                "error": "radio follows the Tidal track that "
+                                         "is playing, and nothing Tidal is"}, 409)
+                return
+            from_line = " - ".join(
+                x for x in (str((playing or {}).get("artist", "")),
+                            str((playing or {}).get("title", ""))) if x)
+            try:
+                tracks = radio_tracks(seed)
+                if not tracks:
+                    raise TidalError("Tidal offered nothing similar to save")
+                st, created, _ = tidal_call(
+                    "PUT",
+                    "/v2/my-collection/playlists/folders/create-playlist",
+                    {"name": title,
+                     "description": ("streamer radio, from " + from_line)
+                                     if from_line else "",
+                     "folderId": "root"})
+                uuid = ""
+                if isinstance(created, dict):
+                    uuid = str((created.get("data") or {}).get("uuid")
+                               or created.get("uuid") or "")
+                if st != 200 or not uuid:
+                    raise TidalError("Tidal refused to create the playlist "
+                                     "(%s)" % st)
+                # Filling a playlist is conditional on its ETag, verified the
+                # same day: the POST to /items answers 412 (or adds nothing)
+                # unless it carries If-None-Match from a fresh GET.
+                _, _, hdrs = tidal_call("GET", "/v1/playlists/%s" % uuid)
+                etag = hdrs.get("ETag") or "*"
+                st, added, _ = tidal_call(
+                    "POST", "/v1/playlists/%s/items" % uuid,
+                    form={"trackIds": ",".join(
+                             str(r["path"]).rsplit("/", 1)[-1] for r in tracks),
+                          "toIndex": 0, "onArtifactNotFound": "SKIP",
+                          "onDupes": "SKIP"},
+                    headers={"If-None-Match": etag})
+                n = (len(added.get("addedItemIds") or [])
+                     if isinstance(added, dict) else 0)
+                if st != 200 or not n:
+                    # Nothing got in: take the empty shell back out of the
+                    # account, whatever it was - refused, or an accept-everything
+                    # response that added no ids.
+                    tidal_call("DELETE", "/v1/playlists/%s" % uuid)
+                    raise TidalError("Tidal added nothing to the new playlist")
+            except TidalError as exc:
+                self._json_out({"ok": False, "error": str(exc)}, 502)
+                return
+            self._json_out({"ok": True, "uuid": uuid, "added": n,
+                            "title": title})
+            return
         self._json_out({"ok": False, "error": "not found"}, 404)
 
     @staticmethod
@@ -648,6 +891,16 @@ a{color:var(--acc)}
  <div class="row" style="margin-top:8px">
   <button onclick="intentStation()">play this again after a reboot</button>
  </div>
+ <h1 style="margin-top:14px">radio</h1>
+ <div class="dim" style="margin-top:2px">similar songs for the Tidal track playing now. They play before the rest of the loaded list; what a reboot brings back stays the saved list as it was.</div>
+ <div class="row" style="margin-top:8px">
+  <button onclick="radioLoad()">show similar songs</button>
+ </div>
+ <ul id="radio" class="hidden" style="margin-top:6px"></ul>
+ <div class="row hidden" id="radio-go" style="margin-top:8px">
+  <button onclick="radioQueue()">queue these</button>
+  <button onclick="radioSave()">save as playlist&hellip;</button>
+ </div>
  <h1 style="margin-top:14px">playlist</h1>
  <div class="dim" style="margin-top:2px">tap a track to start it — the green row is what is playing.</div>
  <ul id="queue"></ul>
@@ -719,7 +972,8 @@ async function unlock(){
   }
   return false;
 }
-function fail(m){$('err').textContent=m||'';if(m)setTimeout(()=>{if($('err').textContent==m)$('err').textContent=''},6000);}
+function fail(m){$('err').className='err';$('err').textContent=m||'';if(m)setTimeout(()=>{if($('err').textContent==m)$('err').textContent=''},6000);}
+function say(m){$('err').className='dim';$('err').textContent=m||'';if(m)setTimeout(()=>{if($('err').textContent==m)$('err').textContent=''},8000);}
 function op(name){api('/api/op/'+name,{}).then(d=>{if(!d.ok)fail(d.error);poll();});}
 function setVol(){api('/api/op/volume',{value:Number($('v').value)}).then(d=>{if(!d.ok)fail(d.error);poll();});}
 function render(s){
@@ -792,6 +1046,43 @@ async function doSearch(){
     b.onclick=()=>api('/api/play',{track:t}).then(r=>{if(!r.ok)fail(r.error);tab('now');});
     li.append(b);ul.append(li);
   }
+}
+let radioList=[];
+async function radioLoad(){
+  // Tidal's list, fetched by the card: the page never sees the account's
+  // access token, only the rows it shows and the two buttons that act on them.
+  const d=await api('/api/radio');
+  if(!d.ok){fail(d.error);return;}
+  radioList=d.tracks||[];
+  const ul=$('radio');ul.innerHTML='';
+  for(const t of radioList){
+    const li=document.createElement('li');
+    li.innerHTML=`<div class="what"><b></b><small></small></div>`;
+    li.querySelector('b').textContent=t.title||'';
+    li.querySelector('small').textContent=[t.artist,t.album].filter(Boolean).join(' · ');
+    ul.append(li);
+  }
+  if(radioList.length){ul.classList.remove('hidden');$('radio-go').classList.remove('hidden');}
+  else say('Tidal offered nothing similar to this track');
+}
+async function radioQueue(){
+  if(!radioList.length)return;
+  const d=await api('/api/radio/queue',{});
+  if(!d.ok){fail(d.error);return;}
+  say('now playing '+d.queued+' similar tracks, before the rest of the list');
+  $('radio-go').classList.add('hidden');
+  loadQueue();
+}
+async function radioSave(){
+  if(!radioList.length)return;
+  const t=snap.track||snap.logical_track||{};
+  const name=prompt('name the new playlist in the Tidal account',
+                    (t.title||'radio')+' - radio');
+  if(!name)return;
+  const d=await api('/api/radio/save',{title:name});
+  if(!d.ok){fail(d.error);return;}
+  say('saved "'+d.title+'" with '+d.added+' tracks to the Tidal account');
+  $('radio-go').classList.add('hidden');
 }
 async function loadQueue(){
   const d=await api('/api/queue');const ul=$('queue');ul.innerHTML='';qrows=[];
