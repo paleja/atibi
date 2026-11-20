@@ -669,18 +669,55 @@ a{color:var(--acc)}
  <div class="card hidden" id="results-card"><h1>results</h1><ul id="results"></ul></div>
 </div>
 </main><script>
-let TOKEN=new URLSearchParams(location.search).get('token')||localStorage.getItem('streamer-token')||'';
-if(new URLSearchParams(location.search).get('token'))localStorage.setItem('streamer-token',TOKEN);
-if(!TOKEN)TOKEN=prompt('card token (from: sudo cat /data/streamer/http.token)')||'';
-let playing=false,tick=0,pos=0,dur=0,timer=null;
+const FROM_URL=new URLSearchParams(location.search).get('token')||'';
+let TOKEN='',playing=false,tick=0,pos=0,dur=0,timer=null;
 let snap={},qrows=[],qplay=null;
 const $=id=>document.getElementById(id);
-async function api(path,body){
+function setToken(t){
+  // The token goes into localStorage only once the card has accepted it: a typo
+  // kept there would fail every later load instead of asking one more time.
+  // Empty means the stored one is deleted - a card re-flashed with a new token
+  // must not leave the page locked out by its own memory of the old one.
+  TOKEN=t||'';
+  if(TOKEN)localStorage.setItem('streamer-token',TOKEN);
+  else localStorage.removeItem('streamer-token');
+}
+async function tokenOk(t){
+  // The cheapest question the card answers with the token: its own status.
+  // Raw fetch, not api(), so a rejected token cannot recurse into itself.
+  if(!t)return false;
+  try{return(await fetch('/api/status',{headers:{'X-Token':t}})).status!==401;}
+  catch(e){return false;}
+}
+async function api(path,body,retried){
   const opt=body?{method:'POST',headers:{'Content-Type':'application/json','X-Token':TOKEN},body:JSON.stringify(body)}
                  :{headers:{'X-Token':TOKEN}};
   const r=await fetch(path,opt);
-  if(r.status===401){TOKEN=prompt('card token rejected, re-enter')||TOKEN;localStorage.setItem('streamer-token',TOKEN);}
+  if(r.status===401&&!retried){
+    // Whatever was being sent is refused, so it goes. Ask for another, check it
+    // before keeping it, and replay this one request - a card that changed its
+    // token should mean one dialog, not a reload and a lost click.
+    setToken('');
+    const t=prompt('card token rejected, re-enter')||'';
+    if(t&&await tokenOk(t)){setToken(t);return api(path,body,true);}
+  }
   return r.json();
+}
+async function unlock(){
+  // Three sources, in the order that makes each of them useful: a token in the
+  // URL (a bookmark, or the redirect from /?token=...), one the browser
+  // remembers from the last time, and finally a typed one. Whichever the card
+  // accepts is the one kept, so the secret is fetched over SSH once, not at
+  // every desk.
+  for(const cand of[FROM_URL,localStorage.getItem('streamer-token')])
+    if(cand&&await tokenOk(cand)){setToken(cand);return true;}
+  setToken('');
+  for(let i=0;i<3;i++){
+    const t=prompt('card token (from: sudo cat /data/streamer/http.token)');
+    if(!t)return false;                      // cancelled, or typed nothing
+    if(await tokenOk(t)){setToken(t);return true;}
+  }
+  return false;
 }
 function fail(m){$('err').textContent=m||'';if(m)setTimeout(()=>{if($('err').textContent==m)$('err').textContent=''},6000);}
 function op(name){api('/api/op/'+name,{}).then(d=>{if(!d.ok)fail(d.error);poll();});}
@@ -713,7 +750,6 @@ async function poll(){
   const d=await api('/api/status');if(!d.ok&&d.error)fail(d.error);else{render(d);tick=d.position||0;}
 }
 setInterval(()=>{if(playing){tick+=0.5;paintBar();}},500);
-timer=setInterval(poll,2000);poll();
 function tab(name){
   for(const t of['now','browse']){$('tab-'+t).classList.toggle('on',t===name);$(t).classList.toggle('hidden',t!==name);}
   if(name==='browse')loadProviders();
@@ -815,7 +851,13 @@ function intentMode(){
     api('/api/intent',{kind:'mode',target:m}).then(r=>{if(!r.ok)fail(r.error);poll();});
   });
 }
-loadQueue();
+async function start(){
+  // Nothing is read before the token works out: every /api answer would come
+  // back 401, and the page would say "nothing playing" about a card that is.
+  if(!await unlock()){fail('no token this card accepts - reload the page to try again');return;}
+  poll();timer=setInterval(poll,2000);
+}
+start();
 </script></body></html>
 """
 
