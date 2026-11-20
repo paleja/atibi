@@ -29,9 +29,11 @@ decisions and their reasons; this file is only about the code.
     `/boot/firmware/config.txt`
   - `usr/local/bin/streamer` — the command people use over SSH, and the only
     thing that writes the record of what to play next boot and how loud
-  - `usr/local/bin/streamer-daemon` — four-line wrapper that starts the
-    player: pins the volume floor, buffer and sample rate, exports the PATH
-    that finds ffmpeg. Deliberately never starts playback.
+  - `usr/local/bin/streamer-daemon` — wrapper that starts the
+    player: pins the volume floor, buffer and sample rate, the DAC's on-board
+    codec trim (`STREAMER_DAC_GAIN`: full scale first, then the dB, hunting
+    for the 'Digital' control rather than assuming a card number), and exports
+    the PATH that finds ffmpeg. Deliberately never starts playback.
   - `usr/local/bin/streamer-play` — the boot-time play: waits for the clock
     and the network, sets the floor, starts the saved target, ramps the level
   - `usr/local/bin/streamer-bootlog` — one durable line per event; the only

@@ -187,6 +187,21 @@ RP-010196; gen4 has a shorter pre-Linux stage than gen5):
   PipeWire in `raspios_lite`). One volume path, not two: all volume via
   cliamp's dB so the control surface has a single knob; the codec's ALSA
   control stays at 0 dB (the driver's attenuate-only default).
+  - **Revised 2026-11-20 (M2 bench):** the Pi-DAC+ measured ~16 dB louder
+    than the jack at the same cliamp level — not a quirk but the full-scale
+    difference between the output stages: 2.0 V RMS line out (the figure
+    above) against the Pi jack's filtered-PWM ~0.3 V. The codec's 'Digital'
+    control now carries a fixed trim closing exactly that gap,
+    `STREAMER_DAC_GAIN=-16` in `streamer.conf`, pinned by `streamer-daemon`
+    at every start (the codec wakes at 0 dB each power-on; the pin is
+    full-scale-then-dB, so a daemon restart cannot stack it). Every cliamp
+    dB — floor, ramp, saved level — then means the same thing on both audio
+    setups. For a person there is still one knob: the trim is a calibration
+    constant under the player, not a second control surface — verified on
+    the card: −16.00 dB reads back after boot and after a daemon restart,
+    boot-play resumes at the saved −20 dB. Attenuating in the codec's
+    digital engine is also the dithered path this bullet's open question
+    points at, so it survives even if that answer goes the other way.
   - **Open bench question:** is cliamp's dB applied in software, at what
     sample format, dithered? Undithered software attenuation to 16-bit pins
     a hiss floor near −96 dBFS, ~6 dB above this amp's residual noise, and

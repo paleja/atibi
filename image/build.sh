@@ -584,6 +584,12 @@ for script in "$R"/usr/local/bin/*; do
             die "$(basename "$script") names an unexpected interpreter: $shebang" ;;
     esac
 done
+# The same reaching check for the one base-image tool a payload script calls:
+# streamer-daemon trims the DAC's codec volume with amixer, from alsa-utils.
+# Absent it, the daemon's trim fails silently every boot and the board plays
+# at 0 dB while every knob says otherwise.
+[ -x "$R/usr/bin/amixer" ] ||
+    die "streamer-daemon trims the codec with amixer, which this base image does not ship"
 # The factory-reset template, the same directories the filesystem above was
 # made from. It sits on the read-only root, owned by the appliance user, so that
 # `cp -a` of it onto /data lands with the ownership the player needs. The path
@@ -916,8 +922,10 @@ sed -i '/^h \/var\/log\/journal/d' "$R/usr/lib/tmpfiles.d/journal-nocow.conf"
 #     state, so every card logs a failed restore - plus two level-err lines
 #     for a GOTO label missing from the vendor file itself. udev reads only
 #     the highest-priority file with a given basename, so an empty file in
-#     /etc turns the whole rule off. Nothing on this appliance touches
-#     alsactl or amixer: cliamp owns the volume, ramped by streamer-play.
+#     /etc turns the whole rule off. Nothing on this appliance saves or
+#     restores a card state through alsactl: cliamp owns the playing volume,
+#     ramped by streamer-play, and streamer-daemon pins the DAC's codec trim
+#     with amixer directly at every start rather than through a stored state.
 install -d "$R/etc/udev/rules.d"
 : >"$R/etc/udev/rules.d/90-alsa-restore.rules"
 # netplan generate runs at boot and warns about every config file it reads

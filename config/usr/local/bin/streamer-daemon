@@ -15,6 +15,33 @@ set -eu
 PATH=/data/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
+# A fixed trim on the DAC's own codec volume, which comes back at 0 dB every
+# power-on. Full scale first, then the trim in dB, so the figure means the
+# same thing every start: the codec keeps its level across a daemon restart,
+# and only an absolute setting cannot stack up. The card is hunted for by the
+# control it has, not assumed by number: on the analog jack setup there is no
+# 'Digital' control anywhere, and that card is left alone.
+gain=${STREAMER_DAC_GAIN:-}
+case $gain in ''|0) gain= ;; esac
+if [ -n "$gain" ]; then
+    card=0
+    while [ "$card" -lt 8 ]; do
+        if amixer -c "$card" scontrols 2>/dev/null |
+                grep -q "^Simple mixer control 'Digital',"; then
+            trim="${gain#-}dB"
+            case $gain in -*) trim="$trim-" ;; *) trim="$trim+" ;; esac
+            if amixer -q -c "$card" sset 'Digital' 100% >/dev/null 2>&1 &&
+               amixer -q -c "$card" sset 'Digital' "$trim" >/dev/null 2>&1; then
+                echo "codec volume on card $card pinned to $gain dB"
+            else
+                echo "card $card has a codec volume that refused the $gain dB trim" >&2
+            fi
+            break
+        fi
+        card=$((card + 1))
+    done
+fi
+
 # Start at the boot floor. If anything reaches the speakers before
 # streamer-play runs, it cannot be louder than that.
 exec cliamp --daemon \
