@@ -924,7 +924,8 @@ a{color:var(--acc)}
 </main><script>
 const FROM_URL=new URLSearchParams(location.search).get('token')||'';
 let TOKEN='',playing=false,tick=0,pos=0,dur=0,timer=null;
-let snap={},qrows=[],qplay=null;
+let snap={},qrows=[],qplay;    // qplay: the list whose rows are on screen.
+                               // Undefined means nothing has been fetched yet.
 const $=id=>document.getElementById(id);
 function setToken(t){
   // The token goes into localStorage only once the card has accepted it: a typo
@@ -991,13 +992,15 @@ function render(s){
   const shown=(m.kind==='track'&&(m.title||''))?m.title:(m.target||'(default)');
   $('intent').textContent=(lbl[m.kind]||'')+svc+shown+(m.volume?(' at '+m.volume+' dB to start with'):' (level not saved)');
   mark();
-  // A different list loaded under us - another phone, the browse tab, a reboot -
-  // means the rows being held are the wrong list, so fetch the new one. The
-  // green row alone would follow the track, but the numbers would lie.
-  if(!$('now').classList.contains('hidden')&&(s.playlist||null)!==qplay){
-    qplay=s.playlist||null;loadQueue();
-  }
+  // The rows being shown are only honest if they are the list being played, so
+  // they are fetched whenever that changes: another phone, the browse tab, a
+  // reboot, and the first status answer after a refresh, where nothing has been
+  // fetched yet. A list from a streaming service has no name in the status -
+  // the player answers with no playlist key at all - so the number of rows
+  // rides along in the identity: same name and same count means the same list.
+  if(!$('now').classList.contains('hidden')&&listkey(s)!==qplay)loadQueue();
 }
+function listkey(s){return (s.playlist||'')+'|'+(s.total===undefined?'':s.total);}
 function paintBar(){if(dur>0)$('p').style.width=Math.min(100,100*tick/dur)+'%';}
 async function poll(){
   if(document.hidden)return;
@@ -1085,9 +1088,14 @@ async function radioSave(){
   $('radio-go').classList.add('hidden');
 }
 async function loadQueue(){
+  // The list these rows are for is named before the wait, not after: if a
+  // different list loads while this one is being read, the next poll sees the
+  // mismatch and fetches again. A failed read puts it back to undefined, so the
+  // next poll retries instead of leaving an empty list until something is
+  // clicked.
+  qplay=listkey(snap);
   const d=await api('/api/queue');const ul=$('queue');ul.innerHTML='';qrows=[];
-  if(!d.ok){fail(d.error);return;}
-  qplay=snap.playlist||null;
+  if(!d.ok){qplay=undefined;fail(d.error);return;}
   // Every row, not a slice of the first few: the row being played has to be
   // findable in green, and a list cut short can hide it. The number shown is the
   // row's own index — the figure /api/queue/play takes back — and a row that
