@@ -384,7 +384,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/queue":
             res = ipc_op("queue.list", {"limit": 200})
-            self._json_out({"ok": True, "tracks": res.get("tracks", [])})
+            # The row index the player says it is on comes back too: that is
+            # what numbers the list and what marks the row it is playing now.
+            self._json_out({"ok": True, "tracks": res.get("tracks", []),
+                            "index": res.get("index"), "total": res.get("total")})
             return
         self._json_out({"ok": False, "error": "not found"}, 404)
 
@@ -443,6 +446,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 "error": "url must be http(s)"}, 400)
                 return
             ipc_op("url.load", {"path": url, "play": True})
+            self._json_out({"ok": True})
+            return
+        if path == "/api/queue/play":
+            # Tapping a row of the live list: queue.play takes the row's index,
+            # and the player jumps to it. Verified on the card against 2.4.1:
+            # the job succeeds and the snapshot's index and track follow the row
+            # asked for, so the page's number and the player's agree.
+            try:
+                row = int(body.get("index"))
+            except (TypeError, ValueError):
+                self._json_out({"ok": False, "error": "index must be a row number"}, 400)
+                return
+            if row < 0:
+                self._json_out({"ok": False, "error": "index must be a row number"}, 400)
+                return
+            # No intent written down here, on purpose. This row belongs to a
+            # list that is already the boot intent - it was remembered when it
+            # was loaded - and the position within it is not something the
+            # appliance records. Tapping a track is not a new boot intent.
+            ipc_op("queue.play", {"index": row})
             self._json_out({"ok": True})
             return
         if path == "/api/play":
@@ -568,9 +591,21 @@ input[type=range]{flex:1;accent-color:var(--acc)}
 ul{list-style:none;margin:0;padding:0}
 li{display:flex;justify-content:space-between;gap:10px;align-items:center;
 padding:10px 4px;border-bottom:1px solid #232b35}
-li .what{min-width:0}
+/* The text block takes the width the number and any button leave over. Without
+   flex:1 it shrinks to its own content and the flex row's space-between pushes
+   it to the right edge - every title right-aligned, which is what a playlist
+   row (number, text, no button) looked like on screen. */
+li .what{min-width:0;flex:1}
 li b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 li small{color:var(--dim)}
+/* A playlist row is a control: tapping it asks the player to start that row.
+   The number is the row's own index, the same figure /api/queue/play takes. */
+li.tap{cursor:pointer}
+li.tap:active{background:#232b35}
+li .num{color:var(--dim);font-size:14px;min-width:2.2em;text-align:right;
+font-variant-numeric:tabular-nums}
+/* The row being played gets the same green as the tab that says playing. */
+li.cur b,li.cur .num{color:var(--acc)}
 .dim{color:var(--dim)}
 .err{color:var(--bad);min-height:20px;font-size:14px}
 .bar{height:4px;background:#232b35;border-radius:2px;margin:8px 0}
@@ -613,7 +648,8 @@ a{color:var(--acc)}
  <div class="row" style="margin-top:8px">
   <button onclick="intentStation()">play this again after a reboot</button>
  </div>
- <h1 style="margin-top:14px">queue</h1>
+ <h1 style="margin-top:14px">playlist</h1>
+ <div class="dim" style="margin-top:2px">tap a track to start it — the green row is what is playing.</div>
  <ul id="queue"></ul>
 </div>
 
@@ -637,6 +673,7 @@ let TOKEN=new URLSearchParams(location.search).get('token')||localStorage.getIte
 if(new URLSearchParams(location.search).get('token'))localStorage.setItem('streamer-token',TOKEN);
 if(!TOKEN)TOKEN=prompt('card token (from: sudo cat /data/streamer/http.token)')||'';
 let playing=false,tick=0,pos=0,dur=0,timer=null;
+let snap={},qrows=[],qplay=null;
 const $=id=>document.getElementById(id);
 async function api(path,body){
   const opt=body?{method:'POST',headers:{'Content-Type':'application/json','X-Token':TOKEN},body:JSON.stringify(body)}
@@ -649,6 +686,7 @@ function fail(m){$('err').textContent=m||'';if(m)setTimeout(()=>{if($('err').tex
 function op(name){api('/api/op/'+name,{}).then(d=>{if(!d.ok)fail(d.error);poll();});}
 function setVol(){api('/api/op/volume',{value:Number($('v').value)}).then(d=>{if(!d.ok)fail(d.error);poll();});}
 function render(s){
+  snap=s;
   const t=s.track||s.logical_track||{};
   $('t').textContent=t.title||'nothing playing';
   $('s').textContent=[t.artist,t.station&&('· '+t.station),s.playlist&&('· '+s.playlist)].filter(Boolean).join(' ');
@@ -661,6 +699,13 @@ function render(s){
   const svc=m.kind in lbl&&m.kind!=='playlist'?(m.provider||'?')+': ':'';
   const shown=(m.kind==='track'&&(m.title||''))?m.title:(m.target||'(default)');
   $('intent').textContent=(lbl[m.kind]||'')+svc+shown+(m.volume?(' at '+m.volume+' dB to start with'):' (level not saved)');
+  mark();
+  // A different list loaded under us - another phone, the browse tab, a reboot -
+  // means the rows being held are the wrong list, so fetch the new one. The
+  // green row alone would follow the track, but the numbers would lie.
+  if(!$('now').classList.contains('hidden')&&(s.playlist||null)!==qplay){
+    qplay=s.playlist||null;loadQueue();
+  }
 }
 function paintBar(){if(dur>0)$('p').style.width=Math.min(100,100*tick/dur)+'%';}
 async function poll(){
@@ -713,15 +758,41 @@ async function doSearch(){
   }
 }
 async function loadQueue(){
-  const d=await api('/api/queue');const ul=$('queue');ul.innerHTML='';
-  if(!d.ok)return;
-  for(const t of d.tracks.slice(0,30)){
+  const d=await api('/api/queue');const ul=$('queue');ul.innerHTML='';qrows=[];
+  if(!d.ok){fail(d.error);return;}
+  qplay=snap.playlist||null;
+  // Every row, not a slice of the first few: the row being played has to be
+  // findable in green, and a list cut short can hide it. The number shown is the
+  // row's own index — the figure /api/queue/play takes back — and a row that
+  // answers without one sits at its own position, which is the order queue.list
+  // returns.
+  for(const[i,t]of(d.tracks||[]).entries()){
+    const idx=Number.isInteger(t.index)?t.index:i;
     const li=document.createElement('li');
-    li.innerHTML=`<div class="what"><b></b><small></small></div>`;
+    li.className='tap';li.dataset.idx=idx;li.dataset.path=t.path||'';
+    li.innerHTML=`<span class="num"></span><div class="what"><b></b><small></small></div>`;
+    li.querySelector('.num').textContent=idx+1;
     li.querySelector('b').textContent=t.title||t.path||'';
-    li.querySelector('small').textContent=[t.artist,t.station].filter(Boolean).join(' · ');
-    ul.append(li);
+    li.querySelector('small').textContent=[t.artist,t.album,t.station].filter(Boolean).join(' · ');
+    li.onclick=()=>api('/api/queue/play',{index:idx}).then(r=>{if(!r.ok)fail(r.error);poll();});
+    ul.append(li);qrows.push(li);
   }
+  mark();
+}
+function mark(){
+  // Which row to light up: the track the player says it is playing, and as a
+  // fallback the index it reports. Most of the time they agree. Verified on the
+  // card 2026-11-20 that they need not - right after a boot-time provider.load,
+  // the index was 5 while the track being played sat at row 0, a restored
+  // session's place against a freshly ordered list. So the track decides when it
+  // can, and only when it cannot does the index get its turn: one green row.
+  for(const r of qrows)r.classList.remove('cur');
+  const t=snap.track||snap.logical_track||{};
+  const path=String(t.path||'');
+  let lit=false;
+  if(path)for(const r of qrows)if(r.dataset.path===path){r.classList.add('cur');lit=true;}
+  if(!lit&&Number.isInteger(snap.index))for(const r of qrows)
+    if(Number(r.dataset.idx)===snap.index)r.classList.add('cur');
 }
 function intentStation(){
   api('/api/status').then(s=>{
