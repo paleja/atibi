@@ -6,6 +6,8 @@ being unplugged without warning.
 
 - Requirements and design decisions: [docs/PRD.md](docs/PRD.md)
 - Repo layout and how to work on this codebase: [AGENTS.md](AGENTS.md)
+- License: MIT ([LICENSE](LICENSE)); what the finished card also carries from
+  others: [docs/THIRD-PARTY.md](docs/THIRD-PARTY.md)
 
 Everything that has to be true when the card boots is written into the image at
 build time: no setup script, no resizing at boot, no first-run step. The card
