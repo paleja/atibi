@@ -812,7 +812,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/intent":
             # Straight to the streamer command: the only sanctioned writer of
-            # the intent file, sudo escalation and boot.log entry included.
+            # the intent file, sudo escalation and boot.log entry included. The
+            # --save below is what makes a verb that plays also record: without
+            # it, it plays and says nothing about the next boot.
             kind = body.get("kind")
             target = str(body.get("target", ""))
             if kind == "station":
@@ -820,12 +822,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self._json_out({"ok": False,
                                     "error": "station target must be http(s)"}, 400)
                     return
-                out = run_streamer("station", target)
+                out = run_streamer("station", "--save", target)
             elif kind == "playlist":
                 if not target:
                     self._json_out({"ok": False, "error": "playlist name required"}, 400)
                     return
-                out = run_streamer("playlist", target)
+                out = run_streamer("playlist", "--save", target)
             elif kind == "mode":
                 if target not in ("last", "stop"):
                     self._json_out({"ok": False, "error": "mode last|stop"}, 400)

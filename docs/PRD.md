@@ -315,7 +315,8 @@ gets corruptable itself mid-overlay-writeback):
 ### 8.1 Radio
 - Radio Browser directory + custom stations. Nothing baked: the box starts
   from one default station (`STREAMER_START_TARGET` in `/etc/streamer.conf`)
-  and `streamer station <url>` records what you actually want, on `/data`.
+  and `streamer station <url> --save` records what you actually want, on `/data`;
+  without `--save` that command only plays.
   The built-in list is fetched, not duplicated in the image, so the two
   cannot drift.
 - `yt-dlp` is **excluded from the Pi 4 image**: slow on Cortex-A72, the
@@ -349,17 +350,23 @@ gets corruptable itself mid-overlay-writeback):
 - cliamp's own resume state is not enough: a headless radio start bypasses
   it, so the appliance keeps its own record on `/data` and replays it
   through IPC.
-- **Saved on change, not on a timer.** Every surface that changes intent —
-  `streamer play/station/playlist/remember/mode/stop/vol/up/down` and the
-  web page's equivalents — rewrites the whole record, carrying over
-  arguments it was not given: turning the level down cannot forget the
-  station, choosing a station cannot forget the level. The old periodic
+- **Saved on change, not on a timer.** The surfaces that decide what plays next
+  boot — `streamer remember`, `--save` on `play/station/playlist/album/track`,
+  `streamer mode/stop`, the level commands `vol`/`up`/`down`, and the web page's
+  boot tab — rewrite the whole record, carrying over arguments they were not
+  given: turning the level down cannot forget the station, choosing a station
+  cannot forget the level. A play command without `--save` plays and writes
+  nothing: its target rides in `/run/streamer/play-now` (tmpfs), which the play
+  unit reads, plays and unlinks. The old periodic
   writer (one-minute timer, position and index) is gone: it bought a detail
   nobody asked for at the cost of a unit, a timer and a boot that resumed
   in the middle of things.
 - The level is read back **from the player**, not recorded from what was
   asked for: the value cliamp settled at is the one the next boot should
-  aim at.
+  aim at. `streamer remember` re-reads it together with the source — the
+  Omarchy panel sets cliamp's dB over the socket, outside the appliance — and
+  a level at or below the boot floor counts as parked, so the saved one
+  carries on.
 - **Provider playlists are a first-class kind** (`kind=provider`,
   `provider=`, bare list id), fetched at boot through
   `provider.load` — `cliamp load` only resolves playlists saved on the
@@ -402,8 +409,9 @@ gets corruptable itself mid-overlay-writeback):
 One command, its own help text is the reference. Groups: transport
 (`play/pause/toggle/next/prev/stop`); level (`vol <dB>`, `up/down <N>` — all
 through cliamp's dB, all recorded for the next boot); what to play
-(`station <url>`, `playlist <name>` or `<provider>:<id>`, `stations`, `last`,
-`mode last|stop`, `remember <what> <target>`); diagnostics (`status`, `log`,
+(`station <url>`, `playlist <name>` or `<provider>:<id>`, `album`, `track` —
+each with `--save` to make it next boot's too — `stations`, `last`, `mode
+last|stop`, `remember <what> <target>`); diagnostics (`status`, `log`,
 `boots`); maintenance (`reload`, `audio [jack|dac]`, `rw`/`ro`,
 `reset --yes`). The privileged ones re-run under sudo via a passwordless
 sudoers drop-in the build ships.

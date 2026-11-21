@@ -10,11 +10,12 @@
 #   streamer next | prev        skip
 #   streamer vol -12            set the level to -12 dB, next boot too
 #   streamer up 3 | down 3      move the level by N dB, next boot too
-#   streamer station <url>      play this stream from now on, next boot too
-#   streamer playlist <name>    play a saved cliamp playlist from now on
-#   streamer playlist tidal:ID  play a streaming service playlist, next boot too
+#   streamer station <url>      play this stream now
+#   streamer playlist <name>    play a saved cliamp playlist now
+#   streamer playlist tidal:ID  play a streaming service playlist now
 #   streamer album tidal:ID     play an album from a streaming service
 #   streamer track tidal:ID     play one track from a streaming service
+#                               --save on those four: this one plays next boot too
 #   streamer remember <what> <target>
 #                               next boot only, without touching what plays now
 #   streamer stations           list the built-in radio endpoints
@@ -29,6 +30,8 @@
 set -eu
 
 . /etc/streamer.conf
+# A card flashed before this knob existed keeps the same default path.
+STREAMER_PLAY_NOW=${STREAMER_PLAY_NOW:-/run/streamer/play-now}
 
 usage() { # the command list at the top of this file, which is its own help text
     awk 'NR == 1 { next } /^set -eu/ { exit } { sub(/^# ?/, ""); print }' "$0"
@@ -89,6 +92,40 @@ save_state() { # save_state <mode> <kind> <target> [provider] [volume] [title] [
     /usr/local/bin/streamer-bootlog "intent set: mode=$mode kind=$kind target=$cur${provider:+ provider=$provider}${cur_vol:+ volume=$cur_vol}${t_title:+ title=$t_title}"
 }
 
+# This session's play request, when the command was not given --save: the same
+# key=value shape as the state record, on tmpfs, so a reboot cannot find it. The
+# directory belongs to the daemon's account because streamer-play (User=pi) reads
+# the file and unlinks it; the command that writes it re-ran under sudo.
+request_play() { # request_play <kind> <target> [provider] [title] [artist] [album]
+    dir=${STREAMER_PLAY_NOW%/*}
+    mkdir -p "$dir" && chown "$STREAMER_USER:$STREAMER_GROUP" "$dir" && chmod 770 "$dir"
+    r_target=$(printf '%s' "$2" | tr -d '\n\r')
+    r_provider=$(printf '%s' "${3:-}" | tr -d '\n\r')
+    r_title=$(printf '%s' "${4:-}" | tr -d '\n\r')
+    r_artist=$(printf '%s' "${5:-}" | tr -d '\n\r')
+    r_album=$(printf '%s' "${6:-}" | tr -d '\n\r')
+    tmp="$STREAMER_PLAY_NOW.tmp"
+    {
+        printf 'kind=%s\ntarget=%s\n' "$1" "$r_target"
+        [ -n "$r_provider" ] && printf 'provider=%s\n' "$r_provider"
+        [ -n "$r_title" ] && printf 'title=%s\n' "$r_title"
+        [ -n "$r_artist" ] && printf 'artist=%s\n' "$r_artist"
+        [ -n "$r_album" ] && printf 'album=%s\n' "$r_album"
+        true
+    } >"$tmp"
+    chmod 660 "$tmp"
+    mv -f "$tmp" "$STREAMER_PLAY_NOW"
+    sync
+}
+
+# One start of the play unit, whichever record it was asked for. When the command
+# saved the choice instead of only asking for it, any older one-shot request goes
+# first: the play unit reads that file in preference to the record.
+start_play() { # the play-unit restart shared by the four play verbs
+    [ "$do_save" = 1 ] && rm -f "$STREAMER_PLAY_NOW"
+    systemctl restart streamer-play.service
+}
+
 playlist_target() { # playlist_target <name | provider:id>
     # Splits into pl_kind, pl_name, pl_provider. A bare name is a playlist cliamp
 # saved on disk, loaded with `cliamp load`; provider:id is the spelling cliamp
@@ -126,9 +163,15 @@ json_num() { # key's number, sign included: last hit wins, keys repeat
         sed -n "s/.*\"$2\": *\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" | tail -n 1
 }
 
-save_level() { # record the level the player is actually at, after a change
+player_level() { # the level the player is actually at, empty if it said nothing
     lvl=$(json_num "$(cliamp status --json 2>/dev/null || true)" volume)
     case "$lvl" in ''|*[!0-9.-]*) return 0 ;; esac
+    printf '%s\n' "$lvl"
+}
+
+save_level() { # record the level the player is actually at, after a change
+    lvl=$(player_level)
+    [ -n "$lvl" ] || return 0
     [ "$lvl" = "$cur_vol" ] && return 0
     save_state "$mode" "$kind" "$cur" "$provider" "$lvl"
 }
@@ -155,6 +198,26 @@ if [ "$(id -u)" != 0 ] && needs_root "$cmd" "${1:-}" && [ -z "${STREAMER_SUDO:-}
     STREAMER_SUDO=1 exec sudo -E "$0" "$cmd" "$@"
 fi
 
+# `--save` decides whether a play command also records what plays next boot; it
+# may sit anywhere among the arguments. Stripping it after the sudo pass means
+# both passes see the same arguments and the verbs keep their ${1:?} usages.
+do_save=0
+case "$cmd" in
+    station | playlist | album | track)
+        i=$#
+        while [ "$i" -gt 0 ]; do
+            a=$1
+            shift
+            if [ "$a" = --save ]; then
+                do_save=1
+            else
+                set -- "$@" "$a"
+            fi
+            i=$((i - 1))
+        done
+        ;;
+esac
+
 case "$cmd" in
     status)
         cliamp status
@@ -179,34 +242,63 @@ case "$cmd" in
         printf 'boot mode: %s\n' "${1:-$mode}"
         ;;
     play)
+        # Replay what the listener saved: any play request that was only for this
+        # session is dropped along the way.
+        rm -f "$STREAMER_PLAY_NOW" || true
         save_state last "$kind" "$cur"
         systemctl restart streamer-play.service
         ;;
     station)
-        url=${1:?usage: streamer station <url>}
-        save_state last url "$url" ""
-        systemctl restart streamer-play.service
+        url=${1:?usage: streamer station <url> [--save]}
+        if [ "$do_save" = 1 ]; then
+            save_state last url "$url" ""
+        else
+            request_play url "$url"
+        fi
+        start_play
         ;;
     playlist)
-        playlist_target "${1:?usage: streamer playlist <name> | <provider>:<id>}"
-        save_state last "$pl_kind" "$pl_name" "$pl_provider"
-        systemctl restart streamer-play.service
+        playlist_target "${1:?usage: streamer playlist <name> | <provider>:<id> [--save]}"
+        if [ "$do_save" = 1 ]; then
+            save_state last "$pl_kind" "$pl_name" "$pl_provider"
+        else
+            request_play "$pl_kind" "$pl_name" "$pl_provider"
+        fi
+        start_play
         ;;
     album)
-        provider_target album "${1:?usage: streamer album <provider>:<id>}"
-        save_state last album "$pt_id" "$pt_provider"
-        systemctl restart streamer-play.service
+        provider_target album "${1:?usage: streamer album <provider>:<id> [--save]}"
+        if [ "$do_save" = 1 ]; then
+            save_state last album "$pt_id" "$pt_provider"
+        else
+            request_play album "$pt_id" "$pt_provider"
+        fi
+        start_play
         ;;
     track)
-        provider_target track "${1:?usage: streamer track <provider>:<id> [title] [artist] [album]}"
+        provider_target track "${1:?usage: streamer track <provider>:<id> [title] [artist] [album] [--save]}"
         # The strings only decide what "now playing" shows after the boot.
-        save_state last track "$pt_id" "$pt_provider" "$cur_vol" "${2:-}" "${3:-}" "${4:-}"
-        systemctl restart streamer-play.service
+        if [ "$do_save" = 1 ]; then
+            save_state last track "$pt_id" "$pt_provider" "$cur_vol" "${2:-}" "${3:-}" "${4:-}"
+        else
+            request_play track "$pt_id" "$pt_provider" "${2:-}" "${3:-}" "${4:-}"
+        fi
+        start_play
         ;;
     remember)
         # Next boot only, without touching playback: a tapped playlist already started
 # the music, and `streamer playlist` on top would restart the boot sequence
 # from the floor mid-track.
+        # The level is captured with the source, read back from the player: the
+        # Omarchy bar panel drives cliamp's dB directly, so a level moved there
+        # reaches the record at this capture rather than never. A level at or
+        # below the boot floor is a parked control, not a preference: then the
+        # saved one carries on.
+        lvl=$(player_level)
+        if [ -n "$lvl" ] && ! awk -v l="$lvl" -v f="$STREAMER_VOL_FLOOR" \
+            'BEGIN{ exit (l+0 <= f+0) ? 0 : 1 }'; then
+            cur_vol=$lvl
+        fi
         what=${1:?usage: streamer remember <station|playlist|album|track|mode> <target>}
         case "$what" in
             station)
@@ -257,7 +349,7 @@ case "$cmd" in
         else
             echo "could not read $STREAMER_STATION_LIST" >&2
         fi
-        echo "then: streamer station <url>"
+        echo "then: streamer station <url> [--save]"
         ;;
     stop)
         cliamp stop || true

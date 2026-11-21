@@ -94,17 +94,22 @@ Break one of these and a test should say so.
 
 - `/data/streamer/state` (`mode`/`kind`/`target`, plus `provider=`/`volume=`)
   has exactly one writer: the `streamer` command, when a person changes something.
-  The HTTP server shells out to it and never writes the record itself; on the
-  page only the "use the now playing" button (`/api/boot/now` → `streamer
-  remember`) and the explicit `station|playlist|mode` call (`/api/intent`) reach
-  it. Saved on change, never on a timer — that is what keeps it an intent, and
-  what keeps the floor, the ramp and boot.log unavoidable.
-- Only `streamer-play` starts audio. The daemon holds the IPC socket and sits
-  at the floor; the ramp and its three guards (a level that will not move, a
-  step budget that fits the boot budget, a level set elsewhere winning over the
-  boot's own climb) live in that script.
+  What plays next boot is decided only by `streamer remember` — the page reaches
+  it through the boot tab's "use the now playing" button (`/api/boot/now` →
+  `streamer remember`) and through `/api/intent`, which passes `--save` — and by
+  `--save` on `station|playlist|album|track`. Without `--save` those four play and
+  write nothing to the card: the request rides in `$STREAMER_PLAY_NOW`, a
+  key=value file under `/run` (tmpfs), which the play unit reads, plays and
+  unlinks. Saved on change, never on a timer — that is what keeps it an intent,
+  and what keeps the floor, the ramp and boot.log unavoidable.
+- Only `streamer-play` starts audio, the saved record and the one-shot request
+  both included: the daemon holds the IPC socket and sits at the floor, and the
+  ramp and its three guards (a level that will not move, a step budget that fits
+  the boot budget, a level set elsewhere winning over the boot's own climb) live
+  in that script.
 - The level is read back from the player, never recorded from what was asked
-  for: what cliamp settled at is what the next boot aims at.
+  for: what cliamp settled at is what the next boot aims at. `streamer remember`
+  re-reads it along with the source.
 - `streamer remember <what> <target>` records intent without touching playback:
   a tapped playlist has already started the music, and a plain play command on
   top would mean a second start and a trip back to the floor mid-track.

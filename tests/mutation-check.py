@@ -272,7 +272,7 @@ MUTATIONS = [
      "if False:",
      "a non-http url.load is refused too"),
     ("the intent route skips the sanctioned writer", HTTP,
-     'out = run_streamer("station", target)',
+     'out = run_streamer("station", "--save", target)',
      'out = ""',
      "the intent file says the new station plays next boot"),
     ("the page sets the level on the player only, so the next boot does not know it", HTTP,

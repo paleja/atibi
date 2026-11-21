@@ -5,6 +5,8 @@
 set -eu
 
 . /etc/streamer.conf
+# A card flashed before this knob existed keeps the same default path.
+STREAMER_PLAY_NOW=${STREAMER_PLAY_NOW:-/run/streamer/play-now}
 
 log_boot() { # log_boot <one line>
     /usr/local/bin/streamer-bootlog "$1"
@@ -29,6 +31,26 @@ fi
 [ -n "$mode" ] || mode=last
 [ -n "$kind" ] || kind=url
 case "$saved_vol" in ''|*[!0-9.-]*) saved_vol= ;; esac
+
+# A play request for this session only: `streamer station <url>` without --save
+# wrote it to tmpfs, so a reboot cannot find it and it says nothing about what the
+# next boot loads. It wins over the saved record for this start, and an explicit
+# request plays even in stop mode, which means quiet after the next boot.
+req_last() { sed -n "s/^$1=//p" "$STREAMER_PLAY_NOW" 2>/dev/null | tail -n 1; }
+ad_hoc=""
+if [ -f "$STREAMER_PLAY_NOW" ]; then
+    ad_kind=$(req_last kind)
+    ad_target=$(req_last target)
+    if [ -n "$ad_kind" ] && [ -n "$ad_target" ]; then
+        kind=$ad_kind
+        target=$ad_target
+        provider=$(req_last provider)
+        mode=last
+        ad_hoc=1
+    else
+        echo "one-shot play request names no kind or target: ignoring it" >&2
+    fi
+fi
 [ "$mode" = stop ] && { echo "appliance is in stop mode, staying quiet"; log_boot "stop mode, nothing started"; exit 0; }
 [ -n "$target" ] || { echo "nothing to play" >&2; log_boot "FAIL no target to play"; exit 1; }
 
@@ -204,7 +226,12 @@ case "$kind" in
             # playing" shows, and a track saved without them still plays, unnamed.
             esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
             row="{\"path\":\"$esc_p://track/$esc_t\",\"stream\":true,\"provider_meta\":{\"$esc_p.id\":\"$esc_t\"}"
-            t_title=$(last title); t_artist=$(last artist); t_album=$(last album)
+            # Whichever record this start was asked for holds the strings.
+            if [ -n "$ad_hoc" ]; then
+                t_title=$(req_last title); t_artist=$(req_last artist); t_album=$(req_last album)
+            else
+                t_title=$(last title); t_artist=$(last artist); t_album=$(last album)
+            fi
             if [ -n "$t_title" ]; then row="$row,\"title\":\"$(esc "$t_title")\""; fi
             if [ -n "$t_artist" ]; then row="$row,\"artist\":\"$(esc "$t_artist")\""; fi
             if [ -n "$t_album" ]; then row="$row,\"album\":\"$(esc "$t_album")\""; fi
@@ -254,6 +281,11 @@ while :; do
     }
     sleep 0.5
 done
+
+# The request is spent: a later restart of this unit goes back to what the
+# listener saved. It is kept when the start failed, so the unit's own retry
+# replays the same request rather than a different thing.
+[ -n "$ad_hoc" ] && rm -f "$STREAMER_PLAY_NOW"
 
 # Where the ramp ends: the level the last session left, or the configured default,
 # clamped - the floor has to be the last word, so a stale level can never make
@@ -322,5 +354,9 @@ while :; do
     sleep "$STREAMER_RAMP_DELAY"
 done
 
-echo "playing $kind:$target at $now dB (target $level dB, floor $STREAMER_VOL_FLOOR dB)"
-log_boot "OK $kind $target at $now dB (target $level)"
+# A one-shot start says so in the history: boot.log reads as the box's history,
+# and this line is not a choice the listener made about the next boot.
+one_shot=""
+[ -n "$ad_hoc" ] && one_shot=" (this boot only)"
+echo "playing $kind:$target at $now dB (target $level dB, floor $STREAMER_VOL_FLOOR dB)$one_shot"
+log_boot "OK $kind $target at $now dB (target $level)$one_shot"
