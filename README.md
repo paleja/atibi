@@ -1,10 +1,10 @@
-# rpi-atibi
+# atibi
 
-Purpose-built Raspberry Pi appliance image: a music atibi (cliamp on a Pi 4
-with an I2S DAC HAT) that comes back playing whatever was going when the power
-was pulled, and survives being unplugged without warning.
+Purpose-built Raspberry Pi appliance image: a music streamer (cliamp on a Pi 4
+with an I2S DAC HAT) that comes back playing the chosen source, and survives 
+being unplugged without warning.
 
-- Product requirements and design decisions: [docs/PRD.md](docs/PRD.md)
+- Requirements and design decisions: [docs/PRD.md](docs/PRD.md)
 - Repo layout and how to work on this codebase: [AGENTS.md](AGENTS.md)
 
 Everything that has to be true when the card boots is written into the image at
@@ -68,7 +68,7 @@ card you built.
     ssh -i <key> pi@atibi.local
     cliamp --provider tidal   # first time only: visit the printed URL, enter the code
 
-Credentials land on `/data` and survive anything done to the read-only root.
+Credentials land on `/data`.
 
 ## Using it
 

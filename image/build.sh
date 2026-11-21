@@ -524,6 +524,9 @@ for script in "$CONFIG"/usr/local/bin/*; do
     [ -f "$script" ] || continue
     install -m 755 "$script" "$R/usr/local/bin/$(basename "$script")"
 done
+# The page's mark: an .ico and an .svg next to the scripts that serves them
+install -d -m 755 "$R/usr/local/share/atibi"
+cp -a "$CONFIG/usr/local/share/atibi/." "$R/usr/local/share/atibi/"
 # The payload's shared library: one implementation of the knobs, the record,
 # the player's socket and boot.log, in the directory the card's own interpreter
 # looks in first. The version in that path is a fact about the base image, so
@@ -1045,6 +1048,10 @@ nm_key=$(debugfs -R 'ls -l /var/lib/NetworkManager' "${LOOP}p2" 2>/dev/null |
 [ "${nm_key:-0}" -eq 1 ] ||
     die "the root filesystem does not hold /var/lib/NetworkManager/secret_key"
 log "  baked-in /var/lib state reads back from the image"
+mark=$(debugfs -R 'ls -l /usr/local/share/atibi' "${LOOP}p2" 2>/dev/null |
+    awk '{ print $NF }' | grep -cx 'favicon.ico' || true)
+[ "${mark:-0}" -eq 1 ] ||
+    die "the root filesystem does not hold /usr/local/share/atibi/favicon.ico"
 
 # The other half of that step: the vendor edits. Reading the shipped files back and
 # looking for the offending lines is the only way to know the seds ran against files still

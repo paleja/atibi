@@ -1,5 +1,5 @@
 ---
-title: "PRD — rpi-atibi"
+title: "PRD — atibi"
 type: prd
 owner: janp
 status: v3 — image built, first card running on the bench
@@ -12,7 +12,7 @@ changelog:
 ## 1. Problem
 
 The listening setup is a power amplifier + speakers with a atibi in front of
-it. Commercial atibis are slow, walled gardens, or overkill. A Raspberry Pi
+it. Commercial streamers are slow, walled gardens, or overkill. A Raspberry Pi
 running `cliamp` covers every wanted source (internet radio, Tidal, local
 files). The remaining problems to engineer around:
 
@@ -120,7 +120,7 @@ From the service manual: line inputs are **150 mV / 50 kΩ** for rated output,
 - **Input selection:** a high-level line input (CD/TUNER/AUX), never PHONO;
   `SOURCE DIRECT` to leave the tone stage flat.
 - **The amp is never the slow device.** Its speaker-protection relay closes
-  in a second or two, long before the Pi's first audio sample exists. The
+  in 5 seconds, long before the Pi's first audio sample exists. The
   real risk is the knob.
 - **Volume is a physical, non-volatile variable.** The pot keeps its position
   through a hard power cut, so switch-on level equals wherever the knob was

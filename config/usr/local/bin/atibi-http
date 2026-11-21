@@ -32,6 +32,7 @@ Environment overrides (used by the test suite; systemd sets none):
   ATIBI_HTTP_TOKEN token file path        (default atibi.conf, then <data>/atibi/http.token)
   ATIBI_CLIAMP_SOCKET  the daemon socket  (default $HOME/.config/cliamp/cliamp.sock)
   ATIBI_HTTP_PIDFILE   write our pid here (test harness only; setsid detaches)
+  ATIBI_SHARE_DIR    where the icons live (default /usr/local/share/atibi)
   ATIBI_HTTP_TEST_NO_LISTEN  print the config and exit 0 (packaging checks)
   ATIBI_RADIO_SIZE     how many similar songs the radio offers (atibi.conf, then 50)
   ATIBI_TIDAL_CRED     the Tidal login this server borrows (atibi.conf, then <data>/cliamp/tidal_credentials.json)
@@ -60,6 +61,12 @@ from atibi.intent import (NoTarget, parse_target, record_level, record_mode,
                              record_now, record_target)
 
 CONF_PATH_DEFAULT = "/etc/atibi.conf"
+SHARE_DEFAULT = "/usr/local/share/atibi"
+# The mark this page wears, read from the payload at start and served like the
+# page itself - unauthenticated, because an icon carries nothing. A missing
+# asset is a 404 and nothing else changes: the page works without its icon.
+SHARE_DIR = os.environ.get("ATIBI_SHARE_DIR", SHARE_DEFAULT)
+ICON_MIME = {"favicon.ico": "image/x-icon", "favicon.svg": "image/svg+xml"}
 IPC_LOCK = threading.Lock()
 PROVIDERS_CACHE = {"at": 0.0, "data": []}
 # The appliance this server writes through: knobs, record, log and player from
@@ -499,6 +506,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _json_out(self, obj, code=200):
         self._send(code, json.dumps(obj, separators=(",", ":")))
 
+    def _asset(self, path):
+        """One icon file, straight off the payload's share directory."""
+        name = path.lstrip("/")
+        try:
+            with open(os.path.join(SHARE_DIR, name), "rb") as handle:
+                body = handle.read()
+        except OSError:
+            self._send(404, b"")
+            return
+        self._send(200, body, ICON_MIME[name])
+
     def _authorized(self):
         given = self.headers.get("X-Token", "")
         if not given:
@@ -534,6 +552,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             self._send(200, PAGE, "text/html; charset=utf-8")
+            return
+        if path[1:] in ICON_MIME:
+            self._asset(path)
             return
         if not self._authorized():
             self._json_out({"ok": False, "error": "unauthorized"}, 401)
@@ -885,6 +906,8 @@ PAGE = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>atibi</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="any">
 <style>
 :root{color-scheme:dark;--bg:#101418;--card:#1a2028;--fg:#dde3ea;--dim:#7f8b99;
 --acc:#4ec9a0;--bad:#e2655f}
