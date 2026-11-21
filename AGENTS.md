@@ -103,6 +103,13 @@ break one of these and a test should say so:
 - cliamp `status --json` pretty-prints with two-space indent. The fixtures
   answer the same way; extractors that assume compact JSON are a known
   failure mode with a mutation entry guarding it.
+- The IPC snapshot is not the whole player. On cliamp 2.4.1 `cliamp remote
+  state` answers 16 keys and no `volume` among them — checked on the card
+  2026-11-21 — so the level the page shows is read from `cliamp status --json`
+  (`live_volume`), the same source `json_num` in `streamer` and `pick` in
+  `streamer-play` read. `tests/fixtures/fake-ipc.py` leaves `volume` out of
+  its snapshot for the same reason; put it back and the control server is
+  reading a key the card never sends.
 - The payload ships its own tools and reaches for nothing else. Every program
   a unit names, and every interpreter a payload script declares, is checked
   against what the image actually ships.

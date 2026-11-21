@@ -103,6 +103,12 @@ class Config:
             os.path.join(home, ".config", "cliamp", "cliamp.sock"))
         self.streamer = os.environ.get("STREAMER_EXECUTABLE",
                                        "/usr/local/bin/streamer")
+        # The player's own command, for the one thing the IPC snapshot cannot
+        # answer (see live_volume). Absolute rather than looked up: a service
+        # whose PATH nobody controls should not find a different cliamp than
+        # the daemon it is controlling.
+        self.cliamp = os.environ.get("STREAMER_CLIAMP_EXECUTABLE",
+                                     "/usr/local/bin/cliamp")
         self.radio_size = int(os.environ.get(
             "STREAMER_RADIO_SIZE", conf.get("STREAMER_RADIO_SIZE", "50")))
         self.tidal_cred = os.environ.get("STREAMER_TIDAL_CRED") or expand(
@@ -252,6 +258,36 @@ def run_streamer(*args):
     if out.returncode != 0:
         raise IpcError((out.stderr or out.stdout or "streamer failed").strip())
     return (out.stdout or "").strip()
+
+
+# The level the player is at, which the IPC snapshot cannot answer. Verified
+# on the card 2026-11-21: `cliamp remote state` hands back eq_bands, eq_preset,
+# index, logical_track, mono, playlist_revision, position, repeat, revision,
+# seekable, shuffle, speed, state, theme, track, total, visualizer - no
+# volume - while `cliamp status --json` does answer `"volume": 0`. That is the
+# same reading the shell payload uses: `json_num` in the streamer command, `pick`
+# in streamer-play, both of which had to learn that this JSON is pretty-printed
+# (a space may follow the colon) and that one key can be spelled more than once,
+# where the last hit is the appliance's own level rather than a row's. The page
+# asked the snapshot and never got an answer, so its slider sat where a browser
+# puts a range control nobody set: the middle of -50..0, read as about -25 dB
+# over music that was playing at 0.
+VOLUME_KEY = re.compile(r'"volume": *(-?\d+(?:\.\d+)?)')
+
+
+def live_volume():
+    try:
+        out = subprocess.run([CFG.cliamp, "status", "--json"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    hit = VOLUME_KEY.findall(out.stdout or "")
+    if not hit:
+        return None
+    value = float(hit[-1])
+    # Whole numbers stay whole: they are printed next to the word dB, and
+    # "-12.0 dB" on a phone is a decimal nobody asked for.
+    return int(value) if value == int(value) else value
 
 
 def read_intent():
@@ -636,6 +672,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "seekable", "volume", "playlist", "index", "total",
                     "shuffle", "repeat", "stream_error")
             out = {k: snap[k] for k in keep if k in snap}
+            # The level, from the player itself: the snapshot has no such key
+            # (see live_volume). The snapshot's value is left in place when the
+            # player cannot be asked, so the page still shows a level rather
+            # than nothing.
+            vol = live_volume()
+            if vol is not None:
+                out["volume"] = vol
             # Which provider the radio can follow, for the row playing now:
             # the page's radio section is only shown when this names one, so
             # the section cannot offer to queue songs for a file on the card
@@ -1034,7 +1077,7 @@ a{color:var(--acc)}
  </div>
  <div class="row" style="margin-top:10px">
   <span class="dim">vol</span>
-  <input type="range" id="v" min="-50" max="0" step="1" onchange="setVol()">
+  <input type="range" id="v" min="-50" max="0" step="1" value="0" onchange="setVol()">
   <span id="vd" class="dim"></span>
  </div>
  <div class="row" style="margin-top:8px">
@@ -1155,6 +1198,12 @@ function render(s){
   $('s').textContent=[t.artist,t.station&&('· '+t.station),lname&&('· '+lname)].filter(Boolean).join(' ');
   playing=s.state==='playing';$('pp').textContent=playing?'⏸':'▶';
   pos=s.position||0;dur=s.duration||0;
+  // The level is the player's own (see live_volume), and it only ever moves
+  // the thumb when nobody is holding it: a hand on the slider mid-drag is
+  // not a thing to argue with. Before the first answer the thumb sits at 0
+  // - the value the markup gives it, and the level cliamp starts a session
+  // at - rather than at the middle of the range, where a browser puts a
+  // control nobody has set.
   $('vd').textContent=(s.volume===undefined?'':s.volume+' dB');
   if(document.activeElement!==$('v')&&s.volume!==undefined)$('v').value=Math.max(-50,Math.min(0,Math.round(s.volume)));
   const m=s.intent||{};$('mode').textContent=m.mode||'last';

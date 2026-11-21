@@ -61,9 +61,15 @@ def save(d):
 
 
 def snapshot(d):
+    # No "volume" key, and that is not an omission: the real daemon's
+    # `cliamp remote state` answers 16 keys and none of them is the level
+    # (checked on the card 2026-11-21), while its `cliamp status --json` does.
+    # The stand-in used to answer the level over the socket too, which let the
+    # control server read a level the card never gives it - and the page's
+    # slider sat at the middle of its range over music playing at 0 dB.
     return {"revision": 1, "state": d["state"], "track": d["queue"][d["index"]],
             "position": d.get("position", 0), "seekable": False,
-            "volume": d["volume"], "playlist": d.get("playlist", ""),
+            "playlist": d.get("playlist", ""),
             "index": d["index"], "total": len(d["queue"])}
 
 

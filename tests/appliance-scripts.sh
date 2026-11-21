@@ -461,6 +461,7 @@ s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.clos
         STREAMER_HTTP_PIDFILE="$T/http.pid" \
         STREAMER_CLIAMP_SOCKET="$sock" \
         STREAMER_EXECUTABLE="$T/streamer" \
+        STREAMER_CLIAMP_EXECUTABLE="$T/bin/cliamp" \
         setsid "$T/streamer-http" </dev/null >"$T/logs/http.out" 2>&1 &
     i=0
     until http_raw GET / >/dev/null 2>&1; do

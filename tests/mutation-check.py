@@ -279,6 +279,11 @@ MUTATIONS = [
      'self._json_out({"ok": True, "streamer": run_streamer("vol", repr(db))})',
      'self._json_out(self._op("volume", {"value": db}))',
      "and it is the level the next boot will start at"),
+    ("the level the page reads comes from the IPC snapshot, as it did while the"
+     " slider sat at the middle of its range over music at 0 dB", HTTP,
+     '            vol = live_volume()',
+     '            vol = None',
+     "a level set from the phone lands on the player"),
     ("a playlist tapped on the phone becomes the boot target nobody asked "
      "for", HTTP,
      '            ipc_op("provider.load", {"provider": provider, "playlist": pid})',
