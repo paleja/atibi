@@ -1,17 +1,7 @@
 #!/bin/sh
-# streamer-bootlog - append one durable line about this boot.
-#
-# The journal on this appliance is deliberately volatile (see
-# /etc/journald.conf.d/streamer.conf): a journal file on /data would be left
-# dirty at exactly the moment a hard power cut happens. So the scripts that run
-# at boot say what they did here instead, one line per event, on the writable
-# partition. It is append-only and kept to the last STREAMER_BOOTLOG_KEEP lines.
-#
-#   streamer-bootlog <one line>
-#
-# It never fails: a streamer script must not die because its logging did, it must
-# not corrupt the thing it writes, and it must not shout about it either. That
-# log is the only record a boot leaves behind.
+# streamer-bootlog <one line> - one durable line about this boot.
+# journald is volatile on this box, so this file on /data is the only record
+# a boot leaves behind, kept to the last STREAMER_BOOTLOG_KEEP lines.
 set -eu
 
 . /etc/streamer.conf
@@ -20,44 +10,18 @@ umask 022
 dir=$(dirname "$STREAMER_BOOTLOG")
 mkdir -p "$dir" 2>/dev/null || true
 
-# This log is written by two identities: the boot units, which run as
-# STREAMER_USER, and a `streamer` command typed over SSH, which runs as root. A
-# file one of them created is closed to the other, and the one that must not be
-# silenced is the service: its lines are the whole record of a boot. Seen on the
-# card 2026-11-18 - a `streamer ro` typed over SSH made the file root-owned, and
-# every line the service tried to add after that was refused.
-#
-# So the writer puts the file into the boot user's hands whenever it can. Root
-# always can, and root is the only one who needs to: a file the boot user creates
-# is theirs already, and root can write anything.
+# Two identities write this: the units as STREAMER_USER, and a `streamer`
+# typed over SSH as root. Whichever made the file closes it to the other, so
+# the writer hands the file back to the boot user when it can.
 if [ -e "$STREAMER_BOOTLOG" ] && [ ! -w "$STREAMER_BOOTLOG" ]; then
-    # Not writable and not ours to fix: somebody else owns it. The directory it
-    # sits in belongs to the boot user, and that is enough - the file can be
-    # replaced through the directory, with what could be read of it kept. Better
-    # than the silence this used to end in. The lock below is held on an inode,
-    # so a replacement is only safe because the file being replaced was closed to
-    # this caller anyway: nobody who could write it was ever shut out of it.
     tmp="$STREAMER_BOOTLOG.tmp.$$"
     tail -n "$STREAMER_BOOTLOG_KEEP" "$STREAMER_BOOTLOG" >"$tmp" 2>/dev/null &&
         mv -f "$tmp" "$STREAMER_BOOTLOG" || rm -f "$tmp"
 fi
 
-# The append and the trim are one operation, under a lock.
-#
-# They have to be. Several writers are alive at once on this file: a boot that
-# keeps failing runs streamer-play again every RestartSec, and its lines overlap
-# the previous attempt's. Unlocked, the trim renames a fresh short file over the
-# log while another writer is still appending at its old offset, and that
-# writer's next append lands past the end of the new file. Seen on the card
-# 2026-11-18: 384 NUL bytes in the middle of boot.log where two lines used to
-# be, plus two trims racing each other on one shared .tmp name.
-#
-# The lock is the log file itself, held on fd 9: no second file to keep track of,
-# nothing to litter the partition, and nothing for an SSH session to leave owned
-# by the wrong person. A separate lock file turned out to be a way to lose lines
-# rather than a way to keep them - one created by root could not be opened by the
-# service, and with no lock to take, the boot logged nothing at all. Appending,
-# never truncating, is what keeps that fd honest across the trim's rename.
+# Append and trim are one operation, under a lock: a boot that keeps failing
+# runs this again every RestartSec, and an unlocked trim renames a fresh file
+# over a log another writer is still appending to.
 boot_log() {
     flock 9 || return 0
     printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" \
@@ -70,11 +34,8 @@ boot_log() {
             mv -f "$tmp" "$STREAMER_BOOTLOG" || rm -f "$tmp"
     fi
 }
-# The silence comes first. A redirect that cannot be opened is reported by the
-# shell making it, at the point in the redirect list where it fails, so writing
-# this as `9>>... 2>/dev/null` let one message per unwritable line reach the
-# journal: 210 of them, on the card, from a log that had been left root-owned.
-# A line that cannot be written is dropped, and nothing else happens: a logging
-# helper must not stop, or noise up, the boot that called it.
+# The silence comes first: written as `9>>... 2>/dev/null`, the shell's own
+# cannot-open message reached the journal, 210 lines of it on the card. A
+# line that cannot be written is dropped.
 (boot_log "$*") 2>/dev/null 9>>"$STREAMER_BOOTLOG" || true
 chown "$STREAMER_USER:$STREAMER_GROUP" "$STREAMER_BOOTLOG" 2>/dev/null || true

@@ -1,10 +1,9 @@
-# I2S DAC: IQaudIO Pi-DAC+ (MPN SC2078), and any other PCM5122/PCM5121 based
-# I2S DAC. The stock analog output has to stay off: it holds the I2S clock
-# domain, and the Pi-DAC+ mutes its RCA jacks while the headphone amp is live.
+# I2S DAC: IQaudIO Pi-DAC+ (SC2078), or any PCM5122/PCM5121 board. The stock
+# analog output stays off: it holds the I2S clock domain, and the Pi-DAC+ mutes
+# its RCA jacks while the headphone amp is live.
 dtparam=i2c_arm=on
 dtoverlay=iqaudio-dacplus
 dtoverlay=vc4-kms-v3d,noaudio
 
-# If the DAC shows up in `aplay -l` but stays silent, release the on-board
-# amplifier mute line:
-# dtoverlay=iqaudio-dacplus,unmute_amp
+# If the DAC appears in `aplay -l` but stays silent, add ,unmute_amp to the
+# iqaudio-dacplus line above.

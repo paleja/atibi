@@ -1,8 +1,6 @@
 [Unit]
 Description=Music streamer appliance
-# Pulled up by multi-user.target. Its members ask for the data mount with
-# RequiresMountsFor=/data, so they wait for it and fail with it if it is missing;
-# nothing here has to be set up first for the box to make a sound.
+# Its members ask for /data themselves; nothing here precedes a sound.
 
 [Install]
 WantedBy=multi-user.target

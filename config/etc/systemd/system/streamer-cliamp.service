@@ -1,12 +1,9 @@
 [Unit]
 Description=cliamp headless player daemon
 Documentation=file:/data/cliamp/cliamp.log
-# network.target says almost nothing - it is up before any address exists.
-# network-online.target waits for NetworkManager-wait-online (enabled on this
-# image), which returns once a connection is activated - at which point the
-# lease is in and /run/NetworkManager/resolv.conf has the DNS from DHCP.
-# Without this, the daemon's first m3u fetch races the lease and logs
-# "lookup ... network is unreachable"; seen on the card 2026-10-06.
+# network.target is up before any address exists; online.target returns once
+# the DHCP lease is in (without it, the first m3u fetch is
+# "network is unreachable").
 Wants=network-online.target
 After=network-online.target
 RequiresMountsFor=/data
@@ -16,14 +13,8 @@ Type=simple
 User=pi
 Group=pi
 Environment=HOME=/home/pi
-# System services get no locale from PAM; without this, non-ASCII station and
-# track names come out mangled in the journal.
 Environment=LANG=C.UTF-8
 ExecStart=/usr/local/bin/streamer-daemon
-# always, not on-failure: cliamp treats SIGTERM as a clean shutdown and exits
-# 0, so a stray `pkill cliamp` (easy to hit when a second TUI needs killing)
-# would otherwise leave the appliance silent until reboot. Only deliberate
-# stops (streamer reset) use systemctl stop, which always wins over this.
 Restart=always
 RestartSec=2
 NoNewPrivileges=yes

@@ -1,10 +1,7 @@
 #!/bin/sh
 # streamer-play - bring up playback for this boot, then ramp the volume.
-#
-# Started by streamer-play.service. It is the only thing that starts audio, so
-# the volume floor and the ramp cannot be bypassed. It reads /etc/streamer.conf
-# and the appliance state, so whatever played before the last power cut plays
-# again.
+# Started by streamer-play.service, and the only thing that starts audio, so the
+# floor and the ramp cannot be bypassed.
 set -eu
 
 . /etc/streamer.conf
@@ -18,18 +15,11 @@ kind="$STREAMER_START_KIND"
 target="$STREAMER_START_TARGET"
 provider=""
 saved_vol=""
-# state is the appliance's memory of what to play next boot. The `streamer`
-# command is the only thing that writes it, so every target in it is one a
-# person chose through the appliance, which is what makes boot.log honest: a
-# FAIL line there names something somebody asked for. The level the last
-# session settled on lives in the same file, written when the volume changes.
-# Defined before the file is read: the track branch below reads the row's
-# display strings through it too, and wants the same last-line-wins rule.
+# What plays next boot and how loud.
 last() { sed -n "s/^$1=//p" "$STREAMER_STATE" 2>/dev/null | tail -n 1; }
 if [ -f "$STREAMER_STATE" ]; then
-    # Last line wins for each key, the same rule the JSON picks below use. The
-    # streamer command never writes a key twice, but a file edited by hand can,
-    # and an answer of "-30\n-99" would make every comparison below meaningless.
+    # Last line wins per key. The streamer command never writes a key twice; a
+    # hand-edited file can, and "-30\n-99" would break every comparison below.
     mode=$(last mode)
     kind=$(last kind)
     target=$(last target)
@@ -55,15 +45,13 @@ while [ ! -S "$sock" ]; do
     sleep 0.25
 done
 
-# A stream needs name resolution. Rather than pulling in network-online.target
-# and the two second stall that comes with it, check the one thing the target
-# actually needs.
+# A stream needs name resolution. Rather than pulling in network-online.target and
+# its two-second stall, check the one thing the target actually needs.
 host=$(printf '%s' "$target" | sed -n 's#^[a-zA-Z]*://\([^/:]*\).*#\1#p')
 need_network() { # does this target have to reach a service somewhere?
     [ -n "$host" ] && return 0
-    # provider playlists, provider albums and single provider tracks are all
-    # bare ids with no hostname in them: the name check above has nothing to
-    # work on, yet every one of them is fetched across the network.
+    # provider playlists, albums and single tracks are bare ids with no hostname,
+    # yet all of them are fetched across the network.
     case "$kind" in provider|album|track) return 0 ;; esac
     return 1
 }
@@ -71,14 +59,10 @@ net_ready() { # can this target be reached yet?
     if [ -n "$host" ]; then
         getent hosts "$host" >/dev/null 2>&1
     else
-        # A provider target is a bare playlist id: there is no hostname in it,
-        # so the name check above has nothing to work on and a provider boot
-        # used to go straight to provider.load with no network at all. Seen on
-        # the card 2026-11-18: the DHCP lease landed at 02:27:51 and the load
-        # was asked for at 02:27:43, so cliamp could not refresh its Tidal
-        # session and answered "sign-in required". Whichever host the service
-        # needs is cliamp's business; what it needs either way is a route and an
-        # address, which is what `ip route get` answers.
+        # A provider target is a bare id: no hostname for the check above, yet it
+        # is fetched across the network.
+        # Which host the service needs is cliamp's business; either way it needs
+        # a route and an address, which is what `ip route get` answers.
         ip route get 1.1.1.1 >/dev/null 2>&1
     fi
 }
@@ -87,10 +71,8 @@ if need_network; then
     until net_ready; do
         i=$((i + 1))
         if [ "$i" -eq 1 ]; then
-            # The journal on this box is volatile: a boot that had to wait is
-            # only findable afterwards if the waiting itself says so once.
-            # provider targets name no host, so say what is actually being
-            # waited for there: a route.
+            # journald is volatile here, so a boot that had to wait says so once.
+            # A provider target names no host, so say what is waited for: a route.
             [ -n "$host" ] && waiting="to resolve $host" || waiting="for a route"
             echo "network not up yet, waiting up to ${STREAMER_NET_WAIT}s $waiting" >&2
             log_boot "WARN network not up, waiting ${STREAMER_NET_WAIT}s for $kind $target"
@@ -109,14 +91,10 @@ if need_network; then
     done
 fi
 
-# A Pi has no RTC battery: after a power cut the clock starts at the date the
-# image was built, and every TLS handshake made before the first NTP sync
-# fails with "certificate is not yet valid". The daemon accepts url.load and
-# reports it ok; only the stream behind it dies, in its own log, and the
-# playing-state wait below is what eventually notices. So an https target
-# waits for the clock. systemd-timesyncd writes the flag file on sync, the
-# same one systemd-time-wait-sync.service watches. The wait is bounded: with
-# no NTP server reachable the box still tries to play rather than not at all.
+# A Pi has no RTC battery: after a power cut the clock starts at the image build
+# date, and every TLS handshake before the first NTP sync fails as "certificate
+# is not yet valid". So an https target waits for timesyncd's flag file - bounded,
+# because with no NTP reachable the box should still try to play.
 case "$target" in
     https://*)
         sync_flag=${STREAMER_TIME_SYNC_FLAG:-/run/systemd/timesync/synchronized}
@@ -134,12 +112,11 @@ case "$target" in
 esac
 
 status() { cliamp status --json 2>/dev/null || true; }
-# The real player pretty-prints status --json, and it spells the same key twice:
-# the current row number is inside the "track" object as well as at the top
-# level. So the search is line-based, a space after the colon is allowed for,
-# and the last hit wins, which is the top-level one. Getting this wrong is not
-# cosmetic: with a compact-only pattern every pick came back empty, which made
-# the ramp start from an assumed level and left the two guards below inert.
+# status --json is pretty-printed and spells some keys twice: the row number sits
+# inside "track" as well as at the top level. So the search is line-based, allows
+# a space after the colon, and keeps the last hit.
+# A compact-only pattern made every pick come back empty, which started the ramp
+# from an assumed level and left the two guards below inert.
 pick() { # pick <json> <key> : that key's number, sign included
     printf '%s' "$1" |
         sed -n "s/.*\"$2\": *\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" | tail -n 1
@@ -148,9 +125,8 @@ jstr() { # jstr <json> <key> : that key's string
     printf '%s' "$1" | sed -n 's/.*"'"$2"'": *"\([^"]*\)".*/\1/p' | tail -n 1
 }
 
-# Hard floor, set before anything can reach the speakers. The daemon was
-# already started at this level; setting it again is cheap, and it is what
-# makes the floor true even if the daemon restored an old session on its own.
+# Hard floor, set before anything can reach the speakers. The daemon started at
+# it already; setting it again covers a daemon that restored an old session itself.
 if ! cliamp volume "$STREAMER_VOL_FLOOR"; then
     echo "could not set the volume floor of $STREAMER_VOL_FLOOR dB" >&2
     log_boot "FAIL volume floor $STREAMER_VOL_FLOOR"
@@ -159,9 +135,8 @@ fi
 
 case "$kind" in
     playlist)
-        # The same name the --playlist flag and the TUI use. cliamp load waits
-        # up to five minutes for a big playlist, which is why this unit gets its
-        # own generous TimeoutStartSec.
+        # The same name the --playlist flag and the TUI use; cliamp load waits up
+        # to five minutes for a big playlist, hence this unit's TimeoutStartSec.
         if ! cliamp load "$target"; then
             echo "could not load playlist: $target" >&2
             log_boot "FAIL load '$target'"
@@ -169,11 +144,10 @@ case "$kind" in
         fi
         ;;
     url|file)
-        # NOT `cliamp queue <url>`: a live daemon already has the cliamp radio
-        # channels loaded, and queue only appends, so play would then start row
-        # 0, which is a different channel. url.load with play set starts the row
-        # it adds, whatever was loaded before. The path is escaped for JSON the
-        # slow way because there is no jq on the card.
+        # NOT `cliamp queue <url>`: a live daemon already has the radio channels
+        # loaded and queue only appends, so play would start row 0, a different
+        # channel. url.load with play set starts the row it adds. No jq on the
+        # card, hence the hand-escaped JSON.
         esc=$(printf '%s' "$target" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
         if ! cliamp remote call url.load --params "{\"path\":\"$esc\",\"play\":true}" --wait; then
             echo "could not start: $target" >&2
@@ -182,21 +156,12 @@ case "$kind" in
         fi
         ;;
     provider)
-        # A provider playlist is not a file on disk, so `cliamp load` cannot
-        # find it: cliamp pulls it from the service by its id. provider.load
-        # starts playing what it loads, which is why no separate play call
-        # follows. Without this branch a provider target — the kind the web
-        # page writes when you play a Tidal playlist — would boot to silence
-        # with a log line about an unknown kind.
-        #
-        # The service session is only worth asking for once there is a network
-        # to reach it with: the wait above covers a provider target too, because
-        # on 2026-11-18 this call arrived eight seconds before the DHCP lease
-        # and cliamp answered "sign-in required".
+        # A provider playlist is not a file on disk, so `cliamp load` cannot find it:
+        # provider.load pulls it from the service by id and starts playing what it
+        # loads, which is why no play call follows. Without this branch a Tidal
+        # playlist booted to silence.
         if [ -z "$provider" ]; then
-            # A state file edited by hand can say kind=provider without naming
-            # the provider, and a request with an empty provider name can never
-            # be answered.
+            # kind=provider with no provider named can never be answered.
             echo "kind=provider with no provider named in $STREAMER_STATE" >&2
             log_boot "FAIL provider playlist with no provider: $target"
             exit 1
@@ -211,17 +176,12 @@ case "$kind" in
         fi
         ;;
     album|track)
-        # What tapping an album search hit (or one track) on the phone wrote
-        # down. provider.load_album expands an album into its real track rows
-        # and starts playing — the same call the page made when the hit was
-        # tapped — and a single track goes back through track.play as a row
-        # rebuilt from the state file. Both need the service, so the route
-        # wait above covers these kinds too.
-        #
-        # These targets only mean something together with the service that
-        # minted the id, and the provider name is used as a JSON key and the
-        # scheme of a provider:// path, so a hand-edited state file cannot be
-        # allowed to name it with quotes or spaces in it.
+        # What tapping an album hit, or one track, on the phone wrote down:
+        # provider.load_album expands an album into its real rows and starts playing
+        # them; a single track goes back through track.play as a row rebuilt from
+        # the state file. Both need the service, so the route wait covers them.
+        # The provider name becomes a JSON key and a path scheme, so a hand-edited
+        # state file cannot name it with quotes or spaces in it.
         case "$provider" in
             *[!a-z0-9-]*|'')
                 echo "kind=$kind with no usable provider name in $STREAMER_STATE: '$provider'" >&2
@@ -239,11 +199,9 @@ case "$kind" in
                 exit 1
             fi
         else
-            # cliamp 2.4.1 has no fetch-a-track-by-id call, so the row's
-            # display strings ride in the state file beside the id and are
-            # put back here. The player resolves the audio from the
-            # provider_meta id; the strings decide what "now playing" shows,
-            # and a track saved without them still plays, just unnamed.
+            # cliamp 2.4.1 cannot fetch a track by id, so the row's display strings
+            # ride in the state file and are put back here: they decide what "now
+            # playing" shows, and a track saved without them still plays, unnamed.
             esc() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
             row="{\"path\":\"$esc_p://track/$esc_t\",\"stream\":true,\"provider_meta\":{\"$esc_p.id\":\"$esc_t\"}"
             t_title=$(last title); t_artist=$(last artist); t_album=$(last album)
@@ -251,13 +209,8 @@ case "$kind" in
             if [ -n "$t_artist" ]; then row="$row,\"artist\":\"$(esc "$t_artist")\""; fi
             if [ -n "$t_album" ]; then row="$row,\"album\":\"$(esc "$t_album")\""; fi
             row="$row}"
-            # The answer is captured, not just checked: cliamp says where the
-            # row it added landed, and if the transport had not flipped to
-            # playing by the time the guard below looks, that row — not row 0
-            # — is the one to start. Seen on the card 2026-11-18: the daemon
-            # had restored the previous session's list, the job answer still
-            # said stopped, and a row-0 start played The Final Countdown when
-            # the saved intent was Carrie, row 14.
+            # The answer is captured, not just checked: it says where the row landed,
+            # and if the transport has not flipped to playing
             if ! resp=$(cliamp remote call track.play --params "{\"track\":$row}" --wait); then
                 echo "could not play $provider track: $target" >&2
                 log_boot "FAIL track.play $provider $target"
@@ -271,14 +224,12 @@ case "$kind" in
     *) echo "unknown state kind: $kind" >&2; log_boot "FAIL unknown kind $kind"; exit 1 ;;
 esac
 
-# url.load with play set starts the row it adds; a playlist load only fills the
-# live list. provider.load starts playing when it can, so ask only if nothing
-# is running: that keeps a boot from restarting a track that already began.
-# Row 0, not a remembered row: the appliance records what to play, not where in
-# it it had got to — with one exception. A single track (kind=track) is a row
-# appended to whatever list is loaded, so its own row, where the track.play
-# answer said it landed, is the one to start if the transport has not begun
-# yet; row 0 there is a leftover from the previous session.
+# url.load with play starts the row it adds, provider.load starts playing when it
+# can, a playlist load only fills the list: ask only if nothing is running, so a
+# boot never restarts a track that already began.
+# Row 0, never a remembered row - the appliance records what to play, not where
+# it got to. One exception: kind=track is a row appended to the loaded list, so
+# the row track.play reported is the one to start if the transport has not begun
 if [ "$(jstr "$(status)" state)" != playing ]; then
     start_at=${play_index:-0}
     if ! cliamp remote call queue.play --params "{\"index\":$start_at}" --wait >/dev/null 2>&1; then
@@ -304,16 +255,11 @@ while :; do
     sleep 0.5
 done
 
-# Where the ramp ends: the level the last session left it at, or the default in
-# /etc/streamer.conf if nothing was saved. Clamped, because the floor has to be
-# the last word: a stale saved level can never make the first sample loud.
-#
-# A saved level at or below the floor is a special case. The volume control
-# bottoms out at the floor, so a user who parks it there and then pulls the
-# power gets the floor back at every boot after that — silence, with no way to
-# tell that the box is not broken. That is a mistake, not a preference worth
-# keeping, so it falls back to the configured default and says so. To get a
-# genuinely quiet box, use `streamer stop`.
+# Where the ramp ends: the level the last session left, or the configured default,
+# clamped - the floor has to be the last word, so a stale level can never make
+# the first sample loud. A saved level at or below the floor is a parked control,
+# not a preference: it falls back to the default and says so. For a quiet box,
+# use `streamer stop`.
 level=${saved_vol:-}
 if [ -z "$level" ]; then
     level=$STREAMER_VOL_TARGET
@@ -326,14 +272,10 @@ fi
 level=$(awk -v l="$level" -v f="$STREAMER_VOL_FLOOR" -v h="$STREAMER_VOL_MAX" \
     'BEGIN{ if (l+0 < f+0) l=f+0; if (l+0 > h+0) l=h+0; printf "%g", l }')
 
-# Ramp. Nothing jumps: the amplifier's relay is already closed by now, and a
-# step would be the one thing it could not absorb.
-#
-# Two guards keep this loop from outliving the boot. A volume that does not move
-# at all means the player will not go where it is asked, usually because the
-# output device has its own limit, so continuing would be a loop that sleeps
-# until the unit's start timeout kills it. And the step budget is the backstop
-# for anything else: the ramp is worth at most so much of the boot budget.
+# Ramp: nothing jumps. The amp's relay is closed by now and a step is the one
+# thing it could not absorb. Two guards keep the ramp inside the boot:
+# a level that never moves means the output device will not go where asked,
+# and the step budget caps the ramp either way.
 sleep "$STREAMER_RAMP_START"
 now=$(pick "$(status)" volume)
 [ -n "$now" ] || now=$STREAMER_VOL_FLOOR
@@ -347,9 +289,8 @@ while :; do
     cliamp remote call volume.adjust --params "{\"value\":$step}" --wait >/dev/null 2>&1 || break
     expected=$(awk -v n="$now" -v s="$step" 'BEGIN{ printf "%g", n+s }')
 
-    # If cliamp reports a level more than one step away from where this ramp
-    # left it, that was somebody else: their setting wins, and the ramp stops
-    # rather than arguing with it.
+    # A level more than one step off where this ramp left it was set elsewhere:
+    # theirs wins, and the ramp stops.
     after=$(pick "$(status)" volume)
     if [ -n "$after" ]; then
         moved=$(awk -v a="$after" -v e="$expected" -v s="$step" \

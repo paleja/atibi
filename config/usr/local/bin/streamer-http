@@ -7,25 +7,21 @@ carries its own web page, so the browser is the whole client.
 
 Design rules this file keeps to, and why:
 
-- The server holds no state of its own. Playback facts live in the cliamp
-  daemon (read and written over its IPC socket); boot intent lives in the
-  appliance state file, and is written ONLY by shelling out to `streamer
-  station|playlist|mode`, never by touching the state file directly. That
-  keeps one writer for the file, keeps the durable boot.log entries honest,
-  and keeps the volume floor and ramp of streamer-play impossible to bypass:
-  a boot intent set from the phone goes through exactly the same path as one
-  set over SSH.
-- cliamp IPC version 2, newline-delimited JSON over the daemon's Unix
-  socket: the same protocol the panel widget and `cliamp remote` use. One
-  connection per request under one lock keeps that traffic ordered without
-  needing any reconnect logic, and requests are tiny, so connection churn
-  costs nothing next to a TLS stream start.
-- Everything under /api needs the token. The page itself is plain HTML and
-  needs nothing. With a token in hand the root URL redirects straight to the
-  app with the token in the URL, because typing a 32-character secret on a
-  phone is not a plan; from there the page keeps it in localStorage and
-  sends it as an X-Token header. A cross-site form cannot set a custom
-  header, so the header requirement is also the CSRF defence.
+- The server holds no state of its own: playback facts live in the cliamp
+  daemon, read and written over its IPC socket; boot intent lives in the
+  appliance state file and is written ONLY by shelling out to `streamer
+  station|playlist|mode`, never by touching the file. That keeps one writer
+  for the file, keeps boot.log honest, and keeps streamer-play's floor and
+  ramp unbypassable from a phone.
+- cliamp IPC version 2, newline-delimited JSON over the daemon's Unix socket:
+  the same protocol `cliamp remote` uses. One connection per request under
+  one lock keeps that traffic ordered with no reconnect logic, and requests
+  are tiny, so churn costs nothing next to a TLS stream start.
+- Everything under /api needs the token; the page itself is plain HTML.
+  With a token in hand the root URL redirects to the app with it in the URL,
+  because typing a 32-character secret on a phone is not a plan; from there
+  the page keeps it in localStorage and sends it as an X-Token header, which
+  a cross-site form cannot set - that is also the CSRF defence.
 - Python 3 stdlib only: the card has python3 because RasPiOS Lite ships it,
   and nothing here may assume a package install on a read-only root.
 
@@ -103,10 +99,9 @@ class Config:
             os.path.join(home, ".config", "cliamp", "cliamp.sock"))
         self.streamer = os.environ.get("STREAMER_EXECUTABLE",
                                        "/usr/local/bin/streamer")
-        # The player's own command, for the one thing the IPC snapshot cannot
-        # answer (see live_volume). Absolute rather than looked up: a service
-        # whose PATH nobody controls should not find a different cliamp than
-        # the daemon it is controlling.
+        # The player's own command, for the one thing the IPC snapshot cannot answer
+        # (see live_volume). Absolute rather than looked up: this server should not
+        # find a different cliamp than the daemon it is controlling.
         self.cliamp = os.environ.get("STREAMER_CLIAMP_EXECUTABLE",
                                      "/usr/local/bin/cliamp")
         self.radio_size = int(os.environ.get(
@@ -114,18 +109,16 @@ class Config:
         self.tidal_cred = os.environ.get("STREAMER_TIDAL_CRED") or expand(
             conf.get("STREAMER_TIDAL_CRED",
                      "$STREAMER_DATA/cliamp/tidal_credentials.json"), conf)
-        # The list the streamer command reads, read here as well so a target
-        # this server writes is one that command spells the same way: it is
-        # what tells both of them where a provider name ends and a bare id
-        # begins.
+        # The list the streamer command reads, read here as well so a target this
+        # server writes is one that command spells the same way: this is what tells
+        # both where a provider name ends and a bare id begins.
         self.providers = (os.environ.get("STREAMER_PROVIDERS")
                           or conf.get("STREAMER_PROVIDERS",
                                       "tidal qobuz spotify")).split()
-        # Which of those providers the radio can follow. Tidal is the only
-        # one whose API answers a track radio at all (see the note in the
-        # Tidal section), so this is the one honest place where "currently
-        # only Tidal is supported" is written down; the page asks the card
-        # instead of naming a provider itself.
+        # Which providers the radio can follow. Tidal is the only one whose API answers
+        # a track radio at all (see the note in the Tidal section), so this is the one
+        # honest place where that is written down; the page asks the card instead of
+        # naming a provider itself.
         self.radio_providers = (os.environ.get("STREAMER_RADIO_PROVIDERS")
                                 or conf.get("STREAMER_RADIO_PROVIDERS",
                                             "tidal")).split()
@@ -194,9 +187,9 @@ def ipc(method, params=None, id_hint="h", envelope=None):
             f.flush()
             while True:
                 reply = json.loads(_recv_line(f))
-                # Only a subscribe pushes unsolicited events, and this server
-                # never subscribes; matching the id anyway costs nothing and
-                # keeps a stray frame from being read as an answer.
+                # Only a subscribe pushes unsolicited events, and this server never
+                # subscribes; matching the id anyway keeps a stray frame from being
+                # read as an answer.
                 if reply.get("id") == id_hint:
                     return reply
         except (OSError, ValueError) as exc:
@@ -217,9 +210,8 @@ def _job_wait(job, hint_base):
     while job.get("state") not in final:
         tries += 1
         if tries > 240:  # 240 * 0.5 s = 120 s. A 50-track Tidal playlist load
-                         # resolves every URL, and the docs say slow work
-                         # stays async; a load that gives up early would stop
-                         # being waitable at all, so patience is the rule.
+                         # the docs say slow work stays async, and a load that
+                         # gave up early would stop being waitable at all.
             raise IpcError("job %s did not finish in time" % job.get("id"))
         if not job.get("id"):
             raise IpcError("the player submitted no job")
@@ -260,18 +252,7 @@ def run_streamer(*args):
     return (out.stdout or "").strip()
 
 
-# The level the player is at, which the IPC snapshot cannot answer. Verified
-# on the card 2026-11-21: `cliamp remote state` hands back eq_bands, eq_preset,
-# index, logical_track, mono, playlist_revision, position, repeat, revision,
-# seekable, shuffle, speed, state, theme, track, total, visualizer - no
-# volume - while `cliamp status --json` does answer `"volume": 0`. That is the
-# same reading the shell payload uses: `json_num` in the streamer command, `pick`
-# in streamer-play, both of which had to learn that this JSON is pretty-printed
-# (a space may follow the colon) and that one key can be spelled more than once,
-# where the last hit is the appliance's own level rather than a row's. The page
-# asked the snapshot and never got an answer, so its slider sat where a browser
-# puts a range control nobody set: the middle of -50..0, read as about -25 dB
-# over music that was playing at 0.
+# The level the player is at, which the IPC snapshot cannot answer.
 VOLUME_KEY = re.compile(r'"volume": *(-?\d+(?:\.\d+)?)')
 
 
@@ -311,31 +292,23 @@ def read_intent():
 
 # --- Tidal radio ---------------------------------------------------------------
 #
-# "Similar songs" for what is playing - Tidal's own track radio - is not
-# something cliamp 2.4.1 can do: none of its 77 IPC operations mentions radio,
-# similar, mix or autoplay (its autoplay code is Spotify-only), and the
-# plugin command channel answers nothing. Tidal's own HTTP API does answer it,
-# and the card already holds a Tidal login - the session file cliamp keeps in
-# its data directory - so this server borrows that login rather than having an
-# account of its own. Verified against the card 2026-11-20:
-#
-#   GET /v1/tracks/<id>/radio?countryCode=..  answers real track rows; the
-#   siblings /tracks/<id>/similar, /trackradio/<id> and /mixes do not exist.
-#   GET /v2/my-collection/playlists/folders/create-playlist + the ETag'd POST
-#   to /v1/playlists/<uuid>/items create and fill a real playlist in the
-#   account (it shows up in the Tidal app's own list); DELETE removes it.
-#
+# "Similar songs" for what is playing is not something cliamp 2.4.1 can do,so this
+# server borrows Tidal's login rather than having an account of its own. Verified:
+
+#   GET /v1/tracks/<id>/radio?countryCode=.. answers real track rows; the siblings
+#   /tracks/<id>/similar, /trackradio/<id> and /mixes do not exist.
+#   POST /v2/my-collection/playlists/folders/create-playlist, then the ETag'd POST
+#   to /v1/playlists/<uuid>/items, create and fill a real playlist in the account;
+#   DELETE removes it.
+
 # Rules this borrowing keeps to:
-# - The session file is read fresh on every call, never cached, and never
-#   refreshed here. cliamp owns that login; a second refresher of one OAuth
-#   session is the surest way to end the card's Tidal access for good. A token
-#   that turns out stale is reported, not chased.
-# - The /v1 (or /v2) path segment and countryCode are not decoration: without
-#   the segment the CDN answers a plain 404 page, and playlist calls 400
-#   without the country.
-# - Saving writes into the owner's Tidal account, so the only sequence used is
-#   the one verified end to end that day, and a playlist left empty by a
-#   failed fill is deleted again rather than left behind.
+# - The session file is read fresh on every call and never refreshed here. cliamp owns
+#   that login, and two programs refreshing one OAuth session is how logins get killed;
+#   a token that turns out stale is reported, not chased.
+# - The /v1 (or /v2) segment and countryCode are not decoration: without the segment
+#   the CDN answers a plain 404 page, and the playlist calls 400 without the country.
+# - Saving writes into the owner's Tidal account, so only the sequence verified above is
+#   used, and a playlist left empty by a failed fill is deleted again.
 
 TIDAL_API = "https://api.tidal.com"
 
@@ -438,44 +411,38 @@ def radio_tracks(seed):
 TRANSPORT_OPS = {"play", "pause", "toggle", "next", "prev", "stop"}
 MODE_OPS = {"shuffle", "repeat"}
 
-# A provider search row whose path is provider://album/<id> stands for a
-# whole album, not one streamable track. Verified on the card against cliamp
-# 2.4.1: Tidal search answers with rows like that (provider_meta.kind says
-# "album", there is no stream flag), and the player can only open real track
-# rows: hand one of these to track.play and the job says succeeded while the
-# play pipeline answers with a plain filesystem error, the way it would for
-# any missing file. See the /api/play route.
+# A provider search row whose path is provider://album/<id> stands for a whole album,
+# not one streamable track. Verified on the card against cliamp 2.4.1: Tidal search
+# answers rows like that (provider_meta.kind says "album", no stream flag), and the
+# player can only open real track rows: hand one of these to track.play and the job
+# says succeeded while the play pipeline answers a plain filesystem error. See /api/play.
 ALBUM_ROW = re.compile(r"\A([a-z][a-z0-9-]*)://album/(\S+)\Z")
 
-# The matching shape for a single track row: the scheme names the provider and
-# the tail is the provider's own track id, which is exactly what the boot
-# needs to rebuild the row (see the album|track branch of streamer-play, and
-# why the display strings are saved with it). A row whose path is not this
-# shape — a file on the card, say — plays but is not remembered: the boot
-# cannot reach anything by that id anyway.
+# The matching shape for a single track row: the scheme names the provider and the tail
+# is the provider's own track id, which is exactly what the boot needs to rebuild the
+# row (see the album|track branch of streamer-play, and why the display strings are
+# saved with it). A row whose path is not this shape - a file on the card, say - plays
+# but is not remembered: the boot cannot reach anything by that id anyway.
 TRACK_ROW = re.compile(r"\A([a-z][a-z0-9-]*)://track/(\S+)\Z")
 
-# What cliamp calls the list that is loaded, in the snapshot's "playlist" key.
-# Verified on the card 2026-11-21, four shapes, and only these four: a Tidal
-# playlist is "tidal:<list id>", a Tidal album is "tidal:album:<album id>" —
-# a spelling its own provider.load refuses, so the word "album" has to be
-# taken back out before the boot is told what to load — a playlist saved on
-# the card is its bare name ("cliampui"), and the built-in cliamp radio
-# channel is "radio:l:0", which `cliamp load` cannot open (no such .toml) and
-# only provider.load can. A single track played with track.play comes back
-# with no "playlist" key at all, list or not. That grammar is the reason the
-# boot intent cannot be worked out in the page: it is a fact about the player,
-# and a wrong guess writes an intent that boots to silence.
+# What cliamp puts in the snapshot's "playlist" key. Verified on the card 2026-11-21,
+# four shapes, and only these four: a Tidal playlist is "tidal:<list id>", a Tidal
+# album is "tidal:album:<album id>" - a spelling its own provider.load refuses, so the
+# word "album" is taken back out before the boot is told what to load - a playlist
+# saved on the card is its bare name, and the built-in cliamp radio channel is
+# "radio:l:0", which only provider.load can open. A track played with track.play comes
+# back with no "playlist" key at all. That grammar is why the boot intent cannot be
+# worked out in the page: it is a fact about the player, and a wrong guess writes an
+# intent that boots to silence.
 LIST_ALBUM = re.compile(r"\A([a-z][a-z0-9-]*):album:(\S+)\Z")
 LIST_PROVIDER = re.compile(r"\A([a-z][a-z0-9-]*):(\S+)\Z")
 
-# Provider -> (when it was read, {list id: name}). The listing is the only
-# place a list's own name comes from, and it is kept because the page polls
-# /api/status every two seconds while `provider.playlists` is a call to the
-# service: one read per provider every LIST_NAMES_TTL seconds, whatever else
-# the poll does. A provider that answers nothing is cached as an empty listing,
-# so a broken provider is not asked about on every poll either; a list renamed
-# in the account appears under its new name at the next read.
+# Provider -> (when it was read, {list id: name}). The listing is the only place a
+# list's own name comes from, and `provider.playlists` is a call to the service while
+# the page polls /api/status every two seconds, so this is one read per provider every
+# LIST_NAMES_TTL seconds, whatever else the poll does. A provider that answers nothing
+# is cached as an empty listing too; a list renamed in the account appears under its
+# new name at the next read.
 LISTS_CACHE = {}
 LIST_NAMES_TTL = 15
 
@@ -571,10 +538,10 @@ def boot_target(snap):
         if hit and hit.group(1) in CFG.providers:
             tid = str((row.get("provider_meta") or {}).get(
                 "%s.id" % hit.group(1)) or hit.group(2))
-            # The display strings come from the row the player is holding:
-            # cliamp 2.4.1 has no fetch-a-track-by-id call, so they are all
-            # the boot will have. Empty ones are passed on purpose, so a
-            # row without an artist cannot inherit the previous track's.
+            # The display strings come from the row the player is holding: cliamp 2.4.1
+            # has no fetch-a-track-by-id call, so they are all the boot will have. Empty
+            # ones are passed on purpose, so a row without an artist cannot inherit the
+            # previous track's.
             return ["track", "%s:%s" % (hit.group(1), tid),
                     str(row.get("title", "")),
                     str(row.get("artist", "")),
@@ -672,32 +639,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "seekable", "volume", "playlist", "index", "total",
                     "shuffle", "repeat", "stream_error")
             out = {k: snap[k] for k in keep if k in snap}
-            # The level, from the player itself: the snapshot has no such key
-            # (see live_volume). The snapshot's value is left in place when the
-            # player cannot be asked, so the page still shows a level rather
-            # than nothing.
+            # The level, from the player itself: the snapshot has no such key (see
+            # live_volume). The snapshot's value is left in place when the player cannot
+            # be asked, so the page still shows a level rather than nothing.
             vol = live_volume()
             if vol is not None:
                 out["volume"] = vol
-            # Which provider the radio can follow, for the row playing now:
-            # the page's radio section is only shown when this names one, so
-            # the section cannot offer to queue songs for a file on the card
-            # or for the built-in radio channel.
+            # Which provider the radio can follow, for the row playing now: the page
+            # greys its radio tab when this names none, so it cannot offer to queue
+            # songs for a file on the card or for the built-in radio channel.
             out["radio"] = radio_of(snap)
-            # The same list the player names by its id, said the way its owner
-            # would say it: see list_name. Two spellings ride along, and the
-            # page prefers the name - it has to keep the raw `playlist` label
-            # too, because that label is what `listkey` identifies the list
-            # whose rows are on screen, and a name is not unique.
+            # The same list the player names by its id, said the way its owner would
+            # (see list_name). The raw label rides along too: listkey() identifies the
+            # list whose rows are on screen by that label, because names are not unique.
             out["playlist_name"] = list_name(snap.get("playlist", ""))
             intent = read_intent()
             if intent["kind"] == "provider" and intent["provider"]:
-                # The boot card's line gets the same courtesy: the intent file
-                # holds the list id, and a person choosing what boots wants the
-                # name they gave that list. Bare, without the provider in front:
-                # that line already spells the provider itself. Unset when the
-                # list is not in the provider's listing, so the card falls back
-                # to the id rather than to nothing.
+                # The boot card's line gets the same courtesy: the intent file holds the
+                # list id, and a person choosing what boots wants the name they gave it.
+                # Bare, without the provider in front - that line already spells the
+                # provider itself. Unset when the list is not in the provider's listing,
+                # so the card falls back to the id rather than to nothing.
                 name = list_names(intent["provider"]).get(intent["target"], "")
                 if name:
                     intent["name"] = name
@@ -736,9 +698,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "index": res.get("index"), "total": res.get("total")})
             return
         if path == "/api/radio":
-            # The preview: what Tidal says is similar to the track playing
-            # now. Nothing changes; the page shows these and the two POST
-            # routes below act on them.
+            # The preview: what Tidal says is similar to the track playing now.
+            # Nothing changes; the two POST routes below act on these rows.
             seed, _playing = tidal_seed()
             if not seed:
                 self._json_out({"ok": False,
@@ -770,11 +731,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._json_out({"ok": False, "error": "value must be a dB number"}, 400)
                 return
-            # Not a bare volume call: the level is remembered as well as set,
-            # and the streamer command is the only thing allowed to write that
-            # down. It also reads the level back from the player, so a floor or
-            # ceiling the player enforces is what gets saved, not what the
-            # slider happened to show.
+            # Not a bare volume call: the level is remembered as well as set, and
+            # only the streamer command may write that down. It reads the level back
+            # from the player, so a floor or ceiling the player enforces is what gets
+            # saved, not what the slider happened to show.
             self._json_out({"ok": True, "streamer": run_streamer("vol", repr(db))})
             return
         if path == "/api/op/seek":
@@ -792,11 +752,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json_out({"ok": False, "error": "provider and id required"}, 400)
                 return
             ipc_op("provider.load", {"provider": provider, "playlist": pid})
-            # Nothing is remembered here. What plays next boot is something
-            # only two things set: the `streamer` command, and the page's
-            # "use the now playing" button. A tap in the browse tab plays,
-            # and that is all it claims to do - the boot target is a separate
-            # decision, taken in the "at boot" tab.
+            # Nothing is remembered here. What plays next boot is set only by the
+            # `streamer` command and the page's "use the now playing" button; a tap
+            # in the browse tab plays, and that is all it claims to do - the boot target
+            # is a separate decision, taken in the boot tab.
             self._json_out({"ok": True})
             return
         if path == "/api/load/url":
@@ -809,10 +768,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json_out({"ok": True})
             return
         if path == "/api/queue/play":
-            # Tapping a row of the live list: queue.play takes the row's index,
-            # and the player jumps to it. Verified on the card against 2.4.1:
-            # the job succeeds and the snapshot's index and track follow the row
-            # asked for, so the page's number and the player's agree.
+            # Tapping a row of the live list: queue.play takes the row's index, and
+            # the player jumps to it. Verified on the card against 2.4.1: the job
+            # succeeds and the snapshot's index and track follow the row asked for, so
+            # the page's number and the player's agree.
             try:
                 row = int(body.get("index"))
             except (TypeError, ValueError):
@@ -821,10 +780,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if row < 0:
                 self._json_out({"ok": False, "error": "index must be a row number"}, 400)
                 return
-            # No intent written down here, on purpose. This row belongs to a
-            # list that is already the boot intent - it was remembered when it
-            # was loaded - and the position within it is not something the
-            # appliance records. Tapping a track is not a new boot intent.
+            # No intent written here, on purpose: this row belongs to a list that is
+            # already the boot intent, and a position within it is not something the
+            # appliance records.
             ipc_op("queue.play", {"index": row})
             self._json_out({"ok": True})
             return
@@ -835,13 +793,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             hit = ALBUM_ROW.match(str(track.get("path", "")))
             if hit:
-                # An album search hit is not a track the player can open: it
-                # is a placeholder row standing for a whole album, and the
-                # operation it is asking for is the one the TUI runs when
-                # Enter lands on it — expand it into its real track rows and
-                # start playing. The scheme names the provider, so this holds
-                # for every provider that spells its rows this way, not just
-                # Tidal.
+                # An album search hit is a placeholder row standing for a whole album,
+                # so the operation asked for is the one the TUI runs when Enter lands on
+                # it: expand it into its real track rows and start playing. The scheme
+                # names the provider, so this holds for any provider that spells its
+                # rows this way, not only Tidal.
                 meta = track.get("provider_meta") or {}
                 album = str(meta.get("albumID") or hit.group(2))
                 ipc_op("provider.load_album",
@@ -849,9 +805,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json_out({"ok": True})
                 return
             ipc_op("track.play", {"track": track})
-            # Playing a row from the phone is not a boot decision either
-            # (see /api/load/playlist): what the next reboot loads stays
-            # whatever the "at boot" tab says it is.
+            # Playing a row from the phone is not a boot decision either (see
+            # /api/load/playlist): what the next reboot loads stays what the boot tab
+            # says it is.
             self._json_out({"ok": True})
             return
         if path == "/api/intent":
@@ -883,28 +839,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "intent": read_intent()})
             return
         if path == "/api/boot/now":
-            # The page's "use the now playing" button: make what plays now
-            # what plays next boot. Nothing else on the page does that - a
-            # tap in the browse tab or on a row of the list only plays. The
-            # card works out the shape (see boot_target), so the page asks
-            # one dumb question instead of guessing whether the row on screen
-            # stands for a list, an album, one track or a stream, and the
-            # answer goes to `streamer remember` - the verb that writes the
-            # boot intent without restarting what is already playing, because
-            # restarting here would mean a second start and a trip back to
-            # the volume floor in the middle of a track.
+            # The page's "use the now playing" button: make what plays now what plays
+            # next boot. Nothing else on the page does that. The card works out the shape
+            # (see boot_target), so the page asks one dumb question instead of guessing
+            # whether the row on screen is a list, an album, a track or a stream. The
+            # answer goes to `streamer remember` - the verb that writes the boot intent
+            # without restarting playback, since restarting here would mean a second start
+            # and a trip back to the volume floor in the middle of a track.
             argv = boot_target(ipc("state.get").get("snapshot", {}))
             out = run_streamer("remember", *argv)
             self._json_out({"ok": True, "streamer": out,
                             "intent": read_intent()})
             return
         if path == "/api/radio/queue":
-            # Extend the live queue with the similar songs. The list is read
-            # from Tidal again here rather than taken from the page's preview:
-            # the preview is a look, the action is whatever Tidal calls similar
-            # now, and a body full of hand-written ids would let a page push
-            # arbitrary rows into the player — the same reason the boot intent
-            # is only ever written by the streamer command.
+            # Extend the live queue with the similar songs. Read from Tidal again
+            # here rather than taken from the page's preview: the preview is a look,
+            # the action is whatever Tidal calls similar now, and a body of hand-written
+            # ids would let a page push arbitrary rows into the player - the same reason
+            # the boot intent is only ever written by the streamer command.
             seed, _playing = tidal_seed()
             if not seed:
                 self._json_out({"ok": False,
@@ -916,23 +868,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except TidalError as exc:
                 self._json_out({"ok": False, "error": str(exc)}, 502)
                 return
-            # track.queue, not queue: verified on the card 2026-11-20 that
-            # repeated calls land in the player's play-next area, keep the
-            # order asked for, and play before the rest of the loaded list —
-            # and that each row must carry its fetched metadata, a bare path
-            # makes an unresolved stub. No boot intent touched: the saved
-            # list, and what a reboot brings back, stay exactly as they were.
+            # track.queue, not queue: verified on the card 2026-11-20 that repeated
+            # calls land in the player's play-next area, keep the order asked for, and
+            # play before the rest of the loaded list - and that every row must carry
+            # its fetched metadata, a bare path makes an unresolved stub. No boot intent
+            # touched: the saved list stays exactly as it was.
             for row in tracks:
                 ipc_op("track.queue", {"track": row})
             self._json_out({"ok": True, "queued": len(tracks)})
             return
         if path == "/api/radio/save":
-            # The other half: keep the same similar songs as a real playlist
-            # in the owner's Tidal account, under a title they typed. This is
-            # the only place in this server that writes to a provider account,
-            # with the create/fill sequence verified end to end on the card
-            # 2026-11-20, and a playlist left empty by a failed fill is
-            # deleted again rather than left behind in the account.
+            # The other half: keep the same songs as a real playlist in the owner's
+            # Tidal account, under a title they typed. The only place in this server
+            # that writes to a provider account, with the create/fill sequence verified
+            # end to end on the card 2026-11-20; a playlist left empty by a failed fill
+            # is deleted again rather than left behind.
             title = str(body.get("title", "")).strip()[:120]
             if not title:
                 self._json_out({"ok": False,
@@ -965,9 +915,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if st != 200 or not uuid:
                     raise TidalError("Tidal refused to create the playlist "
                                      "(%s)" % st)
-                # Filling a playlist is conditional on its ETag, verified the
-                # same day: the POST to /items answers 412 (or adds nothing)
-                # unless it carries If-None-Match from a fresh GET.
+                # Filling a playlist is conditional on its ETag, verified the same
+                # day: the POST to /items answers 412, or adds nothing, unless it
+                # carries If-None-Match from a fresh GET.
                 _, _, hdrs = tidal_call("GET", "/v1/playlists/%s" % uuid)
                 etag = hdrs.get("ETag") or "*"
                 st, added, _ = tidal_call(
@@ -980,9 +930,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 n = (len(added.get("addedItemIds") or [])
                      if isinstance(added, dict) else 0)
                 if st != 200 or not n:
-                    # Nothing got in: take the empty shell back out of the
-                    # account, whatever it was - refused, or an accept-everything
-                    # response that added no ids.
+                    # Nothing got in: take the empty shell back out of the account,
+                    # refused or an accept-everything response that added no ids.
                     tidal_call("DELETE", "/v1/playlists/%s" % uuid)
                     raise TidalError("Tidal added nothing to the new playlist")
             except TidalError as exc:
@@ -1029,31 +978,23 @@ h1{font-size:15px;margin:0 0 6px;color:var(--dim);font-weight:600}
 button{background:#243040;border:0;color:var(--fg);border-radius:10px;
 padding:12px 14px;font-size:16px;cursor:pointer}
 button:active{background:#2e3c50}
-/* What cannot be acted on now: the radio tab, for a row whose provider has
-   no similar songs to ask for, and the two buttons that act on such a list
-   before there is one. A control that is there but grey says more than a
-   sentence explaining why it is missing. See render() and tab(). */
+/* Grey is what cannot be acted on now - the radio tab when the provider has no similar
+   songs, or an action with no list yet. Green, below, is what is on. */
 button[disabled]{opacity:.45;cursor:default}
 button.big{font-size:26px;flex:1;padding:16px}
 input[type=range]{flex:1;accent-color:var(--acc)}
 .tabs{display:flex;gap:8px;margin-bottom:12px}
 .tabs button{flex:1}
-/* The one green of "this is what is on": the tab that is open, and a mode
-   icon that is switched on. Any button, one rule - which is how shuffle and
-   repeat can be glyphs with nothing to read beside them. See render(). */
 button.on{background:var(--acc);color:#08110c}
 ul{list-style:none;margin:0;padding:0}
 li{display:flex;justify-content:space-between;gap:10px;align-items:center;
 padding:10px 4px;border-bottom:1px solid #232b35}
-/* The text block takes the width the number and any button leave over. Without
-   flex:1 it shrinks to its own content and the flex row's space-between pushes
-   it to the right edge - every title right-aligned, which is what a playlist
-   row (number, text, no button) looked like on screen. */
+/* Without flex:1 the text block shrinks to its content, and the row's
+   space-between right-aligns every title. */
 li .what{min-width:0;flex:1}
 li b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 li small{color:var(--dim)}
-/* A playlist row is a control: tapping it asks the player to start that row.
-   The number is the row's own index, the same figure /api/queue/play takes. */
+/* A playlist row is a control: tapping it asks the player to start that row. */
 li.tap{cursor:pointer}
 li.tap:active{background:#232b35}
 li .num{color:var(--dim);font-size:14px;min-width:2.2em;text-align:right;
@@ -1140,10 +1081,9 @@ let snap={},qrows=[],qplay;    // qplay: the list whose rows are on screen.
                                // Undefined means nothing has been fetched yet.
 const $=id=>document.getElementById(id);
 function setToken(t){
-  // The token goes into localStorage only once the card has accepted it: a typo
-  // kept there would fail every later load instead of asking one more time.
-  // Empty means the stored one is deleted - a card re-flashed with a new token
-  // must not leave the page locked out by its own memory of the old one.
+  // The token goes into localStorage only once the card has accepted it, so a typo kept
+  // there cannot fail every later load. Empty deletes the stored one: a card re-flashed
+  // with a new token must not leave the page locked out by its own memory of the old one.
   TOKEN=t||'';
   if(TOKEN)localStorage.setItem('streamer-token',TOKEN);
   else localStorage.removeItem('streamer-token');
@@ -1160,9 +1100,9 @@ async function api(path,body,retried){
                  :{headers:{'X-Token':TOKEN}};
   const r=await fetch(path,opt);
   if(r.status===401&&!retried){
-    // Whatever was being sent is refused, so it goes. Ask for another, check it
-    // before keeping it, and replay this one request - a card that changed its
-    // token should mean one dialog, not a reload and a lost click.
+    // Whatever was being sent is refused, so ask for another token, check it, and replay
+    // this one request: a card that changed its token means one dialog, not a reload
+    // and a lost click.
     setToken('');
     const t=prompt('card token rejected, re-enter')||'';
     if(t&&await tokenOk(t)){setToken(t);return api(path,body,true);}
@@ -1170,11 +1110,10 @@ async function api(path,body,retried){
   return r.json();
 }
 async function unlock(){
-  // Three sources, in the order that makes each of them useful: a token in the
-  // URL (a bookmark, or the redirect from /?token=...), one the browser
-  // remembers from the last time, and finally a typed one. Whichever the card
-  // accepts is the one kept, so the secret is fetched over SSH once, not at
-  // every desk.
+  // Three sources, in the order that makes each useful: a token in the URL (a bookmark,
+  // or the redirect from /?token=...), one the browser remembers, then a typed one.
+  // Whichever the card accepts is the one kept, so the secret is fetched over SSH once,
+  // not at every desk.
   for(const cand of[FROM_URL,localStorage.getItem('streamer-token')])
     if(cand&&await tokenOk(cand)){setToken(cand);return true;}
   setToken('');
@@ -1192,51 +1131,42 @@ function setVol(){api('/api/op/volume',{value:Number($('v').value)}).then(d=>{if
 function render(s){
   snap=s;
   const t=s.track||s.logical_track||{};
-  // The list is named for its owner where the player knows a name for it
-  // (see list_name); the raw label stays in s.playlist, and listkey() keeps
-  // using that one, because a name is not unique and an id is.
+  // The list is named for its owner where the player knows a name for it (see list_name);
+  // listkey() keeps using the raw label, because a name is not unique and an id is.
   const lname=s.playlist_name||s.playlist;
   $('t').textContent=t.title||'nothing playing';
   $('s').textContent=[t.artist,t.station&&('· '+t.station),lname&&('· '+lname)].filter(Boolean).join(' ');
   playing=s.state==='playing';$('pp').textContent=playing?'⏸':'▶';
-  // The mode icons carry their own state, in the page's one green: the player
-  // answers shuffle as a flag and repeat as Off/all/one, which the one
-  // button cycles, so any repeat at all lights the icon and which of all
-  // or one it is stays something to see on the player rather than a word
-  // here. Both answers arrive on the next status poll, so a tap is visible
-  // without a label under it.
+  // The mode icons carry their own state in the page's one green. The player answers
+  // shuffle as a flag and repeat as Off/all/one, which one button cycles, so any repeat
+  // at all lights the icon and which of all or one it is stays on the player rather
+  // than a word here. Both answers arrive on the next status poll.
   $('shuffle').classList.toggle('on',!!s.shuffle);
   $('repeat').classList.toggle('on',!!(s.repeat&&s.repeat!=='Off'));
   pos=s.position||0;dur=s.duration||0;
-  // The level is the player's own (see live_volume), and it only ever moves
-  // the thumb when nobody is holding it: a hand on the slider mid-drag is
-  // not a thing to argue with. Before the first answer the thumb sits at 0
-  // - the value the markup gives it, and the level cliamp starts a session
-  // at - rather than at the middle of the range, where a browser puts a
-  // control nobody has set.
+  // The level is the player's own (see live_volume), and it only moves the thumb when
+  // nobody is holding it. Before the first answer the thumb sits at 0 - the value the
+  // markup gives it, and the level cliamp starts a session at - rather than at the
+  // middle of the range, where a browser puts a control nobody has set.
   $('vd').textContent=(s.volume===undefined?'':s.volume+' dB');
   if(document.activeElement!==$('v')&&s.volume!==undefined)$('v').value=Math.max(-50,Math.min(0,Math.round(s.volume)));
   const m=s.intent||{};$('mode').textContent=m.mode||'last';
   const lbl={provider:'playlist on ',album:'album on ',track:'track on ',playlist:'playlist: '};
   const svc=m.kind in lbl&&m.kind!=='playlist'?(m.provider||'?')+': ':'';
-  // The name before the id: the intent file can only hold the list id the
-  // provider gave it, and /api/status sends back the name the owner gave it
-  // (see list_name). Without that name the id is shown, never nothing.
+  // Name before id: the intent file can only hold the list id the provider gave it,
+  // and /api/status sends back the name the owner gave it (see list_name). Without
+  // that name the id is shown, never nothing.
   const shown=(m.kind==='track'&&(m.title||''))?m.title:(m.name||m.target||'(default)');
   $('intent').textContent=(lbl[m.kind]||'')+svc+shown+(m.volume?(' at '+m.volume+' dB to start with'):' (level not saved)');
-  // The radio tab is always in the tab bar, and its colour says whether the
-  // question can be asked at all: only a row whose provider has similar songs
-  // to ask for leaves it lit (see /api/status' radio field), so the built-in
-  // radio channel and a file on the card grey it out instead of offering a
-  // tab that would answer with an error.
+  // Grey tab: the row playing has no provider the radio can follow. The page
+  // itself goes away too, in case the provider changes while the tab is open.
   $('tab-radio').disabled=!s.radio;
+  $('radio').classList.toggle('hidden',!s.radio||!$('tab-radio').classList.contains('on'));
   mark();
-  // The rows being shown are only honest if they are the list being played, so
-  // they are fetched whenever that changes: another phone, the browse tab, a
-  // reboot, and the first status answer after a refresh, where nothing has been
-  // fetched yet. A list from a streaming service has no name in the status -
-  // the player answers with no playlist key at all - so the number of rows
-  // rides along in the identity: same name and same count means the same list.
+  // The rows are only honest if they are the list being played, so they are fetched
+  // whenever that changes: another phone, the browse tab, a reboot, the first answer
+  // after a refresh. A list from a streaming service has no name in the status at all,
+  // so the number of rows rides along in the identity: same name, same count.
   if(!$('now').classList.contains('hidden')&&listkey(s)!==qplay)loadQueue();
 }
 function listkey(s){return (s.playlist||'')+'|'+(s.total===undefined?'':s.total);}
@@ -1294,15 +1224,13 @@ async function doSearch(){
 }
 let radioList=[];
 function radioButtons(){
-  // The two actions follow the list on screen: there is nothing to queue or
-  // to save before the tab has an answer, and a greyed button says that
-  // without needing a sentence under it.
+  // There is nothing to queue or to save before the tab has an answer, and a greyed
+  // button says that without a sentence under it.
   $('radio-queue').disabled=$('radio-save').disabled=!radioList.length;
 }
 async function radioLoad(){
-  // Opening the tab is what asks the question, and the card answers it: the
-  // page never sees the account's access token, only the rows it shows and
-  // the two buttons that act on them.
+  // Opening the tab asks the question and the card answers it: the page never sees
+  // the account's access token, only the rows it shows and the two buttons on them.
   const d=await api('/api/radio');
   const ul=$('radio-list');ul.innerHTML='';
   radioList=d.ok?(d.tracks||[]):[];
@@ -1341,19 +1269,17 @@ async function radioSave(){
   // songs can still be queued.
 }
 async function loadQueue(){
-  // The list these rows are for is named before the wait, not after: if a
-  // different list loads while this one is being read, the next poll sees the
-  // mismatch and fetches again. A failed read puts it back to undefined, so the
-  // next poll retries instead of leaving an empty list until something is
-  // clicked.
+  // The list these rows are for is named before the wait, not after: if another list
+  // loads while this one is being read, the next poll sees the mismatch and fetches
+  // again. A failed read resets it, so the next poll retries instead of leaving an
+  // empty list until something is clicked.
   qplay=listkey(snap);
   const d=await api('/api/queue');const ul=$('queue');ul.innerHTML='';qrows=[];
   if(!d.ok){qplay=undefined;fail(d.error);return;}
-  // Every row, not a slice of the first few: the row being played has to be
-  // findable in green, and a list cut short can hide it. The number shown is the
-  // row's own index — the figure /api/queue/play takes back — and a row that
-  // answers without one sits at its own position, which is the order queue.list
-  // returns.
+  // Every row, not a slice: a list cut short can hide the row being played. The
+  // number shown is the row's own index - the figure /api/queue/play takes back -
+  // and a row that answers without one sits at its own position, which is the order
+  // queue.list returns.
   for(const[i,t]of(d.tracks||[]).entries()){
     const idx=Number.isInteger(t.index)?t.index:i;
     const li=document.createElement('li');
@@ -1368,12 +1294,10 @@ async function loadQueue(){
   mark();
 }
 function mark(){
-  // Which row to light up: the track the player says it is playing, and as a
-  // fallback the index it reports. Most of the time they agree. Verified on the
-  // card 2026-11-20 that they need not - right after a boot-time provider.load,
-  // the index was 5 while the track being played sat at row 0, a restored
-  // session's place against a freshly ordered list. So the track decides when it
-  // can, and only when it cannot does the index get its turn: one green row.
+  // Which row to light up: the track the player says it is playing, and only if it
+  // cannot name one, the index it reports. Verified on the card 2026-11-20 that they
+  // need not agree - after a boot-time provider.load the index was 5 while the playing
+  // track sat at row 0 - so the track decides first, and there is one green row.
   for(const r of qrows)r.classList.remove('cur');
   const t=snap.track||snap.logical_track||{};
   const path=String(t.path||'');
@@ -1383,12 +1307,10 @@ function mark(){
     if(Number(r.dataset.idx)===snap.index)r.classList.add('cur');
 }
 function useAtBoot(){
-  // One question, and the card answers it: what should the next boot load?
-  // Only the player knows whether it is sitting on a playlist, an album,
-  // one track or a stream, and the answer goes to `streamer remember` - the
-  // verb that writes the boot intent without restarting what is already
-  // playing, because restarting here would mean a second start and a trip
-  // back to the volume floor in the middle of a track. See /api/boot/now.
+  // One question, the card answers it: what should the next boot load? Only the
+  // player knows whether it sits on a playlist, an album, one track or a stream,
+  // and the answer goes to `streamer remember` - the verb that writes the boot intent
+  // without restarting what is already playing (see /api/boot/now).
   api('/api/boot/now',{}).then(d=>{if(!d.ok){fail(d.error);return;}poll();});
 }
 function intentMode(){
@@ -1410,9 +1332,8 @@ start();
 
 def main():
     if pidfile := os.environ.get("STREAMER_HTTP_PIDFILE"):
-        # setsid detaches this process from whoever started it, and a detached
-        # process is only killable by the person who knows its pid. The test
-        # harness asks for one; systemd never sets this knob.
+        # setsid detaches this process, and only its pid can kill it then. The
+        # test harness asks for one; systemd never sets this knob.
         with open(pidfile, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()) + "\n")
     if os.environ.get("STREAMER_HTTP_TEST_NO_LISTEN"):

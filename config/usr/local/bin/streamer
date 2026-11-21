@@ -34,12 +34,9 @@ usage() { # the command list at the top of this file, which is its own help text
     awk 'NR == 1 { next } /^set -eu/ { exit } { sub(/^# ?/, ""); print }' "$0"
 }
 
-# Some of these need root: systemctl on system units, the read-only root, the
-# boot partition, /data. The image ships /etc/sudoers.d/streamer for exactly
-# this, so ssh in as the normal user and the command says what it is doing
-# rather than failing with an access error. STREAMER_SUDO marks the second pass,
-# so a sudo that cannot escalate (no sudoers drop-in, say) reports the failure
-# instead of re-running itself forever.
+# Some commands need root: system units, the read-only root, /data. The
+# image ships a sudoers drop-in for exactly this, so they re-run under sudo
+# once (STREAMER_SUDO marks the second pass).
 needs_root() { # needs_root <command> [argument]
     case "$1" in
         play|station|playlist|album|track|reload|reset|rw|ro) return 0 ;;
@@ -48,22 +45,13 @@ needs_root() { # needs_root <command> [argument]
     esac
 }
 
-# Atomically replace the appliance record of what to play next boot and the
-# level to play it at. It lives on /data, so a power cut between here and the
-# next boot loses at most nothing: mode=stop keeps the box silent until it is
-# told to play again. Omitted arguments carry on what is already recorded, so
-# turning the volume down cannot forget the station and setting a station cannot
-# forget the level. Nothing else writes this file: what appears in boot.log as
-# "intent set" is always something a person did through the appliance.
+# Atomically replaces the record of what plays next boot and how loud. Omitted
+# arguments carry on what the file already holds, so changing the level cannot
+# forget the target. Nothing else writes this file.
 #
-# The optional title/artist/album arguments belong to a kind=track target. A
-# single provider track is the one target the boot cannot rebuild from its id
-# alone: cliamp 2.4.1 has no fetch-a-track-by-id call, so the row's display
-# strings are kept beside the id and streamer-play puts them back into the row
-# at boot. An omitted triple carries on what the file already holds (a volume
-# change must not lose them); a call that names them, even empty, wins; and any
-# other kind of target drops them, because a title left over from a track that
-# is no longer the target is noise at best.
+# title/artist/album belong to a kind=track target: cliamp 2.4.1 cannot fetch
+# a track by id, so streamer-play rebuilds the row from these strings. An
+# omitted triple carries on what the file holds; any other kind drops it.
 save_state() { # save_state <mode> <kind> <target> [provider] [volume] [title] [artist] [album]
     mode=$1 kind=$2 cur=$3
     [ "$#" -ge 4 ] && provider=$4
@@ -78,8 +66,7 @@ save_state() { # save_state <mode> <kind> <target> [provider] [volume] [title] [
     else
         t_title= t_artist= t_album=
     fi
-    # The file is one key=value per line, so a value with a newline in it would
-    # forge a line. No player row carries one; this is the guard, not the trust.
+    # A newline in a value would forge a line: guard, not trust.
     t_title=$(printf '%s' "${t_title:-}" | tr -d '\n\r')
     t_artist=$(printf '%s' "${t_artist:-}" | tr -d '\n\r')
     t_album=$(printf '%s' "${t_album:-}" | tr -d '\n\r')
@@ -98,17 +85,14 @@ save_state() { # save_state <mode> <kind> <target> [provider] [volume] [title] [
     } >"$tmp"
     mv -f "$tmp" "$STREAMER_STATE"
     sync
-    # The journal is volatile, so intent changes worth reading about a week later
-    # belong in the durable log too.
+    # journald is volatile, so intent changes also go to the durable log.
     /usr/local/bin/streamer-bootlog "intent set: mode=$mode kind=$kind target=$cur${provider:+ provider=$provider}${cur_vol:+ volume=$cur_vol}${t_title:+ title=$t_title}"
 }
 
 playlist_target() { # playlist_target <name | provider:id>
-    # Splits into pl_kind, pl_name, pl_provider. The difference matters at boot:
-    # a bare name is a playlist cliamp saved on disk, so streamer-play loads it
-    # with `cliamp load`; a name written provider:id — the spelling cliamp itself
-    # uses in its status output — is a playlist that lives on a streaming
-    # service, which only provider.load can fetch.
+    # Splits into pl_kind, pl_name, pl_provider. A bare name is a playlist cliamp
+# saved on disk, loaded with `cliamp load`; provider:id is the spelling cliamp
+# itself uses, and only provider.load can fetch it.
     pl_kind=playlist
     pl_name=$1
     pl_provider=
@@ -123,10 +107,8 @@ playlist_target() { # playlist_target <name | provider:id>
 }
 
 provider_target() { # provider_target <what> <provider:id>
-    # Album and track targets are useless without their service: unlike a
-    # saved playlist name, a bare id means nothing to anyone until the
-    # provider that minted it is named. So unlike playlist_target, a target
-    # without a provider prefix here is an error, not a local playlist.
+    # Unlike a saved playlist name, a bare id means nothing until the service that
+# minted it is named, so a missing prefix here is an error, not a local list.
     pt_id=$2 pt_provider=
     for pr in ${STREAMER_PROVIDERS:-tidal qobuz spotify}; do
         case "$2" in
@@ -139,10 +121,7 @@ provider_target() { # provider_target <what> <provider:id>
     }
 }
 
-json_num() { # json_num <json> <key> : that key's number, sign included. The
-             # real player pretty-prints and repeats some keys, so allow the
-             # space and keep the last hit. Must match the same helper in
-             # streamer-play: both read the player, one of them has to be right.
+json_num() { # key's number, sign included: last hit wins, keys repeat
     printf '%s' "$1" |
         sed -n "s/.*\"$2\": *\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" | tail -n 1
 }
@@ -154,8 +133,7 @@ save_level() { # record the level the player is actually at, after a change
     save_state "$mode" "$kind" "$cur" "$provider" "$lvl"
 }
 
-# Same rule as the boot script: last line wins for each key, so a file with a
-# repeated key cannot hand two values to one comparison.
+# Last line wins per key, as in the boot script.
 state_last() { sed -n "s/^$1=//p" "$STREAMER_STATE" 2>/dev/null | tail -n 1; }
 mode=$(state_last mode)
 kind=$(state_last kind)
@@ -171,9 +149,8 @@ cmd=${1:-status}
 shift || true
 
 if [ "$(id -u)" != 0 ] && needs_root "$cmd" "${1:-}" && [ -z "${STREAMER_SUDO:-}" ]; then
-    # One attempt only. A sudo that cannot escalate - before the first boot has
-    # installed the sudoers drop-in, say - then fails on its own merits at the
-    # operation that needs root, rather than re-running this command forever.
+    # One attempt: with no sudoers drop-in the failure should land on the
+# operation that needs root, not loop here.
     echo "$cmd needs root: re-running with sudo" >&2
     STREAMER_SUDO=1 exec sudo -E "$0" "$cmd" "$@"
 fi
@@ -189,8 +166,7 @@ case "$cmd" in
         printf 'boot level:  %s dB\n' "$lvl"
         ;;
     last)
-        # Everything the next boot needs, on one line: what to load, where it
-        # lives when it is not on this card, and the level to start at.
+        # Everything the next boot needs, on one line.
         printf '%s %s %s%s%s%s\n' "$mode" "$kind" "$cur" \
             "${provider:+ on $provider}" "${title:+ ($title)}" "${cur_vol:+ at $cur_vol dB}"
         ;;
@@ -223,18 +199,14 @@ case "$cmd" in
         ;;
     track)
         provider_target track "${1:?usage: streamer track <provider>:<id> [title] [artist] [album]}"
-        # The display strings are optional here: hand-typed on SSH, whoever
-        # types them usually does not have them at hand, and the track plays
-        # either way — they only decide what "now playing" shows afterwards.
+        # The strings only decide what "now playing" shows after the boot.
         save_state last track "$pt_id" "$pt_provider" "$cur_vol" "${2:-}" "${3:-}" "${4:-}"
         systemctl restart streamer-play.service
         ;;
     remember)
-        # Write down what should play next boot without touching what is playing
-        # now. The web page uses this when a playlist is tapped: that tap has
-        # already started the music, and `streamer playlist` on top of it would
-        # restart the boot sequence, which means a second start and a trip back
-        # to the volume floor in the middle of a track.
+        # Next boot only, without touching playback: a tapped playlist already started
+# the music, and `streamer playlist` on top would restart the boot sequence
+# from the floor mid-track.
         what=${1:?usage: streamer remember <station|playlist|album|track|mode> <target>}
         case "$what" in
             station)
@@ -251,9 +223,8 @@ case "$cmd" in
                 ;;
             track)
                 provider_target track "${2:?usage: streamer remember track <provider>:<id> [title] [artist] [album]}"
-                # Always pass the triple, empty included: the web page knows
-                # the strings from the row it just played, and a track tapped
-                # without them must not inherit the previous track's title.
+                # Always pass the triple, empty included: a row tapped without strings must
+# not inherit the last track's title.
                 save_state last track "$pt_id" "$pt_provider" "$cur_vol" "${3:-}" "${4:-}" "${5:-}"
                 ;;
             mode)
@@ -267,12 +238,9 @@ case "$cmd" in
         esac
         ;;
     stations)
-        # The list belongs to the radio service, not to this box, so this needs
-        # the network. Extracting pairs with grep rather than a JSON parser: the
-        # body may come back on one line or spread over many, and there is no jq
-        # on a lite image. The shape radio.cliamp.stream actually serves keys a
-        # station's stream URL as "stream", and also has "tracks_url", which the
-        # quoted pattern below deliberately does not match.
+        # The list belongs to the radio service, so this needs the network. grep, not a
+# JSON parser: no jq on the image, and the body's line shape varies. "stream"
+# quoted so "tracks_url" does not match.
         if out=$(curl -fsS --max-time 10 "$STREAMER_STATION_LIST" 2>/dev/null) && [ -n "$out" ]; then
             names=$(printf '%s' "$out" | grep -o '"name":"[^"]*"' | sed 's/^"name":"//; s/"$//')
             urls=$(printf '%s' "$out" | grep -o '"stream":"[^"]*"' | sed 's/^"stream":"//; s/"$//')
@@ -302,10 +270,8 @@ case "$cmd" in
         db=${1:?usage: streamer vol <dB>}
         case "$db" in -[0-9]*|[0-9]*) ;; *) echo "not a dB value: $db" >&2; exit 2 ;; esac
         cliamp volume "$db"
-        # The change is remembered straight away, and remembered from the
-        # player rather than from what was asked for: the player has a floor and
-        # a ceiling of its own, and the level it settled at is the one the next
-        # boot should aim at. Nothing saves the volume on a timer.
+        # Read back from the player, not from the request: it has its own floor and
+# ceiling, and what it settled at is what the next boot aims at. Not a timer.
         save_level
         ;;
     up|down)
@@ -317,28 +283,22 @@ case "$cmd" in
         save_level
         ;;
     reset)
-        # Put /data back exactly as it was when the card was built. The template
-        # it copies is the same tree the /data filesystem was made from at build
-        # time (see image/build.sh), so a reset card and a fresh card really are
-        # the same box. What it costs is everything you put on /data: the local
-        # music, and the Tidal sign-in, which lives in /data/cliamp.
+        # /data goes back to the tree the build seeded the partition from, so a reset
+# card and a fresh card are the same box. Costs the local music and the Tidal
+# sign-in.
         if [ "${1:-}" != --yes ]; then
             echo "this removes everything on $STREAMER_DATA, the Tidal sign-in with it:" >&2
             ls -1A "$STREAMER_DATA" 2>/dev/null | sed 's/^/  /' >&2
             echo "to go ahead: streamer reset --yes" >&2
             exit 2
         fi
-        # Stop the player before wiping the ground under it: it holds the IPC
-        # socket and the configuration directory open, and its exit handler
-        # writes to both.
+        # Stop the player first: it holds the IPC socket and the config directory open,
+# and its exit handler writes to both.
         systemctl stop streamer-play.service streamer-cliamp.service
-        # -mindepth/-maxdepth rather than `rm -rf "$STREAMER_DATA"/*`, because a
-        # shell glob skips dotfiles and leaves half of a stale state behind the
-        # new tree.
+        # find, not a shell glob: a glob skips dotfiles and leaves half a stale state.
         find "$STREAMER_DATA" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
         cp -a "$STREAMER_SEED/." "$STREAMER_DATA/"
-        # cp -a already keeps the ownership the template has (the appliance
-        # user), so this is only insurance against a hand-made template.
+        # cp -a keeps the template's ownership; insurance against a hand-made template.
         chown -R "$STREAMER_USER:$STREAMER_GROUP" "$STREAMER_DATA"
         sync
         /usr/local/bin/streamer-bootlog \
@@ -351,8 +311,7 @@ case "$cmd" in
         journalctl -u streamer-cliamp.service -u streamer-play.service -u streamer-http.service -b --no-pager
         ;;
     boots)
-        # The journal is volatile: it only covers the boot you are in. This is
-        # the record that survives a power cut.
+        # The record that survives a power cut; the journal covers only this boot.
         [ -f "$STREAMER_BOOTLOG" ] && tail -n 20 "$STREAMER_BOOTLOG" || echo "no boot log yet"
         ;;
     reload)
