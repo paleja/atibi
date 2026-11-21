@@ -380,6 +380,17 @@ gets corruptable itself mid-overlay-writeback):
   the music, and the plain play command on top would restart the boot
   sequence — a second start and a trip back to the volume floor — in the
   middle of a track.
+- **The player's name for what is loaded is loadable, its rows are not.**
+  The snapshot's `playlist` key is what the "use at boot" control reads, and
+  it comes back in four shapes, verified on the card 2026-11-21: `tidal:<list
+  id>` for a service playlist, `tidal:album:<album id>` for an album (a
+  spelling `provider.load` itself refuses, so the word `album` is taken back
+  out before the intent is written), a bare name for a playlist saved on the
+  card, and `radio:l:0` for the built-in cliamp radio channel — which `cliamp
+  load` cannot open (no such `.toml`), so it is only reachable as a provider
+  target, hence `radio` in `STREAMER_PROVIDERS`. A single `track.play` leaves
+  the key out altogether. Guessing any of this from the row on screen is
+  how the box ends up booting to silence, so the mapping lives on the card.
 - What each boot did is one line in `boot.log`: `OK <kind> <target> at N dB`
   or `FAIL …`, plus intent changes and audio-output switches, so the file
   reads as the box's history, not only its failures (§7).
@@ -416,6 +427,13 @@ and provider browsing/playlists/search through the player's own IPC socket.
 The token is generated on first boot into `/data`, owner-readable, printed
 once to the journal. Boot intent changes go through the same `streamer`
 command as over SSH, so floor, ramp and boot.log apply from every surface.
+Three tabs — **playing / browse / at boot**: what a reboot will load, and the
+control that makes the current thing the next boot's target, is a tab of its
+own rather than a button under "now playing". The radio section appears only
+while a provider the radio can follow is playing (`STREAMER_RADIO_PROVIDERS`,
+Tidal alone today): the card answers that question, so a provider it cannot
+follow — the built-in radio channel, a file on the card — shows no radio
+section instead of a button that would fail.
 
 Still open: physical power strategy — a soft-latch button or WoL-style
 policy instead of a dumb strip (§12).

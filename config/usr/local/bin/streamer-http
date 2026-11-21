@@ -39,6 +39,8 @@ Environment overrides (used by the test suite; systemd sets none):
   STREAMER_HTTP_TEST_NO_LISTEN  print the config and exit 0 (packaging checks)
   STREAMER_RADIO_SIZE     how many similar songs the radio offers (streamer.conf, then 50)
   STREAMER_TIDAL_CRED     the Tidal login this server borrows (streamer.conf, then <data>/cliamp/tidal_credentials.json)
+  STREAMER_PROVIDERS      the prefixes a target may carry (streamer.conf, then tidal qobuz spotify)
+  STREAMER_RADIO_PROVIDERS  providers whose rows the radio can follow (streamer.conf, then tidal)
 """
 
 import errno
@@ -64,14 +66,17 @@ PROVIDERS_CACHE = {"at": 0.0, "data": []}
 
 def read_conf(path):
     """The few key=value lines this server needs. Same file every streamer-*
-    script sources, so the knob set (port, token path) lives in one place."""
+    script sources, so the knob set (port, token path) lives in one place. A
+    double-quoted value may hold spaces, which is how the shell sources it too:
+    STREAMER_PROVIDERS is a list of names, and reading it unquoted would hand
+    this server a first word and a stray quote."""
     conf = {}
     try:
         with open(path, encoding="utf-8") as f:
             for line in f:
-                m = re.match(r"^([A-Z_][A-Z0-9_]*)=(\S+)", line)
+                m = re.match(r'^([A-Z_][A-Z0-9_]*)=("[^"]*"|\S+)', line)
                 if m:
-                    conf[m.group(1)] = m.group(2)
+                    conf[m.group(1)] = m.group(2).strip('"')
     except FileNotFoundError:
         pass
     return conf
@@ -103,6 +108,21 @@ class Config:
         self.tidal_cred = os.environ.get("STREAMER_TIDAL_CRED") or expand(
             conf.get("STREAMER_TIDAL_CRED",
                      "$STREAMER_DATA/cliamp/tidal_credentials.json"), conf)
+        # The list the streamer command reads, read here as well so a target
+        # this server writes is one that command spells the same way: it is
+        # what tells both of them where a provider name ends and a bare id
+        # begins.
+        self.providers = (os.environ.get("STREAMER_PROVIDERS")
+                          or conf.get("STREAMER_PROVIDERS",
+                                      "tidal qobuz spotify")).split()
+        # Which of those providers the radio can follow. Tidal is the only
+        # one whose API answers a track radio at all (see the note in the
+        # Tidal section), so this is the one honest place where "currently
+        # only Tidal is supported" is written down; the page asks the card
+        # instead of naming a provider itself.
+        self.radio_providers = (os.environ.get("STREAMER_RADIO_PROVIDERS")
+                                or conf.get("STREAMER_RADIO_PROVIDERS",
+                                            "tidal")).split()
 
     def token(self):
         """The LAN secret, made once and kept on /data. Printed to the journal
@@ -399,6 +419,91 @@ ALBUM_ROW = re.compile(r"\A([a-z][a-z0-9-]*)://album/(\S+)\Z")
 # cannot reach anything by that id anyway.
 TRACK_ROW = re.compile(r"\A([a-z][a-z0-9-]*)://track/(\S+)\Z")
 
+# What cliamp calls the list that is loaded, in the snapshot's "playlist" key.
+# Verified on the card 2026-11-21, four shapes, and only these four: a Tidal
+# playlist is "tidal:<list id>", a Tidal album is "tidal:album:<album id>" —
+# a spelling its own provider.load refuses, so the word "album" has to be
+# taken back out before the boot is told what to load — a playlist saved on
+# the card is its bare name ("cliampui"), and the built-in cliamp radio
+# channel is "radio:l:0", which `cliamp load` cannot open (no such .toml) and
+# only provider.load can. A single track played with track.play comes back
+# with no "playlist" key at all, list or not. That grammar is the reason the
+# boot intent cannot be worked out in the page: it is a fact about the player,
+# and a wrong guess writes an intent that boots to silence.
+LIST_ALBUM = re.compile(r"\A([a-z][a-z0-9-]*):album:(\S+)\Z")
+LIST_PROVIDER = re.compile(r"\A([a-z][a-z0-9-]*):(\S+)\Z")
+
+
+def snap_row(snap, key):
+    """The row under `key`, or nothing usable. A snapshot that answers a row
+    as a bare string (the harness does, for the built-in radio rows) must not
+    take /api/status down: the page polls that route every two seconds, so an
+    unparseable row is worth treating as "no row" rather than as an error."""
+    row = snap.get(key)
+    return row if isinstance(row, dict) else {}
+
+
+def radio_of(snap):
+    """The provider whose rows the radio can follow, for the row playing now
+    ('' when it is none of them: the built-in radio channel, a file on the
+    card). The page hides its radio section on this answer rather than testing
+    a path scheme in JavaScript, so a second supported service needs a knob
+    edit here and no change to the page at all."""
+    for key in ("track", "logical_track"):
+        row = snap_row(snap, key)
+        hit = TRACK_ROW.match(str(row.get("path", "")))
+        if hit and hit.group(1) in CFG.radio_providers:
+            return hit.group(1)
+    return ""
+
+
+def boot_target(snap):
+    """`streamer remember`'s own arguments, for whatever the player is on.
+
+    The list name wins when the player has one, because the thing a reboot
+    should bring back is the list, not the row it happens to have reached:
+    a list name is loadable, a row id in the middle of it is not. Only
+    names the streamer command can spell are accepted (CFG.providers), and
+    anything that has no such name falls back to the playing row: an album
+    or track row through its provider, a stream by its URL. Rows whose path
+    is a file on the card are refused outright — the boot cannot reach
+    anything by that path.
+    """
+    label = str(snap.get("playlist") or "")
+    hit = LIST_ALBUM.match(label)
+    if hit and hit.group(1) in CFG.providers:
+        return ["album", "%s:%s" % (hit.group(1), hit.group(2))]
+    hit = LIST_PROVIDER.match(label)
+    if hit and hit.group(1) in CFG.providers:
+        return ["playlist", "%s:%s" % (hit.group(1), hit.group(2))]
+    if label and ":" not in label:
+        # A playlist saved on the card: `streamer playlist <name>` and
+        # streamer-play's own playlist branch use that name as cliamp does.
+        return ["playlist", label]
+    for key in ("logical_track", "track"):
+        row = snap_row(snap, key)
+        path = str(row.get("path", ""))
+        hit = ALBUM_ROW.match(path)
+        if hit and hit.group(1) in CFG.providers:
+            meta = row.get("provider_meta") or {}
+            album = str(meta.get("albumID") or hit.group(2))
+            return ["album", "%s:%s" % (hit.group(1), album)]
+        hit = TRACK_ROW.match(path)
+        if hit and hit.group(1) in CFG.providers:
+            tid = str((row.get("provider_meta") or {}).get(
+                "%s.id" % hit.group(1)) or hit.group(2))
+            # The display strings come from the row the player is holding:
+            # cliamp 2.4.1 has no fetch-a-track-by-id call, so they are all
+            # the boot will have. Empty ones are passed on purpose, so a
+            # row without an artist cannot inherit the previous track's.
+            return ["track", "%s:%s" % (hit.group(1), tid),
+                    str(row.get("title", "")),
+                    str(row.get("artist", "")),
+                    str(row.get("album", ""))]
+        if path.startswith("http://") or path.startswith("https://"):
+            return ["station", path]
+    raise IpcError("nothing playing that the next boot could reach")
+
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -488,6 +593,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "seekable", "volume", "playlist", "index", "total",
                     "shuffle", "repeat", "stream_error")
             out = {k: snap[k] for k in keep if k in snap}
+            # Which provider the radio can follow, for the row playing now:
+            # the page's radio section is only shown when this names one, so
+            # the section cannot offer to queue songs for a file on the card
+            # or for the built-in radio channel.
+            out["radio"] = radio_of(snap)
             out["intent"] = read_intent()
             self._json_out({"ok": True, **out})
             return
@@ -695,6 +805,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json_out({"ok": True, "streamer": out,
                             "intent": read_intent()})
             return
+        if path == "/api/boot/now":
+            # The page's "use at boot" button: make what plays now what plays
+            # next boot. The card works out the shape (see boot_target), so
+            # the page asks one dumb question instead of guessing whether the
+            # row on screen stands for a list, an album or one song. `remember`
+            # and not a restarting verb: the music is already running, and a
+            # start here would mean a second start and a trip back to the
+            # volume floor in the middle of a track.
+            argv = boot_target(ipc("state.get").get("snapshot", {}))
+            out = run_streamer("remember", *argv)
+            self._json_out({"ok": True, "streamer": out,
+                            "intent": read_intent()})
+            return
         if path == "/api/radio/queue":
             # Extend the live queue with the similar songs. The list is read
             # from Tidal again here rather than taken from the page's preview:
@@ -875,7 +998,6 @@ a{color:var(--acc)}
  <div class="row" style="margin-top:8px">
   <button onclick="op('shuffle')">shuffle</button>
   <button onclick="op('repeat')">repeat</button>
-  <button onclick="intentMode()">boot: <span id="mode">?</span></button>
  </div>
  <div class="err" id="err"></div>
 </div>
@@ -883,27 +1005,32 @@ a{color:var(--acc)}
 <div class="tabs">
  <button id="tab-now" class="on" onclick="tab('now')">playing</button>
  <button id="tab-browse" onclick="tab('browse')">browse</button>
+ <button id="tab-boot" onclick="tab('boot')">at boot</button>
 </div>
 
 <div id="now" class="card">
- <h1>boot station</h1>
- <div id="intent" class="sub"></div>
- <div class="row" style="margin-top:8px">
-  <button onclick="intentStation()">play this again after a reboot</button>
- </div>
- <h1 style="margin-top:14px">radio</h1>
- <div class="dim" style="margin-top:2px">similar songs for the Tidal track playing now. They play before the rest of the loaded list; what a reboot brings back stays the saved list as it was.</div>
- <div class="row" style="margin-top:8px">
-  <button onclick="radioLoad()">show similar songs</button>
- </div>
- <ul id="radio" class="hidden" style="margin-top:6px"></ul>
- <div class="row hidden" id="radio-go" style="margin-top:8px">
-  <button onclick="radioQueue()">queue these</button>
-  <button onclick="radioSave()">save as playlist&hellip;</button>
- </div>
- <h1 style="margin-top:14px">playlist</h1>
+ <h1>playlist</h1>
  <div class="dim" style="margin-top:2px">tap a track to start it — the green row is what is playing.</div>
  <ul id="queue"></ul>
+ <div id="radio-sec" class="hidden">
+  <div class="row" style="margin-top:14px">
+   <button title="similar songs for the Tidal track playing now. They play before the rest of the loaded list; what a reboot brings back stays the saved list as it was." onclick="radioLoad()">radio</button>
+  </div>
+  <ul id="radio" class="hidden" style="margin-top:6px"></ul>
+  <div class="row hidden" id="radio-go" style="margin-top:8px">
+   <button onclick="radioQueue()">queue these</button>
+   <button onclick="radioSave()">save as playlist&hellip;</button>
+  </div>
+ </div>
+</div>
+
+<div id="boot" class="card hidden">
+ <h1>what plays next boot</h1>
+ <div id="intent" class="sub"></div>
+ <div class="row" style="margin-top:8px">
+  <button onclick="useAtBoot()">use at boot</button>
+  <button onclick="intentMode()">boot: <span id="mode">?</span></button>
+ </div>
 </div>
 
 <div id="browse" class="hidden">
@@ -991,6 +1118,11 @@ function render(s){
   const svc=m.kind in lbl&&m.kind!=='playlist'?(m.provider||'?')+': ':'';
   const shown=(m.kind==='track'&&(m.title||''))?m.title:(m.target||'(default)');
   $('intent').textContent=(lbl[m.kind]||'')+svc+shown+(m.volume?(' at '+m.volume+' dB to start with'):' (level not saved)');
+  // The radio section only means something for a provider that has one, and
+  // the card says which one it can follow for the row playing now; hidden
+  // otherwise, so a file on the card or the built-in radio channel does not
+  // offer to queue songs for it. See /api/status' radio field.
+  $('radio-sec').classList.toggle('hidden',!s.radio);
   mark();
   // The rows being shown are only honest if they are the list being played, so
   // they are fetched whenever that changes: another phone, the browse tab, a
@@ -1008,9 +1140,10 @@ async function poll(){
 }
 setInterval(()=>{if(playing){tick+=0.5;paintBar();}},500);
 function tab(name){
-  for(const t of['now','browse']){$('tab-'+t).classList.toggle('on',t===name);$(t).classList.toggle('hidden',t!==name);}
+  for(const t of['now','browse','boot']){$('tab-'+t).classList.toggle('on',t===name);$(t).classList.toggle('hidden',t!==name);}
   if(name==='browse')loadProviders();
   if(name==='now')loadQueue();
+  if(name==='boot')poll();   // this tab is all about the saved intent: show it now
 }
 async function loadProviders(){
   const d=await api('/api/providers');if(!d.ok){fail(d.error);return;}
@@ -1129,20 +1262,14 @@ function mark(){
   if(!lit&&Number.isInteger(snap.index))for(const r of qrows)
     if(Number(r.dataset.idx)===snap.index)r.classList.add('cur');
 }
-function intentStation(){
-  api('/api/status').then(s=>{
-    // cliamp's own name for what is loaded, when it has one: "tidal:<id>" or
-    // "local:<name>". That is the form the boot can load again. The path of the
-    // track under it is no use here: for a streaming service it reads
-    // tidal://track/123, and url.load answers that with "no such file".
-    if(s.playlist){
-      api('/api/intent',{kind:'playlist',target:s.playlist}).then(r=>{if(!r.ok)fail(r.error);poll();});
-      return;
-    }
-    const t=s.logical_track||s.track||{};
-    if(!t.path){fail('nothing playing that has a URL');return;}
-    api('/api/intent',{kind:'station',target:t.path}).then(r=>{if(!r.ok)fail(r.error);poll();});
-  });
+function useAtBoot(){
+  // One question, and the card answers it: what should the next boot load?
+  // Only the player knows whether it is sitting on a playlist, an album,
+  // one track or a stream, and the answer goes to `streamer remember` - the
+  // verb that writes the boot intent without restarting what is already
+  // playing, because restarting here would mean a second start and a trip
+  // back to the volume floor in the middle of a track. See /api/boot/now.
+  api('/api/boot/now',{}).then(d=>{if(!d.ok){fail(d.error);return;}poll();});
 }
 function intentMode(){
   api('/api/status').then(s=>{

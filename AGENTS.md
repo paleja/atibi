@@ -82,6 +82,13 @@ break one of these and a test should say so:
   flock on the log file itself.
 - A playlist on a streaming service is stored as `kind=provider` and loaded
   with `provider.load`; `cliamp load` only resolves lists saved on the card.
+- What a reboot should load is worked out on the card, not in the page:
+  `boot_target()` (streamer-http) maps the snapshot's `playlist` label —
+  `tidal:<id>`, `tidal:album:<id>`, a bare saved-playlist name, `radio:l:0`
+  — onto the right `streamer remember` verb, and `/api/boot/now` is the page's
+  one question. A row's path is a fallback, never the first choice. The same
+  file answers "can the radio follow this?" (`radio_of`, `STREAMER_RADIO_PROVIDERS`),
+  which is what the page's radio section hides on.
 - cliamp `status --json` pretty-prints with two-space indent. The fixtures
   answer the same way; extractors that assume compact JSON are a known
   failure mode with a mutation entry guarding it.
