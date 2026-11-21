@@ -429,11 +429,20 @@ once to the journal. Boot intent changes go through the same `streamer`
 command as over SSH, so floor, ramp and boot.log apply from every surface.
 Three tabs — **playing / browse / at boot**: what a reboot will load, and the
 control that makes the current thing the next boot's target, is a tab of its
-own rather than a button under "now playing". The radio section appears only
-while a provider the radio can follow is playing (`STREAMER_RADIO_PROVIDERS`,
-Tidal alone today): the card answers that question, so a provider it cannot
-follow — the built-in radio channel, a file on the card — shows no radio
-section instead of a button that would fail.
+own rather than a button under "now playing". That control is labelled **use
+the now playing**, and it is the only thing on the page that changes what
+boots: tapping a list or a search row in **browse**, or a row of the live
+list, plays, and stops at that. The radio button sits with shuffle and
+repeat, because it acts on the row playing now and not on a tab; it is
+dimmed rather than hidden when the provider cannot be followed
+(`STREAMER_RADIO_PROVIDERS`, Tidal alone today), and the list of songs it
+asks for appears only then — the card answers that question, so a provider
+it cannot follow, the built-in radio channel or a file on the card, shows
+no similar-songs list instead of a button that would fail. A list is shown
+by the name its owner gave it (`tidal:Lana`) wherever the card can look it
+up, and by the id the player reports where it cannot: an id on screen is
+worse than a name, but it is still the truth, and the raw label stays what
+identifies the list whose rows are on screen.
 
 Still open: physical power strategy — a soft-latch button or WoL-style
 policy instead of a dumb strip (§12).

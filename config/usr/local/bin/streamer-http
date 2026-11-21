@@ -433,6 +433,49 @@ TRACK_ROW = re.compile(r"\A([a-z][a-z0-9-]*)://track/(\S+)\Z")
 LIST_ALBUM = re.compile(r"\A([a-z][a-z0-9-]*):album:(\S+)\Z")
 LIST_PROVIDER = re.compile(r"\A([a-z][a-z0-9-]*):(\S+)\Z")
 
+# Provider -> (when it was read, {list id: name}). The listing is the only
+# place a list's own name comes from, and it is kept because the page polls
+# /api/status every two seconds while `provider.playlists` is a call to the
+# service: one read per provider every LIST_NAMES_TTL seconds, whatever else
+# the poll does. A provider that answers nothing is cached as an empty listing,
+# so a broken provider is not asked about on every poll either; a list renamed
+# in the account appears under its new name at the next read.
+LISTS_CACHE = {}
+LIST_NAMES_TTL = 15
+
+
+def list_names(provider):
+    got = LISTS_CACHE.get(provider)
+    if got and time.time() - got[0] < LIST_NAMES_TTL:
+        return got[1]
+    names = {}
+    try:
+        res = ipc_op("provider.playlists", {"provider": provider, "limit": 100})
+        for row in res.get("playlists", []):
+            if isinstance(row, dict) and row.get("id") is not None:
+                names[str(row["id"])] = str(row.get("name") or "")
+    except Exception:
+        pass                         # see LISTS_CACHE: the caller falls back
+    LISTS_CACHE[provider] = (time.time(), names)
+    return names
+
+
+def list_name(label):
+    """The player's label for a loaded list, said the way its owner would.
+
+    The snapshot spells a Tidal list by its id (`tidal:b9823cb3-f037-42dd-…`),
+    which is what the page has been showing; the person looking at it knows
+    that list as `tidal:Lana`. A bare label (a playlist saved on the card is
+    its own name) and an id that is not in the provider's listing are returned
+    unchanged: showing an id is worse than a name, but it is still the truth,
+    and guessing is not on offer."""
+    label = str(label or "")
+    hit = LIST_PROVIDER.match(label)
+    if not hit or hit.group(1) not in CFG.providers:
+        return label
+    name = list_names(hit.group(1)).get(hit.group(2), "")
+    return "%s:%s" % (hit.group(1), name) if name else label
+
 
 def snap_row(snap, key):
     """The row under `key`, or nothing usable. A snapshot that answers a row
@@ -598,7 +641,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # the section cannot offer to queue songs for a file on the card
             # or for the built-in radio channel.
             out["radio"] = radio_of(snap)
-            out["intent"] = read_intent()
+            # The same list the player names by its id, said the way its owner
+            # would say it: see list_name. Two spellings ride along, and the
+            # page prefers the name - it has to keep the raw `playlist` label
+            # too, because that label is what `listkey` identifies the list
+            # whose rows are on screen, and a name is not unique.
+            out["playlist_name"] = list_name(snap.get("playlist", ""))
+            intent = read_intent()
+            if intent["kind"] == "provider" and intent["provider"]:
+                # The boot card's line gets the same courtesy: the intent file
+                # holds the list id, and a person choosing what boots wants the
+                # name they gave that list. Bare, without the provider in front:
+                # that line already spells the provider itself. Unset when the
+                # list is not in the provider's listing, so the card falls back
+                # to the id rather than to nothing.
+                name = list_names(intent["provider"]).get(intent["target"], "")
+                if name:
+                    intent["name"] = name
+            out["intent"] = intent
             self._json_out({"ok": True, **out})
             return
         if path == "/api/providers":
@@ -689,15 +749,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json_out({"ok": False, "error": "provider and id required"}, 400)
                 return
             ipc_op("provider.load", {"provider": provider, "playlist": pid})
-            # A playlist started from the phone is what should play after the
-            # next reboot, so it is written down — through the streamer command,
-            # with the provider:id spelling that command understands. Not
-            # `streamer playlist` on its own: that verb also restarts the boot
-            # sequence, which on top of a click would mean the track starts
-            # again, quietly, from the volume floor.
-            self._json_out({"ok": True,
-                            "streamer": run_streamer("remember", "playlist",
-                                                     "%s:%s" % (provider, pid))})
+            # Nothing is remembered here. What plays next boot is something
+            # only two things set: the `streamer` command, and the page's
+            # "use the now playing" button. A tap in the browse tab plays,
+            # and that is all it claims to do - the boot target is a separate
+            # decision, taken in the "at boot" tab.
+            self._json_out({"ok": True})
             return
         if path == "/api/load/url":
             url = str(body.get("url", ""))
@@ -746,36 +803,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 album = str(meta.get("albumID") or hit.group(2))
                 ipc_op("provider.load_album",
                        {"provider": hit.group(1), "album": album})
-                # And it is remembered, through the streamer command, the same
-                # way /api/load/playlist remembers a tapped playlist: what was
-                # tapped on the phone is what should play after the next
-                # reboot. remember, not a restarting verb: the music already
-                # started on this tap.
-                self._json_out({"ok": True,
-                                "streamer": run_streamer(
-                                    "remember", "album",
-                                    "%s:%s" % (hit.group(1), album))})
+                self._json_out({"ok": True})
                 return
             ipc_op("track.play", {"track": track})
-            thit = TRACK_ROW.match(str(track.get("path", "")))
-            if thit:
-                provider = thit.group(1)
-                tid = str((track.get("provider_meta") or {}).get(
-                    "%s.id" % provider) or thit.group(2))
-                # The display strings come from the row the page is holding:
-                # the boot has no fetch-a-track-by-id call on cliamp 2.4.1, so
-                # what shows in "now playing" after a reboot is what is saved
-                # here. Empty strings are passed on purpose, so a row without
-                # an artist cannot inherit the previous track's.
-                self._json_out({"ok": True,
-                                "streamer": run_streamer(
-                                    "remember", "track",
-                                    "%s:%s" % (provider, tid),
-                                    str(track.get("title", "")),
-                                    str(track.get("artist", "")),
-                                    str(track.get("album", "")))})
-            else:
-                self._json_out({"ok": True})
+            # Playing a row from the phone is not a boot decision either
+            # (see /api/load/playlist): what the next reboot loads stays
+            # whatever the "at boot" tab says it is.
+            self._json_out({"ok": True})
             return
         if path == "/api/intent":
             # Straight to the streamer command: the only sanctioned writer of
@@ -806,13 +840,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "intent": read_intent()})
             return
         if path == "/api/boot/now":
-            # The page's "use at boot" button: make what plays now what plays
-            # next boot. The card works out the shape (see boot_target), so
-            # the page asks one dumb question instead of guessing whether the
-            # row on screen stands for a list, an album or one song. `remember`
-            # and not a restarting verb: the music is already running, and a
-            # start here would mean a second start and a trip back to the
-            # volume floor in the middle of a track.
+            # The page's "use the now playing" button: make what plays now
+            # what plays next boot. Nothing else on the page does that - a
+            # tap in the browse tab or on a row of the list only plays. The
+            # card works out the shape (see boot_target), so the page asks
+            # one dumb question instead of guessing whether the row on screen
+            # stands for a list, an album, one track or a stream, and the
+            # answer goes to `streamer remember` - the verb that writes the
+            # boot intent without restarting what is already playing, because
+            # restarting here would mean a second start and a trip back to
+            # the volume floor in the middle of a track.
             argv = boot_target(ipc("state.get").get("snapshot", {}))
             out = run_streamer("remember", *argv)
             self._json_out({"ok": True, "streamer": out,
@@ -949,6 +986,10 @@ h1{font-size:15px;margin:0 0 6px;color:var(--dim);font-weight:600}
 button{background:#243040;border:0;color:var(--fg);border-radius:10px;
 padding:12px 14px;font-size:16px;cursor:pointer}
 button:active{background:#2e3c50}
+/* What the card cannot act on right now: the radio button, when the row
+   playing has no provider with similar songs to ask for. See the page's
+   render() and /api/status' radio field. */
+button[disabled]{opacity:.45;cursor:default}
 button.big{font-size:26px;flex:1;padding:16px}
 input[type=range]{flex:1;accent-color:var(--acc)}
 .tabs{display:flex;gap:8px;margin-bottom:12px}
@@ -998,6 +1039,7 @@ a{color:var(--acc)}
  <div class="row" style="margin-top:8px">
   <button onclick="op('shuffle')">shuffle</button>
   <button onclick="op('repeat')">repeat</button>
+  <button id="radio-btn" title="similar songs for the track playing now. They play before the rest of the loaded list; what a reboot brings back stays the saved list as it was." onclick="radioLoad()">radio</button>
  </div>
  <div class="err" id="err"></div>
 </div>
@@ -1013,9 +1055,7 @@ a{color:var(--acc)}
  <div class="dim" style="margin-top:2px">tap a track to start it — the green row is what is playing.</div>
  <ul id="queue"></ul>
  <div id="radio-sec" class="hidden">
-  <div class="row" style="margin-top:14px">
-   <button title="similar songs for the Tidal track playing now. They play before the rest of the loaded list; what a reboot brings back stays the saved list as it was." onclick="radioLoad()">radio</button>
-  </div>
+  <div class="dim" style="margin-top:14px">songs like the one playing now — tap radio above to ask for them.</div>
   <ul id="radio" class="hidden" style="margin-top:6px"></ul>
   <div class="row hidden" id="radio-go" style="margin-top:8px">
    <button onclick="radioQueue()">queue these</button>
@@ -1028,7 +1068,7 @@ a{color:var(--acc)}
  <h1>what plays next boot</h1>
  <div id="intent" class="sub"></div>
  <div class="row" style="margin-top:8px">
-  <button onclick="useAtBoot()">use at boot</button>
+  <button onclick="useAtBoot()">use the now playing</button>
   <button onclick="intentMode()">boot: <span id="mode">?</span></button>
  </div>
 </div>
@@ -1107,8 +1147,12 @@ function setVol(){api('/api/op/volume',{value:Number($('v').value)}).then(d=>{if
 function render(s){
   snap=s;
   const t=s.track||s.logical_track||{};
+  // The list is named for its owner where the player knows a name for it
+  // (see list_name); the raw label stays in s.playlist, and listkey() keeps
+  // using that one, because a name is not unique and an id is.
+  const lname=s.playlist_name||s.playlist;
   $('t').textContent=t.title||'nothing playing';
-  $('s').textContent=[t.artist,t.station&&('· '+t.station),s.playlist&&('· '+s.playlist)].filter(Boolean).join(' ');
+  $('s').textContent=[t.artist,t.station&&('· '+t.station),lname&&('· '+lname)].filter(Boolean).join(' ');
   playing=s.state==='playing';$('pp').textContent=playing?'⏸':'▶';
   pos=s.position||0;dur=s.duration||0;
   $('vd').textContent=(s.volume===undefined?'':s.volume+' dB');
@@ -1116,12 +1160,18 @@ function render(s){
   const m=s.intent||{};$('mode').textContent=m.mode||'last';
   const lbl={provider:'playlist on ',album:'album on ',track:'track on ',playlist:'playlist: '};
   const svc=m.kind in lbl&&m.kind!=='playlist'?(m.provider||'?')+': ':'';
-  const shown=(m.kind==='track'&&(m.title||''))?m.title:(m.target||'(default)');
+  // The name before the id: the intent file can only hold the list id the
+  // provider gave it, and /api/status sends back the name the owner gave it
+  // (see list_name). Without that name the id is shown, never nothing.
+  const shown=(m.kind==='track'&&(m.title||''))?m.title:(m.name||m.target||'(default)');
   $('intent').textContent=(lbl[m.kind]||'')+svc+shown+(m.volume?(' at '+m.volume+' dB to start with'):' (level not saved)');
-  // The radio section only means something for a provider that has one, and
-  // the card says which one it can follow for the row playing now; hidden
-  // otherwise, so a file on the card or the built-in radio channel does not
-  // offer to queue songs for it. See /api/status' radio field.
+  // The radio button sits with shuffle and repeat, because it acts on the row
+  // playing now, wherever that is; the card says which provider it can follow
+  // for that row (see /api/status' radio field), and dead means dead: disabled
+  // rather than hidden, so the one row of similar songs below stays hidden too
+  // and a file on the card or the built-in radio channel cannot be offered
+  // songs it does not have.
+  $('radio-btn').disabled=!s.radio;
   $('radio-sec').classList.toggle('hidden',!s.radio);
   mark();
   // The rows being shown are only honest if they are the list being played, so
@@ -1185,6 +1235,11 @@ async function doSearch(){
 }
 let radioList=[];
 async function radioLoad(){
+  // The button lives in the top card, where the row it acts on is readable
+  // from any tab, while the songs it asks for are listed in the playing tab:
+  // the tab moves first, so a tap never asks a question whose answer sits
+  // off screen.
+  tab('now');
   // Tidal's list, fetched by the card: the page never sees the account's
   // access token, only the rows it shows and the two buttons that act on them.
   const d=await api('/api/radio');

@@ -279,10 +279,12 @@ MUTATIONS = [
      'self._json_out({"ok": True, "streamer": run_streamer("vol", repr(db))})',
      'self._json_out(self._op("volume", {"value": db}))',
      "and it is the level the next boot will start at"),
-    ("a playlist tapped on the phone plays once and is never remembered", HTTP,
-     'self._json_out({"ok": True,\n                            "streamer": run_streamer("remember", "playlist",\n                                                     "%s:%s" % (provider, pid))})',
-     'self._json_out({"ok": True})',
-     "that tap is what the next boot will load, as a provider target"),
+    ("a playlist tapped on the phone becomes the boot target nobody asked "
+     "for", HTTP,
+     '            ipc_op("provider.load", {"provider": provider, "playlist": pid})',
+     '            ipc_op("provider.load", {"provider": provider, "playlist": pid})\n'
+     '            run_streamer("remember", "playlist", "%s:%s" % (provider, pid))',
+     "a tapped list does not rewrite what the next boot loads"),
     ("the submit envelope nests its operation inside params, as the fixture "
      "used to allow and the real player never did", HTTP,
      'reply = ipc("operation.submit", params, id_hint="h",\n'

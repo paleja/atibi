@@ -1281,15 +1281,22 @@ run() { # run <scenario number>
             "$(http POST /api/play '{"track":{"title":"y","path":"tidal://track/9","stream":true,"provider_meta":{"tidal.id":"9"}}}')" '"ok":true'
         ck_eq "the player was asked for that exact row, once" \
             "$(grep -c '^track.play ' "$T/ipc.log")" "1"
+        # The intent file as it stands before the tap, kept for the check
+        # after it: see the three lines below.
+        before_tap=$(cat "$T/data/streamer/state")
         ck_has "a listed playlist loads through provider.load" \
             "$(http POST /api/load/playlist '{"provider":"tidal","id":"pl-1"}')" '"ok":true'
         ck_eq "provider.load carried the provider and the list id" \
             "$(grep -c '^provider.load {"provider":"tidal","playlist":"pl-1"}' "$T/ipc.log")" "1"
-        ck_in "that tap is what the next boot will load, as a provider target" \
-            "$T/data/streamer/state" "kind=provider"
-        ck_in "with its provider named" "$T/data/streamer/state" "provider=tidal"
-        ck_in "and its list id" "$T/data/streamer/state" "target=pl-1"
-        ck_not "and recording it did not restart the boot sequence under the music" \
+        # What plays next boot is a decision someone makes, not a side effect
+        # of a tap (docs/PRD.md: the intent file has exactly one writer, the
+        # streamer command, and the page reaches it only through the "use the
+        # now playing" button). So the intent file is compared byte for byte:
+        # a load that quietly recorded itself would change these lines, and the
+        # next reboot would come back to a list nobody chose.
+        ck_eq "a tapped list does not rewrite what the next boot loads" \
+            "$(cat "$T/data/streamer/state")" "$before_tap"
+        ck_not "and nothing about it is restarted under the music" \
             "$T/systemctl" "restart streamer-play.service"
         # Boot intent is the part with consequences, so the guards are checked
         # in both directions: the sanctioned path, and the rejections around it.

@@ -72,8 +72,13 @@ break one of these and a test should say so:
 - `/data/streamer/state` (the boot intent: `mode`/`kind`/`target`, plus
   `provider=`/`volume=` when they apply) has exactly one writer: the
   `streamer` command, when a person changes something. The HTTP server
-  shells out to the same command; it never writes the record itself. That is
-  what keeps the volume floor, the ramp and boot.log unavoidable.
+  shells out to the same command; it never writes the record itself. On the
+  page, only two things reach it: the "use the now playing" button
+  (`/api/boot/now` → `streamer remember`) and the explicit `station|playlist|mode`
+  call (`/api/intent`). Tapping a list, an album, a track or a row of the
+  live list plays and writes nothing — what boots is a decision, never a
+  side effect. That is what keeps the volume floor, the ramp and boot.log
+  unavoidable.
 - Only `streamer-play` starts audio. The daemon exists to hold the IPC
   socket and sit at the floor; the ramp guards (a level that will not move,
   a step budget, a level set elsewhere) live in that script.
@@ -88,7 +93,12 @@ break one of these and a test should say so:
   — onto the right `streamer remember` verb, and `/api/boot/now` is the page's
   one question. A row's path is a fallback, never the first choice. The same
   file answers "can the radio follow this?" (`radio_of`, `STREAMER_RADIO_PROVIDERS`),
-  which is what the page's radio section hides on.
+  which is what the page dims its radio button on and hides its similar-songs
+  list on. And it puts a name on a list where the provider has one (`list_name`,
+  `playlist_name`, cached per provider for `LIST_NAMES_TTL` s because the page
+  polls `/api/status` every 2 s): the page prefers that name for the now line
+  and the boot line, while `listkey()` keeps matching on the raw `playlist`
+  label — names are not unique, ids are.
 - cliamp `status --json` pretty-prints with two-space indent. The fixtures
   answer the same way; extractors that assume compact JSON are a known
   failure mode with a mutation entry guarding it.
