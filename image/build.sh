@@ -150,7 +150,10 @@ done
 # A unit that starts a script with no #! line dies with 203/Exec format error:
 # on a headless box that is a silent speaker and one journal line nobody reads.
 # This check has earned its place - one such file cost an afternoon of chasing.
+# A host __pycache__ left among the scripts is not a script: it has no #! line,
+# and it is byte-code from this machine, not something the payload ships.
 for script in "$CONFIG"/usr/local/bin/*; do
+    [ -f "$script" ] || continue
     [ "$(head -c 2 "$script")" = "#!" ] ||
         die "$(basename "$script") has no #! line: systemd cannot start it"
 done
@@ -518,6 +521,7 @@ cp -a "$CONFIG/etc/systemd/system/." "$R/etc/systemd/system/"
 cp -a "$CONFIG/etc/streamer/." "$R/etc/streamer/"
 install -m 644 "$CONFIG/etc/streamer.conf" "$R/etc/streamer.conf"
 for script in "$CONFIG"/usr/local/bin/*; do
+    [ -f "$script" ] || continue
     install -m 755 "$script" "$R/usr/local/bin/$(basename "$script")"
 done
 # The payload's shared library: one implementation of the knobs, the record,
@@ -528,9 +532,15 @@ done
 install -d -m 755 "$R/usr/local/lib/python3.13/dist-packages"
 cp -a "$CONFIG/usr/local/lib/python3.13/dist-packages/streamer" \
        "$R/usr/local/lib/python3.13/dist-packages/"
+# Host byte-code does not belong on a card: a .pyc written by another minor
+# version is ignored by the card's python, and a read-only root means the card
+# can never rewrite it. Byte-code from this host (3.14) was found in that
+# directory on the card (checked 2026-11-21), so the tree is pruned here whatever
+# the working copy holds: what ships is what this repo ships.
+find "$R/usr/local/lib/python3.13/dist-packages" -name __pycache__ -type d \
+    -exec rm -rf {} + 2>/dev/null || true
 [ -d "$R/usr/lib/python3.13" ] ||
-    die "the payload is a python3.13 package and this base image has no such "
-        "standard library: the units would not find it"
+    die "the payload is a python3.13 package and this base image has no such standard library: the units would not find it"
 install -m 755 "$CLIAMP" "$R/usr/local/bin/cliamp"
 install -m 755 "$FFMPEG" "$R/usr/local/bin/ffmpeg"
 # A unit naming an interpreter the image lacks comes up 203/EXEC: a silent speaker
@@ -546,8 +556,7 @@ for script in "$R"/usr/local/bin/*; do
                 die "$(basename "$script") wants /bin/sh and the base image has none" ;;
         "#!/usr/bin/env python3")
             [ -x "$R/usr/bin/python3" ] ||
-                die "$(basename "$script") runs python3, which this base image does not ship: "
-                    "the payload cannot start" ;;
+                die "$(basename "$script") runs python3, which this base image does not ship: the payload cannot start" ;;
         *)
             die "$(basename "$script") names an unexpected interpreter: $shebang" ;;
     esac
@@ -559,9 +568,10 @@ done
 if ! PYTHONDONTWRITEBYTECODE=1 python3 - "$CONFIG" <<PY
 import ast, sys, pathlib
 root = pathlib.Path(sys.argv[1])
-files = list(root.glob("usr/local/lib/**/*.py")) + [
-    root / "usr/local/bin/streamer", root / "usr/local/bin/streamer-play",
-    root / "usr/local/bin/streamer-http"]
+files = list(root.glob("usr/local/lib/**/*.py"))
+files += [path for path in sorted(root.glob("usr/local/bin/*"))
+          if path.is_file() and "python3" in path.read_text(errors="ignore")
+                                             .split("\n", 1)[0]]
 for path in files:
     ast.parse(path.read_text(), str(path), "exec")
 print("  %d payload modules parse" % len(files))
@@ -593,7 +603,7 @@ fi
 rm -rf "$R/usr/share/streamer"
 install -d -m 755 "$R/usr/share/streamer/seed"
 cp -a "$SEED/." "$R/usr/share/streamer/seed/"
-log "  $(ls "$CONFIG"/usr/local/bin | wc -l) scripts, cliamp and ffmpeg in /usr/local/bin"
+log "  $(find "$CONFIG"/usr/local/bin -maxdepth 1 -type f | wc -l) scripts, cliamp and ffmpeg in /usr/local/bin"
 log "  reset template in /usr/share/streamer"
 
 step "units"
@@ -1054,10 +1064,14 @@ printf '%s\n' "$nmconf" | grep -q '^rc-manager=symlink' ||
     die "the image does not carry the NetworkManager resolv.conf hand-off"
 # The other half of the hand-off: if the vendor's static resolv.conf survived
 # next to the new conf, NM would write to /run and nothing would read it,
-# which is the silent half of a half-done fix.
-reslink=$(debugfs -R 'ls -l /etc/resolv.conf' "${LOOP}p2" 2>/dev/null || true)
-printf '%s\n' "$reslink" | grep -q -- '-> /run/NetworkManager/resolv.conf' ||
-    die "/etc/resolv.conf in the image is not the symlink to NetworkManager's /run file"
+# which is the silent half of a half-done fix. Same read-back as the dbus link
+# above: ls -l never shows a target, and at 31 characters this link is a fast
+# one, so stat prints it.
+reslink=$(debugfs -R 'stat /etc/resolv.conf' "${LOOP}p2" 2>/dev/null || true)
+[ "$(printf '%s\n' "$reslink" | grep -c 'Type: *symlink')" -eq 1 ] ||
+    die "/etc/resolv.conf in the image is not a symlink: the vendor's static file survived, so NM's answer would never be read"
+[ "$(printf '%s\n' "$reslink" | grep -c 'Fast link dest: "/run/NetworkManager/resolv.conf"')" -eq 1 ] ||
+    die "/etc/resolv.conf in the image does not point at NetworkManager's /run file"
 log "  vendor tmpfiles edits, logrotate off, NM hand-off: read back from the image"
 
 # The data partition's filesystem was made, seeded, checked and stamped a few minutes
