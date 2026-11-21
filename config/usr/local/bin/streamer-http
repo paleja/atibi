@@ -986,9 +986,10 @@ h1{font-size:15px;margin:0 0 6px;color:var(--dim);font-weight:600}
 button{background:#243040;border:0;color:var(--fg);border-radius:10px;
 padding:12px 14px;font-size:16px;cursor:pointer}
 button:active{background:#2e3c50}
-/* What the card cannot act on right now: the radio button, when the row
-   playing has no provider with similar songs to ask for. See the page's
-   render() and /api/status' radio field. */
+/* What cannot be acted on now: the radio tab, for a row whose provider has
+   no similar songs to ask for, and the two buttons that act on such a list
+   before there is one. A control that is there but grey says more than a
+   sentence explaining why it is missing. See render() and tab(). */
 button[disabled]{opacity:.45;cursor:default}
 button.big{font-size:26px;flex:1;padding:16px}
 input[type=range]{flex:1;accent-color:var(--acc)}
@@ -1039,29 +1040,29 @@ a{color:var(--acc)}
  <div class="row" style="margin-top:8px">
   <button onclick="op('shuffle')">shuffle</button>
   <button onclick="op('repeat')">repeat</button>
-  <button id="radio-btn" title="similar songs for the track playing now. They play before the rest of the loaded list; what a reboot brings back stays the saved list as it was." onclick="radioLoad()">radio</button>
  </div>
  <div class="err" id="err"></div>
 </div>
 
 <div class="tabs">
- <button id="tab-now" class="on" onclick="tab('now')">playing</button>
  <button id="tab-browse" onclick="tab('browse')">browse</button>
+ <button id="tab-now" class="on" onclick="tab('now')">playing</button>
+ <button id="tab-radio" disabled onclick="tab('radio')">radio</button>
  <button id="tab-boot" onclick="tab('boot')">at boot</button>
 </div>
 
 <div id="now" class="card">
  <h1>playlist</h1>
- <div class="dim" style="margin-top:2px">tap a track to start it — the green row is what is playing.</div>
  <ul id="queue"></ul>
- <div id="radio-sec" class="hidden">
-  <div class="dim" style="margin-top:14px">songs like the one playing now — tap radio above to ask for them.</div>
-  <ul id="radio" class="hidden" style="margin-top:6px"></ul>
-  <div class="row hidden" id="radio-go" style="margin-top:8px">
-   <button onclick="radioQueue()">queue these</button>
-   <button onclick="radioSave()">save as playlist&hellip;</button>
-  </div>
+</div>
+
+<div id="radio" class="card hidden">
+ <h1>suggested tracks</h1>
+ <div class="row">
+  <button id="radio-queue" disabled onclick="radioQueue()">queue these</button>
+  <button id="radio-save" disabled onclick="radioSave()">save as playlist</button>
  </div>
+ <ul id="radio-list" class="hidden" style="margin-top:8px"></ul>
 </div>
 
 <div id="boot" class="card hidden">
@@ -1083,7 +1084,6 @@ a{color:var(--acc)}
    <input type="search" id="q" placeholder="search this source">
    <button onclick="doSearch()">search</button>
   </div>
-  <div class="dim" style="margin-top:6px">lists load now; search rows play one track or album.</div>
  </div>
  <div class="card"><h1>lists</h1><ul id="lists"></ul></div>
  <div class="card hidden" id="results-card"><h1>results</h1><ul id="results"></ul></div>
@@ -1165,14 +1165,12 @@ function render(s){
   // (see list_name). Without that name the id is shown, never nothing.
   const shown=(m.kind==='track'&&(m.title||''))?m.title:(m.name||m.target||'(default)');
   $('intent').textContent=(lbl[m.kind]||'')+svc+shown+(m.volume?(' at '+m.volume+' dB to start with'):' (level not saved)');
-  // The radio button sits with shuffle and repeat, because it acts on the row
-  // playing now, wherever that is; the card says which provider it can follow
-  // for that row (see /api/status' radio field), and dead means dead: disabled
-  // rather than hidden, so the one row of similar songs below stays hidden too
-  // and a file on the card or the built-in radio channel cannot be offered
-  // songs it does not have.
-  $('radio-btn').disabled=!s.radio;
-  $('radio-sec').classList.toggle('hidden',!s.radio);
+  // The radio tab is always in the tab bar, and its colour says whether the
+  // question can be asked at all: only a row whose provider has similar songs
+  // to ask for leaves it lit (see /api/status' radio field), so the built-in
+  // radio channel and a file on the card grey it out instead of offering a
+  // tab that would answer with an error.
+  $('tab-radio').disabled=!s.radio;
   mark();
   // The rows being shown are only honest if they are the list being played, so
   // they are fetched whenever that changes: another phone, the browse tab, a
@@ -1190,9 +1188,11 @@ async function poll(){
 }
 setInterval(()=>{if(playing){tick+=0.5;paintBar();}},500);
 function tab(name){
-  for(const t of['now','browse','boot']){$('tab-'+t).classList.toggle('on',t===name);$(t).classList.toggle('hidden',t!==name);}
+  for(const t of['browse','now','radio','boot']){$('tab-'+t).classList.toggle('on',t===name);$(t).classList.toggle('hidden',t!==name);}
   if(name==='browse')loadProviders();
   if(name==='now')loadQueue();
+  // The tab is the question: opening it asks for the songs like this one.
+  if(name==='radio')radioLoad();
   if(name==='boot')poll();   // this tab is all about the saved intent: show it now
 }
 async function loadProviders(){
@@ -1234,18 +1234,19 @@ async function doSearch(){
   }
 }
 let radioList=[];
+function radioButtons(){
+  // The two actions follow the list on screen: there is nothing to queue or
+  // to save before the tab has an answer, and a greyed button says that
+  // without needing a sentence under it.
+  $('radio-queue').disabled=$('radio-save').disabled=!radioList.length;
+}
 async function radioLoad(){
-  // The button lives in the top card, where the row it acts on is readable
-  // from any tab, while the songs it asks for are listed in the playing tab:
-  // the tab moves first, so a tap never asks a question whose answer sits
-  // off screen.
-  tab('now');
-  // Tidal's list, fetched by the card: the page never sees the account's
-  // access token, only the rows it shows and the two buttons that act on them.
+  // Opening the tab is what asks the question, and the card answers it: the
+  // page never sees the account's access token, only the rows it shows and
+  // the two buttons that act on them.
   const d=await api('/api/radio');
-  if(!d.ok){fail(d.error);return;}
-  radioList=d.tracks||[];
-  const ul=$('radio');ul.innerHTML='';
+  const ul=$('radio-list');ul.innerHTML='';
+  radioList=d.ok?(d.tracks||[]):[];
   for(const t of radioList){
     const li=document.createElement('li');
     li.innerHTML=`<div class="what"><b></b><small></small></div>`;
@@ -1253,15 +1254,19 @@ async function radioLoad(){
     li.querySelector('small').textContent=[t.artist,t.album].filter(Boolean).join(' · ');
     ul.append(li);
   }
-  if(radioList.length){ul.classList.remove('hidden');$('radio-go').classList.remove('hidden');}
-  else say('Tidal offered nothing similar to this track');
+  ul.classList.toggle('hidden',!radioList.length);
+  radioButtons();
+  if(!d.ok){fail(d.error);return;}
+  if(!radioList.length)say('Tidal offered nothing similar to this track');
 }
 async function radioQueue(){
   if(!radioList.length)return;
   const d=await api('/api/radio/queue',{});
   if(!d.ok){fail(d.error);return;}
   say('now playing '+d.queued+' similar tracks, before the rest of the list');
-  $('radio-go').classList.add('hidden');
+  // The answer has been spent - those songs are in the player now, so both
+  // buttons grey until the tab is opened again for a fresh one.
+  radioList=[];radioButtons();
   loadQueue();
 }
 async function radioSave(){
@@ -1273,7 +1278,8 @@ async function radioSave(){
   const d=await api('/api/radio/save',{title:name});
   if(!d.ok){fail(d.error);return;}
   say('saved "'+d.title+'" with '+d.added+' tracks to the Tidal account');
-  $('radio-go').classList.add('hidden');
+  // The list on screen did not change, so its buttons stay as they are: the
+  // songs can still be queued.
 }
 async function loadQueue(){
   // The list these rows are for is named before the wait, not after: if a

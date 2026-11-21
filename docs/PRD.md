@@ -427,22 +427,25 @@ and provider browsing/playlists/search through the player's own IPC socket.
 The token is generated on first boot into `/data`, owner-readable, printed
 once to the journal. Boot intent changes go through the same `streamer`
 command as over SSH, so floor, ramp and boot.log apply from every surface.
-Three tabs — **playing / browse / at boot**: what a reboot will load, and the
-control that makes the current thing the next boot's target, is a tab of its
-own rather than a button under "now playing". That control is labelled **use
-the now playing**, and it is the only thing on the page that changes what
+Four tabs — **browse / playing / radio / at boot**: what a reboot will load
+is a tab of its own rather than a button under "now playing", and the control
+that makes the current thing the next boot's target is labelled **use the
+now playing**. That control is the only thing on the page that changes what
 boots: tapping a list or a search row in **browse**, or a row of the live
-list, plays, and stops at that. The radio button sits with shuffle and
-repeat, because it acts on the row playing now and not on a tab; it is
-dimmed rather than hidden when the provider cannot be followed
-(`STREAMER_RADIO_PROVIDERS`, Tidal alone today), and the list of songs it
-asks for appears only then — the card answers that question, so a provider
-it cannot follow, the built-in radio channel or a file on the card, shows
-no similar-songs list instead of a button that would fail. A list is shown
-by the name its owner gave it (`tidal:Lana`) wherever the card can look it
-up, and by the id the player reports where it cannot: an id on screen is
-worse than a name, but it is still the truth, and the raw label stays what
-identifies the list whose rows are on screen.
+list, plays, and stops at that. **radio** is a tab as well, headed **suggested tracks**: opening
+it *is* the question to the card — the songs like the row playing now — and the
+two things one can do with the answer, **queue these** and **save as playlist**,
+sit under that heading and above the list. A control that cannot act now is
+greyed, never removed: the radio tab is grey while the row playing belongs to
+no provider the radio can follow (`STREAMER_RADIO_PROVIDERS`, Tidal alone
+today), and the two buttons are grey before there is an answer to act on.
+Nothing on the page explains how to use it: the tab bar, the grey, and the
+one green row of the live list say what there is to say — an interface that
+needs a sentence under it is designed badly. A list is shown by the name its
+owner gave it (`tidal:Lana`) wherever the card can look it up, and by the id
+the player reports where it cannot: an id on screen is worse than a name,
+but it is still the truth, and the raw label stays what identifies the list
+whose rows are on screen.
 
 Still open: physical power strategy — a soft-latch button or WoL-style
 policy instead of a dumb strip (§12).

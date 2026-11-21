@@ -93,12 +93,13 @@ break one of these and a test should say so:
   — onto the right `streamer remember` verb, and `/api/boot/now` is the page's
   one question. A row's path is a fallback, never the first choice. The same
   file answers "can the radio follow this?" (`radio_of`, `STREAMER_RADIO_PROVIDERS`),
-  which is what the page dims its radio button on and hides its similar-songs
-  list on. And it puts a name on a list where the provider has one (`list_name`,
-  `playlist_name`, cached per provider for `LIST_NAMES_TTL` s because the page
-  polls `/api/status` every 2 s): the page prefers that name for the now line
-  and the boot line, while `listkey()` keeps matching on the raw `playlist`
-  label — names are not unique, ids are.
+  which is what greys out the page's radio tab — the tab is always in the
+  tab bar, grey when the question cannot be asked. And it puts a name on a
+  list where the provider has one (`list_name`, `playlist_name`, cached per
+  provider for `LIST_NAMES_TTL` s because the page polls `/api/status` every
+  2 s): the page prefers that name for the now line and the boot line, while
+  `listkey()` keeps matching on the raw `playlist` label — names are not
+  unique, ids are.
 - cliamp `status --json` pretty-prints with two-space indent. The fixtures
   answer the same way; extractors that assume compact JSON are a known
   failure mode with a mutation entry guarding it.
