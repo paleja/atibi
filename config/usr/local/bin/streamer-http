@@ -1038,7 +1038,10 @@ button.big{font-size:26px;flex:1;padding:16px}
 input[type=range]{flex:1;accent-color:var(--acc)}
 .tabs{display:flex;gap:8px;margin-bottom:12px}
 .tabs button{flex:1}
-.tabs button.on{background:var(--acc);color:#08110c}
+/* The one green of "this is what is on": the tab that is open, and a mode
+   icon that is switched on. Any button, one rule - which is how shuffle and
+   repeat can be glyphs with nothing to read beside them. See render(). */
+button.on{background:var(--acc);color:#08110c}
 ul{list-style:none;margin:0;padding:0}
 li{display:flex;justify-content:space-between;gap:10px;align-items:center;
 padding:10px 4px;border-bottom:1px solid #232b35}
@@ -1063,6 +1066,7 @@ li.cur b,li.cur .num{color:var(--acc)}
 .bar i{display:block;height:4px;background:var(--acc);border-radius:2px}
 select,input[type=search]{background:#243040;border:0;color:var(--fg);
 border-radius:10px;padding:12px;font-size:16px;flex:1}
+select{appearance:none;-webkit-appearance:none;padding-right:34px;background-repeat:no-repeat;background-position:right 12px center;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10'%3E%3Cpath d='M1 2l4 4 4-4' fill='none' stroke='%237f8b99' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")}
 .hidden{display:none}
 a{color:var(--acc)}
 </style></head><body><main>
@@ -1074,15 +1078,13 @@ a{color:var(--acc)}
   <button class="big" onclick="op('prev')">⏮</button>
   <button class="big" id="pp" onclick="op('toggle')">⏯</button>
   <button class="big" onclick="op('next')">⏭</button>
+  <button class="big" id="shuffle" onclick="op('shuffle')">🔀</button>
+  <button class="big" id="repeat" onclick="op('repeat')">🔁</button>
  </div>
  <div class="row" style="margin-top:10px">
   <span class="dim">vol</span>
   <input type="range" id="v" min="-50" max="0" step="1" value="0" onchange="setVol()">
   <span id="vd" class="dim"></span>
- </div>
- <div class="row" style="margin-top:8px">
-  <button onclick="op('shuffle')">shuffle</button>
-  <button onclick="op('repeat')">repeat</button>
  </div>
  <div class="err" id="err"></div>
 </div>
@@ -1197,6 +1199,14 @@ function render(s){
   $('t').textContent=t.title||'nothing playing';
   $('s').textContent=[t.artist,t.station&&('· '+t.station),lname&&('· '+lname)].filter(Boolean).join(' ');
   playing=s.state==='playing';$('pp').textContent=playing?'⏸':'▶';
+  // The mode icons carry their own state, in the page's one green: the player
+  // answers shuffle as a flag and repeat as Off/all/one, which the one
+  // button cycles, so any repeat at all lights the icon and which of all
+  // or one it is stays something to see on the player rather than a word
+  // here. Both answers arrive on the next status poll, so a tap is visible
+  // without a label under it.
+  $('shuffle').classList.toggle('on',!!s.shuffle);
+  $('repeat').classList.toggle('on',!!(s.repeat&&s.repeat!=='Off'));
   pos=s.position||0;dur=s.duration||0;
   // The level is the player's own (see live_volume), and it only ever moves
   // the thumb when nobody is holding it: a hand on the slider mid-drag is

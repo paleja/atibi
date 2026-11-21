@@ -438,10 +438,13 @@ two things one can do with the answer, **queue these** and **save as playlist**,
 sit under that heading and above the list. A control that cannot act now is
 greyed, never removed: the radio tab is grey while the row playing belongs to
 no provider the radio can follow (`STREAMER_RADIO_PROVIDERS`, Tidal alone
-today), and the two buttons are grey before there is an answer to act on.
-Nothing on the page explains how to use it: the tab bar, the grey, and the
-one green row of the live list say what there is to say — an interface that
-needs a sentence under it is designed badly. A list is shown by the name its
+today), and the two buttons are grey before there is an answer to act on. Its
+opposite is the one green the page already owns, the green of the open tab: a
+mode that is on lights its icon, which is how **shuffle** and **repeat** can
+be two more glyphs in the transport row, nothing beside them.
+Nothing on the page explains how to use it: the tab bar, the grey, the lit
+icon and the one green row of the live list say what there is to say — an
+interface that needs a sentence under it is designed badly. A list is shown by the name its
 owner gave it (`tidal:Lana`) wherever the card can look it up, and by the id
 the player reports where it cannot: an id on screen is worse than a name,
 but it is still the truth, and the raw label stays what identifies the list
