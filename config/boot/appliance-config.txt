@@ -1,6 +1,6 @@
 [all]
 
-# --- streamer appliance ---
+# --- atibi appliance ---
 # Written by image/build.sh: change it there, or append below the audio end
 # marker of /boot/firmware/config.txt.
 
@@ -15,7 +15,7 @@ dtoverlay=disable-bt
 # Pi 4. Remove if net- or USB-boot is ever needed.
 force_eeprom_read=0
 
-# --- streamer audio begin ---
-# Replaced by `streamer audio jack|dac`. The build comments out the stock
+# --- atibi audio begin ---
+# Replaced by `atibi audio jack|dac`. The build comments out the stock
 # audio lines above, so this block is the whole audio setup.
-# --- streamer audio end ---
+# --- atibi audio end ---

@@ -10,7 +10,7 @@ and comes in four shapes and only these:
                                     before the intent is written
   a bare name                   a list saved on the card, which `load` resolves
   radio:l:0                     cliamp's built-in channel: `load` cannot open it,
-                                hence `radio` in STREAMER_PROVIDERS
+                                hence `radio` in ATIBI_PROVIDERS
 
 A single track.play leaves the key out altogether, which is why the playing
 row is the fallback and never the first choice: a row in the middle of a list
@@ -19,7 +19,7 @@ is not loadable, the list's name is.
 
 import re
 
-from streamer import num
+from atibi import num
 
 PROVIDER_NAME = r"[a-z][a-z0-9-]*"
 ALBUM_ROW = re.compile(r"\A(%s)://album/(\S+)\Z" % PROVIDER_NAME)
@@ -100,7 +100,7 @@ def captured_level(app):
 
 def record_level(app):
     """The level alone, with the source untouched: what the page's volume
-    control and `streamer level` do after they move the dial.
+    control and `atibi level` do after they move the dial.
     """
     level = captured_level(app)
     if level is None:
@@ -115,7 +115,7 @@ def parse_target(what, target, providers):
     it is named, so the prefix is required, not assumed. A bare name means a
     list saved on the card, which cliamp's `load` resolves; a provider:id list
     is fetched by id, and `radio:l:0` only opens that way, hence `radio` in
-    STREAMER_PROVIDERS.
+    ATIBI_PROVIDERS.
     """
     if what == "station":
         if not target.startswith(("http://", "https://")):
@@ -140,7 +140,7 @@ def parse_target(what, target, providers):
 def record_now(app):
     """The choice itself: next boot = what is playing now.
 
-    Reached by `streamer boot now` and by the page's "use the now playing"
+    Reached by `atibi boot now` and by the page's "use the now playing"
     button. The source and the level are captured together, which is what lets
     a level set outside the appliance - the Omarchy panel talking to the
     socket - be remembered at all: `boot now` is the moment the appliance

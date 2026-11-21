@@ -17,14 +17,14 @@ resized or repaired on the card.
 - `image/fstab-ro.awk` — makes root and boot read-only in `/etc/fstab`. A
   separate file so the suite can run it against the fstab a real card shipped.
 - `config/` — the payload, in the shape of the root filesystem:
-  `etc/streamer.conf` (every knob, sourced by `streamer-daemon` and parsed by
-  `streamer.conf`, which turns a missing or mistyped one into an error naming it),
-  `etc/systemd/system/` (`streamer-cliamp` the player daemon, `streamer-play`
-  the boot-time play, `streamer-capture` the level listener, `streamer-http` the
-  LAN control server, `streamer.target` tying them together), `etc/streamer/audio-{jack,dac}.txt`
+  `etc/atibi.conf` (every knob, sourced by `atibi-daemon` and parsed by
+  `atibi.conf`, which turns a missing or mistyped one into an error naming it),
+  `etc/systemd/system/` (`atibi-cliamp` the player daemon, `atibi-play`
+  the boot-time play, `atibi-capture` the level listener, `atibi-http` the
+  LAN control server, `atibi.target` tying them together), `etc/atibi/audio-{jack,dac}.txt`
   (the two audio setups, spliced into the marked block at the end of `config.txt`),
   `boot/appliance-config.txt` (appended to `/boot/firmware/config.txt`),
-  `usr/local/lib/python3.13/dist-packages/streamer/` — the shared library every
+  `usr/local/lib/python3.13/dist-packages/atibi/` — the shared library every
   entry point uses: `conf` (the knobs), `state` (the boot record: read, atomic
   commit), `app` (one run's knobs, record, log, player), `ipc` (the daemon's
   socket, one implementation of version 2), `player` (the operations, one per
@@ -32,10 +32,10 @@ resized or repaired on the card.
   mapping), `net` + `boot` + `ramp` (the boot's waits, its floor and its climb),
   `log` (boot.log, append-and-trim under a flock), `capture` (the daemon's event
   stream, and the level the panel sets with it), and `usr/local/bin/`:
-  `streamer` (the command people use over SSH), `streamer-play` (the boot entry,
-  a thin call onto `streamer.boot`), `streamer-capture` (the level listener),
-  `streamer-daemon` (starts the player, never playback — still /bin/sh, it pins
-  the DAC's codec volume with `amixer`), `streamer-http`.
+  `atibi` (the command people use over SSH), `atibi-play` (the boot entry,
+  a thin call onto `atibi.boot`), `atibi-capture` (the level listener),
+  `atibi-daemon` (starts the player, never playback — still /bin/sh, it pins
+  the DAC's codec volume with `amixer`), `atibi-http`.
 - Things `build.sh` writes with no file here: fstab edits, volatile journald
   config, hostname/timezone, `authorized_keys`, a fresh machine-id and SSH host
   keys, the passwordless-sudoers drop-in, the NetworkManager resolv.conf hand-off,
@@ -80,10 +80,10 @@ listener last chose, at the level they last set.
   purpose, and the state record is written only when a person changes something.
 - **Audio:** IQaudIO Pi-DAC+ (`dtoverlay=iqaudio-dacplus`) is the product
   output; the 3.5mm jack is a development output only. The output is a runtime
-  switch (`streamer audio jack|dac`), never a rebuild. Never pin an ALSA card
+  switch (`atibi audio jack|dac`), never a rebuild. Never pin an ALSA card
   number: the device is the system default sink. One volume path: cliamp's dB.
   The DAC measures ~16 dB louder than the jack at the same cliamp level, so
-  `STREAMER_DAC_GAIN` carries that fixed trim on the codec's own 'Digital'
+  `ATIBI_DAC_GAIN` carries that fixed trim on the codec's own 'Digital'
   control — pinned by the daemon at every start, full scale first then the
   dB, so a restart cannot stack it.
 - **Identity is per build, not per vendor image:** `machine-id`, SSH host keys
@@ -91,39 +91,39 @@ listener last chose, at the level they last set.
   mDNS and the first SSH session, so the build regenerates all three.
 - **DNS follows the lease:** the base image bakes `/etc/resolv.conf`, the build
   points it at  `/run/NetworkManager/resolv.conf` with `rc-manager=symlink`, 
-  and `streamer-cliamp` orders after `network-online.target`.
+  and `atibi-cliamp` orders after `network-online.target`.
 - `/data/bin` is first on the daemon's `PATH`, so a newer ffmpeg or cliamp can
   be dropped on the writable partition with the image copy as fallback.
-  `streamer reset --yes` restores `/data` from `/usr/share/streamer/seed`, the
+  `atibi reset --yes` restores `/data` from `/usr/share/atibi/seed`, the
   same tree the build seeds the partition with.
 
 ## Rules the code enforces
 
 Break one of these and a test should say so.
 
-- `/data/streamer/state` (`mode`/`kind`/`target`, plus `provider=`/`volume=` and
+- `/data/atibi/state` (`mode`/`kind`/`target`, plus `provider=`/`volume=` and
   the track's `title`/`artist`/`album`) has exactly one writer: the library's
-  intent module — `streamer.intent.record_now|record_target|record_mode|record_level`,
-  which commit through `streamer.state.Record` (atomic replace, file and
+  intent module — `atibi.intent.record_now|record_target|record_mode|record_level`,
+  which commit through `atibi.state.Record` (atomic replace, file and
   directory fsync) and write boot.log in the same breath. The command's verbs
   and the page's two write routes (`/api/boot/now`, `/api/intent`) call those
   functions and nothing else, so there is one writer for the record without
   the server having to shell out to the CLI. Written when a person changes
   something, never on a timer — that is what keeps it an intent.
 - Playing and recording are separate verbs and neither implies the other:
-  `streamer play <what> <target>` plays through the daemon's socket and writes
-  nothing to the card; `streamer boot <what> <target>` writes the record and
+  `atibi play <what> <target>` plays through the daemon's socket and writes
+  nothing to the card; `atibi boot <what> <target>` writes the record and
   touches nothing that is playing — a tapped playlist has already started its
   music, and a start on top of it would mean a second start and a trip back to
-  the floor mid-track. `streamer stop` stops and says nothing about the next
-  boot; `streamer boot off` is the sentence that means quiet after a reboot.
+  the floor mid-track. `atibi stop` stops and says nothing about the next
+  boot; `atibi boot off` is the sentence that means quiet after a reboot.
   The `/run` one-shot request file and the `--save` flag existed only to let a
-  play verb reach `streamer-play` without writing the record, and both are gone.
-- `streamer-play` is the only thing that starts audio at boot and the only thing
-  that ramps: the daemon holds the IPC socket and starts at `--vol=$STREAMER_VOL_FLOOR`,
+  play verb reach `atibi-play` without writing the record, and both are gone.
+- `atibi-play` is the only thing that starts audio at boot and the only thing
+  that ramps: the daemon holds the IPC socket and starts at `--vol=$ATIBI_VOL_FLOOR`,
   and the waits, the floor, the ramp and its three guards (a level that will not
   move, a step budget that fits the boot budget, a level set elsewhere winning
-  over the boot's own climb) live in `streamer.boot` and `streamer.ramp`, which
+  over the boot's own climb) live in `atibi.boot` and `atibi.ramp`, which
   that unit calls and nothing else does.
 - The level is read back from the player, never recorded from what was asked
   for: cliamp clamps to its own `volume_min` and +6, and does not persist its
@@ -137,31 +137,31 @@ Break one of these and a test should say so.
   `provider.load` starts playing, so the boot starts row 0 only if the player
   is not already playing.
 - A provider target has no hostname to wait on, so the boot waits for a real
-  route and source address (`STREAMER_NET_WAIT`) before spending the load call —
+  route and source address (`ATIBI_NET_WAIT`) before spending the load call —
   asking before the lease lands fails as *sign-in required*. An https target
-  likewise waits for clock sync (`STREAMER_SYNC_WAIT`): a cold-boot clock behind
+  likewise waits for clock sync (`ATIBI_SYNC_WAIT`): a cold-boot clock behind
   NTP makes every TLS handshake fail as *certificate is not yet valid*.
   `Restart=on-failure` is the backstop for transients, not the designed path.
 - What a reboot should load is worked out on the card, not in the page:
-  `boot_fields()` in `streamer.intent` maps the snapshot's `playlist` label onto
-  the record's fields, and `streamer boot now` and `/api/boot/now` are that one
+  `boot_fields()` in `atibi.intent` maps the snapshot's `playlist` label onto
+  the record's fields, and `atibi boot now` and `/api/boot/now` are that one
   call. A row's path is a fallback, never the first choice: guessing here boots
   to silence.
-- journald is volatile on purpose. `/data/streamer/boot.log` is the durable
-  record: `streamer.log.BootLog` is its only writer — no separate writer
+- journald is volatile on purpose. `/data/atibi/boot.log` is the durable
+  record: `atibi.log.BootLog` is its only writer — no separate writer
   executable any more — append-and-trim under a flock on the log file itself,
   and it keeps working when a boot loop retries over its own earlier attempts.
-  `streamer boots` reads it back.
+  `atibi boots` reads it back.
 - The payload ships its own tools and reaches for nothing else: every program a
   unit names and every interpreter a payload script declares is checked against
-  what the image actually ships. The payload is python3 except `streamer-daemon`
+  what the image actually ships. The payload is python3 except `atibi-daemon`
   (/bin/sh, it pins the DAC trim with `amixer`), and its shared library installs
   in `/usr/local/lib/python3.13/dist-packages` — the directory the card's own
   interpreter looks in first (checked 2026-11-21), and the build refuses a base
   image whose stdlib is another minor version. Byte-code is baked only when the
   build host has that same minor version: the root is read-only, so a card can
   never write a `__pycache__`, and an unbaked tree pays the parse every boot —
-  measured at 100 ms for `import streamer.boot` on the card, inside the budget.
+  measured at 100 ms for `import atibi.boot` on the card, inside the budget.
 - **The page has no sentences.** Grey means cannot act now (the radio tab for a
   row whose provider has no similar songs; its two actions before there is an
   answer), green means on (the open tab, a mode that is on). The only green row
@@ -169,14 +169,14 @@ Break one of these and a test should say so.
   (headed `suggested tracks`) · at boot; the boot control is `use the now
   playing`. A list is shown by the name its owner gave it where the card can
   look it up. An interface that needs a sentence under it is designed badly, and
-  so is a card that needs a sentence to be fixed: recovery is `streamer audio
+  so is a card that needs a sentence to be fixed: recovery is `atibi audio
   jack` over SSH, or one vfat edit from any card reader.
 
 ## Facts about the player, as checked on the card
 
 - `cliamp remote state` answers 16 keys and **no `volume`** among them (2026-11-21);
   the level comes from `cliamp status --json` — `live_volume` in
-  `streamer-http`, `json_num` in `streamer`, `pick` in `streamer-play`.
+  `atibi-http`, `json_num` in `atibi`, `pick` in `atibi-play`.
   `fake-ipc.py` leaves `volume` out of its snapshot for the same reason; put it
   back and the server is reading a key the card never sends.
 - `cliamp status --json` pretty-prints with two-space indent and repeats some
@@ -187,7 +187,7 @@ Break one of these and a test should say so.
   refuses, so the word `album` comes back out before the intent is written), a
   bare name for a playlist saved on the card, and `radio:l:0` for the built-in
   channel — which `cliamp load` cannot open, hence `radio` in
-  `STREAMER_PROVIDERS`. A single `track.play` leaves the key out altogether.
+  `ATIBI_PROVIDERS`. A single `track.play` leaves the key out altogether.
 - Daemon mode owns the IPC socket (`~/.config/cliamp/cliamp.sock`, a path capped
   at 107 characters). Verbs `play/pause/toggle/next/prev/status --json/volume/seek/load/eq/device`
   plus v2 `remote state|capabilities|call|job|events`. No HTTP frontend (upstream
@@ -197,7 +197,7 @@ Break one of these and a test should say so.
   Tidal revokes shared client IDs now and then, with cliamp's
   `client_id`/`client_secret` override as the escape hatch.
 - The same file answers "can the radio follow this?" (`radio_of`,
-  `STREAMER_RADIO_PROVIDERS`) and "what is this list called?" (`list_name`,
+  `ATIBI_RADIO_PROVIDERS`) and "what is this list called?" (`list_name`,
   `playlist_name`, cached per provider for `LIST_NAMES_TTL` s because the page
   polls `/api/status` every 2 s). `listkey()` keeps matching the raw `playlist`
   label: names are not unique, ids are.
@@ -217,7 +217,7 @@ Break one of these and a test should say so.
    `~/.config/cliamp` is a symlink to `/data/cliamp`).
 3. First-boot Tidal login over SSH, an album start-to-finish at hi-res where
    the master allows.
-4. `streamer audio jack|dac` swaps the output on a running box, leaves the
+4. `atibi audio jack|dac` swaps the output on a running box, leaves the
    rest of `config.txt` alone, and is idempotent; `config.txt` can only be
    damaged deliberately.
 
@@ -230,13 +230,13 @@ torture (the 20 cuts, at arbitrary moments including mid-write).
 
 ## Working against a real card
 
-The card answers at `streamer.home`/`streamer.local` over SSH with
-`~/.ssh/streamer`. Root is read-only: `streamer rw` to write, `sync &&
-streamer ro` when done. Deploy during development: `scp` to `/tmp`, `sudo cp`
+The card answers at `atibi.home`/`atibi.local` over SSH with
+`~/.ssh/atibi`. Root is read-only: `atibi rw` to write, `sync &&
+atibi ro` when done. Deploy during development: `scp` to `/tmp`, `sudo cp`
 (or `sudo install -m 755`) into place, `systemctl restart <unit>`. The HTTP
-API on port 8077 takes the token from `/data/streamer/http.token`. Restarting
-`streamer-http` does not disturb playback; only `streamer-play` and the
-`streamer` command touch what is playing.
+API on port 8077 takes the token from `/data/atibi/http.token`. Restarting
+`atibi-http` does not disturb playback; only `atibi-play` and the
+`atibi` command touch what is playing.
 
 `cliamp remote state` is the snapshot, `cliamp remote call <op> --params …
 --wait` the operation channel, `cliamp status --json` the level. Facts about

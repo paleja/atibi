@@ -7,7 +7,7 @@ service in different ways: a list saved on the card is a file `load` resolves, a
 streaming-service list is fetched by id, an album is expanded into rows first,
 and a single track row is sent whole because there is no fetch-a-track-by-id.
 
-Failure messages come out in the words boot.log and `streamer boots` show, so
+Failure messages come out in the words boot.log and `atibi boots` show, so
 they name the operation that refused, the target, and what the daemon said:
 "sign-in required" means the DHCP lease had not landed yet, and a TLS failure
 means the cold-boot clock is behind NTP.
@@ -16,7 +16,7 @@ means the cold-boot clock is behind NTP.
 import json
 import subprocess
 
-from streamer.ipc import IpcError
+from atibi.ipc import IpcError
 
 
 class PlayerError(Exception):

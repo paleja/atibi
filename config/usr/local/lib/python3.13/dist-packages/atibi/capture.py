@@ -21,7 +21,7 @@ rule the boot record obeys.
 import json
 import subprocess
 
-from streamer import num
+from atibi import num
 
 
 def level_events(cliamp, topics=("runtime.state",)):

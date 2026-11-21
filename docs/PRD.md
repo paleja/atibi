@@ -1,5 +1,5 @@
 ---
-title: "PRD — rpi-streamer"
+title: "PRD — rpi-atibi"
 type: prd
 owner: janp
 status: v3 — image built, first card running on the bench
@@ -11,8 +11,8 @@ changelog:
 
 ## 1. Problem
 
-The listening setup is a power amplifier + speakers with a streamer in front of
-it. Commercial streamers are slow, walled gardens, or overkill. A Raspberry Pi
+The listening setup is a power amplifier + speakers with a atibi in front of
+it. Commercial atibis are slow, walled gardens, or overkill. A Raspberry Pi
 running `cliamp` covers every wanted source (internet radio, Tidal, local
 files). The remaining problems to engineer around:
 
@@ -51,7 +51,7 @@ A reproducible custom Raspberry Pi OS image containing:
 
 - Power-on → audio playing (last-played source resumed) in **≤ 10 s wall
   clock**, measured from 5V applied, median of ≥5 cold boots.
-- On every boot the streamer auto-plays the source the listener last chose
+- On every boot the atibi auto-plays the source the listener last chose
   (radio station, saved playlist, or streaming-service playlist) at the level
   they last set. Position is not resumed: a live stream has none, and coming
   up mid-playlist is a detail rather than a feature (§8.3).
@@ -160,7 +160,7 @@ RP-010196; gen4 has a shorter pre-Linux stage than gen5):
   appended. The `ro` here is intent, not the mechanism: fstab is the
   mechanism (§7).
 - No initramfs work: the image boots plain ext4, as the stock image does.
-- **Network units:** `streamer-cliamp` orders after `network-online.target`
+- **Network units:** `atibi-cliamp` orders after `network-online.target`
   (NetworkManager-wait-online is enabled, so this returns exactly when the
   lease is in). A daemon started against plain `network.target` resolves
   names before an address exists.
@@ -177,7 +177,7 @@ RP-010196; gen4 has a shorter pre-Linux stage than gen5):
 - **Board is settled:** IQaudIO Pi-DAC+ → `dtoverlay=iqaudio-dacplus`. One
   check remains on real hardware: confirm the HAT EEPROM string.
 - **The audio output is a runtime switch, not a rebuild:**
-  `streamer audio jack|dac` splices a fragment into the marked block at the
+  `atibi audio jack|dac` splices a fragment into the marked block at the
   end of `config.txt`; `build.sh --audio jack|dac` only picks which fragment
   is live on first boot.
 - **Output device:** nothing pinned. The device is the system default sink,
@@ -192,7 +192,7 @@ RP-010196; gen4 has a shorter pre-Linux stage than gen5):
     difference between the output stages: 2.0 V RMS line out (the figure
     above) against the Pi jack's filtered-PWM ~0.3 V. The codec's 'Digital'
     control now carries a fixed trim closing exactly that gap,
-    `STREAMER_DAC_GAIN=-16` in `streamer.conf`, pinned by `streamer-daemon`
+    `ATIBI_DAC_GAIN=-16` in `atibi.conf`, pinned by `atibi-daemon`
     at every start (the codec wakes at 0 dB each power-on; the pin is
     full-scale-then-dB, so a daemon restart cannot stack it). Every cliamp
     dB — floor, ramp, saved level — then means the same thing on both audio
@@ -211,18 +211,18 @@ RP-010196; gen4 has a shorter pre-Linux stage than gen5):
     leave cliamp at 0 dB — still one path, different control at its end.
 - **Boot volume floor: −30 dBFS**, applied before the stream starts, then
   ramped in steps toward the resumed level (§8.3). The math behind the
-  numbers lives in the comments in `streamer.conf`; the decision is: a boot
+  numbers lives in the comments in `atibi.conf`; the decision is: a boot
   can never produce a full-power first sample, and the cost — a quiet first
   second — is the accepted trade. The floor is not bypassable: only
-  `streamer-play` starts audio, and it sets the floor with a failure check
+  `atibi-play` starts audio, and it sets the floor with a failure check
   before playback.
 - **Ramp guards** (all three observable in boot.log; mechanics in
-  `streamer-play`): the ramp stops where the output device stops it, it has
+  `atibi-play`): the ramp stops where the output device stops it, it has
   a step budget that fits the boot budget, and it yields to a level set
   elsewhere (bar panel or SSH wins over the boot's own climb).
 - **A saved level at or below the floor counts as a parked control, not a
   preference**: it is replaced by the configured default, in boot.log.
-  Deliberately quiet is `streamer stop`, a different thing.
+  Deliberately quiet is `atibi stop`, a different thing.
 - **Pi 5 note:** the DAC+ driver had a real Pi 5 bug on non-Raspberry-Pi-OS
   kernels (LP #2060240); Pi 5 stays bench-only, so this is gated behind the
   Pi 5 image decision.
@@ -256,22 +256,22 @@ gets corruptable itself mid-overlay-writeback):
 - Writable content that must survive a cut, all at the top of `/data` (which
   is what makes a clean slate one command): cliamp config and credentials
   (symlinked from `~/.config/cliamp`), the appliance's record of what to
-  play next boot and at what level (`/data/streamer/state`),
-  `/data/streamer/boot.log`, and the LAN server's token. That state record
-  has exactly one writer — the `streamer` command, at the moment a person
+  play next boot and at what level (`/data/atibi/state`),
+  `/data/atibi/boot.log`, and the LAN server's token. That state record
+  has exactly one writer — the `atibi` command, at the moment a person
   changes something; nothing writes it on a timer, which is what keeps it an
   intent rather than a position snapshot.
 - **journald stays deliberately volatile.** A durable journal on `/data`
   would be left dirty at exactly the instant of a hard cut. The durable
   record is `boot.log`: one line per event, written by a single appender
-  (`streamer-bootlog`) that survives overlapping attempts of a boot that
+  (`atibi-bootlog`) that survives overlapping attempts of a boot that
   keeps failing (mechanics, including file-level locking and ownership
-  recovery, are commented in the script). Read back with `streamer boots`.
+  recovery, are commented in the script). Read back with `atibi boots`.
 - **Boot self-healing was removed** (boot counter + rollback of
   `config.txt`/`cmdline.txt`). It protected against one scenario — an audio
   switch on a headless box — and cost two units, two scripts and a state
   file. On a read-only root the same protection is one SSH session and
-  `streamer audio jack`; if the card truly will not boot, the firmware
+  `atibi audio jack`; if the card truly will not boot, the firmware
   partition is writable from any card reader. Not rebuilding it is a
   decision, recorded so it stays one.
 - Nothing is deleted from the base image that merely looks unused:
@@ -282,8 +282,8 @@ gets corruptable itself mid-overlay-writeback):
   `/data/bin` in front of `/usr/local/bin`, so a newer `ffmpeg` (or cliamp,
   or an added `yt-dlp`) can be dropped on the writable partition with the
   image copy as fallback.
-- **Factory reset = `streamer reset --yes`**: stop the player, clear `/data`,
-  copy the template back from `/usr/share/streamer/seed` — the same tree the
+- **Factory reset = `atibi reset --yes`**: stop the player, clear `/data`,
+  copy the template back from `/usr/share/atibi/seed` — the same tree the
   build seeded the partition with, which is why a reset card and a freshly
   built one are identical. Providers logged out, defaults restored.
 - **Identity is per build, not per vendor image.** `machine-id`, the SSH host
@@ -298,7 +298,7 @@ gets corruptable itself mid-overlay-writeback):
 - **Daemon mode** (`cliamp --daemon`): headless, same engine, owns the IPC
   socket; no tmux/screen needed. The unit's `ExecStart` is a wrapper that
   pins the floor, buffer and sample rate and deliberately does **not** start
-  playback: only `streamer-play` does, which makes the floor and ramp
+  playback: only `atibi-play` does, which makes the floor and ramp
   unbypassable.
 - **IPC**: newline-delimited JSON over `~/.config/cliamp/cliamp.sock`; verbs
   `play/pause/toggle/next/prev/status --json/volume/seek/load/eq/device`, v2
@@ -314,8 +314,8 @@ gets corruptable itself mid-overlay-writeback):
 
 ### 8.1 Radio
 - Radio Browser directory + custom stations. Nothing baked: the box starts
-  from one default station (`STREAMER_START_TARGET` in `/etc/streamer.conf`)
-  and `streamer station <url> --save` records what you actually want, on `/data`;
+  from one default station (`ATIBI_START_TARGET` in `/etc/atibi.conf`)
+  and `atibi station <url> --save` records what you actually want, on `/data`;
   without `--save` that command only plays.
   The built-in list is fetched, not duplicated in the image, so the two
   cannot drift.
@@ -351,19 +351,19 @@ gets corruptable itself mid-overlay-writeback):
   it, so the appliance keeps its own record on `/data` and replays it
   through IPC.
 - **Saved on change, not on a timer.** The surfaces that decide what plays next
-  boot — `streamer remember`, `--save` on `play/station/playlist/album/track`,
-  `streamer mode/stop`, the level commands `vol`/`up`/`down`, and the web page's
+  boot — `atibi remember`, `--save` on `play/station/playlist/album/track`,
+  `atibi mode/stop`, the level commands `vol`/`up`/`down`, and the web page's
   boot tab — rewrite the whole record, carrying over arguments they were not
   given: turning the level down cannot forget the station, choosing a station
   cannot forget the level. A play command without `--save` plays and writes
-  nothing: its target rides in `/run/streamer/play-now` (tmpfs), which the play
+  nothing: its target rides in `/run/atibi/play-now` (tmpfs), which the play
   unit reads, plays and unlinks. The old periodic
   writer (one-minute timer, position and index) is gone: it bought a detail
   nobody asked for at the cost of a unit, a timer and a boot that resumed
   in the middle of things.
 - The level is read back **from the player**, not recorded from what was
   asked for: the value cliamp settled at is the one the next boot should
-  aim at. `streamer remember` re-reads it together with the source — the
+  aim at. `atibi remember` re-reads it together with the source — the
   Omarchy panel sets cliamp's dB over the socket, outside the appliance — and
   a level at or below the boot floor counts as parked, so the saved one
   carries on.
@@ -375,14 +375,14 @@ gets corruptable itself mid-overlay-writeback):
   is not already playing.
 - A provider target has no hostname to wait on, so the boot additionally
   waits for an actual route and source address (budget:
-  `STREAMER_NET_WAIT`) before spending the load call — asking before the
+  `ATIBI_NET_WAIT`) before spending the load call — asking before the
   lease lands fails as `sign-in required`. A wait that actually waits
   leaves one WARN line in boot.log; no retry, `Restart=on-failure` stays
   as the backstop for transients, not as the designed path. An https
-  target likewise waits for clock sync first (`STREAMER_SYNC_WAIT`): a
+  target likewise waits for clock sync first (`ATIBI_SYNC_WAIT`): a
   cold-boot clock behind NTP makes every TLS handshake fail as
   "certificate is not yet valid".
-- `streamer remember <what> <target>` records intent without touching
+- `atibi remember <what> <target>` records intent without touching
   playback. The web page needs it: a tapped playlist has already started
   the music, and the plain play command on top would restart the boot
   sequence — a second start and a trip back to the volume floor — in the
@@ -395,7 +395,7 @@ gets corruptable itself mid-overlay-writeback):
   out before the intent is written), a bare name for a playlist saved on the
   card, and `radio:l:0` for the built-in cliamp radio channel — which `cliamp
   load` cannot open (no such `.toml`), so it is only reachable as a provider
-  target, hence `radio` in `STREAMER_PROVIDERS`. A single `track.play` leaves
+  target, hence `radio` in `ATIBI_PROVIDERS`. A single `track.play` leaves
   the key out altogether. Guessing any of this from the row on screen is
   how the box ends up booting to silence, so the mapping lives on the card.
 - What each boot did is one line in `boot.log`: `OK <kind> <target> at N dB`
@@ -404,7 +404,7 @@ gets corruptable itself mid-overlay-writeback):
 
 ## 9. Control surface
 
-### 9.1 On the box (`streamer`, over SSH)
+### 9.1 On the box (`atibi`, over SSH)
 
 One command, its own help text is the reference. Groups: transport
 (`play/pause/toggle/next/prev/stop`); level (`vol <dB>`, `up/down <N>` — all
@@ -429,11 +429,11 @@ needs yt-dlp on the Pi and is out of v1 (§8.1).
 
 ### 9.3 On the LAN (shipped)
 
-A token-guarded HTTP server (`streamer-http`) on port 8077 with a
+A token-guarded HTTP server (`atibi-http`) on port 8077 with a
 phone-sized page: transport, volume, shuffle/repeat, queue, the radio list,
 and provider browsing/playlists/search through the player's own IPC socket.
 The token is generated on first boot into `/data`, owner-readable, printed
-once to the journal. Boot intent changes go through the same `streamer`
+once to the journal. Boot intent changes go through the same `atibi`
 command as over SSH, so floor, ramp and boot.log apply from every surface.
 Four tabs — **browse / playing / radio / at boot**: what a reboot will load
 is a tab of its own rather than a button under "now playing", and the control
@@ -445,7 +445,7 @@ it *is* the question to the card — the songs like the row playing now — and 
 two things one can do with the answer, **queue these** and **save as playlist**,
 sit under that heading and above the list. A control that cannot act now is
 greyed, never removed: the radio tab is grey while the row playing belongs to
-no provider the radio can follow (`STREAMER_RADIO_PROVIDERS`, Tidal alone
+no provider the radio can follow (`ATIBI_RADIO_PROVIDERS`, Tidal alone
 today), and the two buttons are grey before there is an answer to act on. Its
 opposite is the one green the page already owns, the green of the open tab: a
 mode that is on lights its icon, which is how **shuffle** and **repeat** can
@@ -471,9 +471,9 @@ policy instead of a dumb strip (§12).
 2. 20 consecutive hard power-cuts: the 21st boot succeeds, **auto-plays the
    source that was playing before the first cut**, at the level it was at,
    credentials intact. A missing or unusable saved level falls back to the
-   configured default — never silence — and `streamer boots` says which
+   configured default — never silence — and `atibi boots` says which
    happened.
-3. `streamer toggle` over SSH works from the desktop with no interactive
+3. `atibi toggle` over SSH works from the desktop with no interactive
    prompts, and the bar panel drives the Pi instance.
 4. Bar panel controls the Pi instance (search + transport + volume).
 5. First-boot Tidal login over SSH completes, and an album plays
@@ -483,10 +483,10 @@ policy instead of a dumb strip (§12).
 6. Rebuilding the image from this repo reproduces a working card on a second
    SD of the same size.
 7. Boot behaviour (§8.3) is deterministic over the torture sequence.
-8. `streamer audio jack` ↔ `dac` changes the output on a running box with no
+8. `atibi audio jack` ↔ `dac` changes the output on a running box with no
    reflash, leaves the rest of `config.txt` untouched, and is idempotent.
-9. `config.txt` can only be damaged deliberately (`streamer audio jack|dac`
-   is the only writer), and recovery is proportional: usually `streamer audio
+9. `config.txt` can only be damaged deliberately (`atibi audio jack|dac`
+   is the only writer), and recovery is proportional: usually `atibi audio
    jack` over SSH, otherwise one vfat edit from a card reader (§7).
 
 ### 10.1 Test tiers
@@ -519,7 +519,7 @@ A green result means different things at different tiers:
 | ≤10s not reached on stock userspace (Pi 4 SD I/O) | Goal miss | Critical-chain work is incremental; fallback ladder: faster SD → USB3 SSD → trimmed userspace, before considering Buildroot. SSD is bought only if the first five-boot median misses |
 | Tidal revokes shared OAuth client IDs | Provider breakage | `client_id`/`client_secret` override; re-login path documented |
 | cliamp updates change socket protocol (1.x → 2.x was breaking) | Control breakage | Pin the version in the image; upgrade deliberately, `/data/bin` for a trial first |
-| HAT EEPROM misdetection | No audio | `force_eeprom_read=0` plus the explicit pinned overlay; `/proc/device-tree/hat/product` confirms on first boot; `streamer audio jack` is one command away |
+| HAT EEPROM misdetection | No audio | `force_eeprom_read=0` plus the explicit pinned overlay; `/proc/device-tree/hat/product` confirms on first boot; `atibi audio jack` is one command away |
 | Ground-loop hum Pi→amp (a 1993 amp bonding the Pi's SMPS earth into its analog ground) | Audible defect | Quality PSU; test before buying a galvanic isolator; note inline transformers roll off bass, so with full-range speakers the real remedies are a proper isolator or breaking the loop at the mains side |
 | `/data` wear | SD wear-out | The state file is rewritten only when a person changes something; the journal is volatile, so nothing else is written to the card at all |
 | Loud surprise at power-on (the amp knob survives a hard cut) | UX / speaker damage | Boot floor −30 dBFS bounds the worst case at single-digit watts even at maximum knob (§6.4) |
@@ -546,12 +546,12 @@ A green result means different things at different tiers:
   boot log, DNS. Remaining bench checks: cliamp dB dithering and output
   sample format (§6.4), the floor/ramp at a reference dial position, the
   amp's relay close time, the baseline boot measurement.
-- **M2 — I2S bring-up (Pi-DAC+)**: `streamer audio dac` on the running box,
+- **M2 — I2S bring-up (Pi-DAC+)**: `atibi audio dac` on the running box,
   confirm the HAT in the device tree and `aplay -l`, check the case fit.
 - **M3 — Boot tuning (Pi 4)**: §6 applied one unit at a time, 5 cold boots
   per config, median ≤10s; decide SD vs SSD on that number (§12.1).
 - **M4 — Appliance hardening**: power-cut torture test incl. resume-last,
-  `streamer reset --yes` on hardware, the `config.txt` recovery path, the
+  `atibi reset --yes` on hardware, the `config.txt` recovery path, the
   first-boot provider login flow.
 - **M5 — Control**: bar panel wired up; stretch: `yt-dlp` on `/data`
   (§8.1), physical power (§12.4). The LAN page is shipped (§9.3).

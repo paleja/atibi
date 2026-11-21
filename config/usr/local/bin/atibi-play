@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""streamer-play - this boot's playback: bring the source up, then ramp.
+"""atibi-play - this boot's playback: bring the source up, then ramp.
 
-Started by streamer-play.service, and the only thing that starts audio, which
+Started by atibi-play.service, and the only thing that starts audio, which
 is what keeps the floor, the waits and the ramp unbypassable from the page,
 from the command and from a reboot. Everything that decides what plays and
-how loud it gets lives in streamer.boot; this file is the entry the unit
+how loud it gets lives in atibi.boot; this file is the entry the unit
 names, and its exit code, which systemd's Restart=on-failure reads.
 """
 
 import sys
 
-from streamer.app import Appliance
-from streamer.boot import Boot
-from streamer.conf import KnobError
+from atibi.app import Appliance
+from atibi.boot import Boot
+from atibi.conf import KnobError
 
 
 def main():

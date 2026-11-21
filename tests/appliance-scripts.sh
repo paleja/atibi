@@ -64,30 +64,30 @@ d = json.load(open(sys.argv[1]))
 q = d.get("queue", [])
 print(q[int(sys.argv[2])] if int(sys.argv[2]) < len(q) else "")' "$T/state.json" "$1"; }
 
-C=$PWD/config/etc/streamer.conf
-T=${TESTSANDBOX:-/tmp/opencode/rpi-streamer-playtest}
+C=$PWD/config/etc/atibi.conf
+T=${TESTSANDBOX:-/tmp/opencode/rpi-atibi-playtest}
 
 # Everything a scenario can leave behind that another scenario reads: the
 # sandbox is wiped and rebuilt before each run, so a file one scenario
 # writes cannot decide what a later one sees. (It used to matter: a
-# geometry record left in /etc/streamer changed what the next boot did.)
-rm -rf "$T/bin" "$T/logs" "$T/data" "$T/fw" "$T/home" "$T/etc-streamer"
-mkdir -p "$T/bin" "$T/fw" "$T/home/.config/cliamp" "$T/data/streamer" "$T/logs"
+# geometry record left in /etc/atibi changed what the next boot did.)
+rm -rf "$T/bin" "$T/logs" "$T/data" "$T/fw" "$T/home" "$T/etc-atibi"
+mkdir -p "$T/bin" "$T/fw" "$T/home/.config/cliamp" "$T/data/atibi" "$T/logs"
 
-# The factory template `streamer reset` copies back over the data partition.
+# The factory template `atibi reset` copies back over the data partition.
 # build.sh makes one of these and feeds it to mkfs.ext4 -d, so the directory
 # names are read out of the build script instead of repeated here: a knob
 # that changes there has to show up in both.
 DATA_DIRS=$(sed -n 's/^DATA_DIRS="\(.*\)"$/\1/p' "$BUILD")
 seed_tree() { # seed_tree: the template, as build.sh has it at build time
-    rm -rf "$T/share/streamer/seed"
-    install -d "$T/share/streamer/seed"
-    for d in $DATA_DIRS; do install -d "$T/share/streamer/seed/$d"; done
+    rm -rf "$T/share/atibi/seed"
+    install -d "$T/share/atibi/seed"
+    for d in $DATA_DIRS; do install -d "$T/share/atibi/seed/$d"; done
     printf '%s\n' "the template a factory reset copies back" >\
-        "$T/share/streamer/seed/README"
+        "$T/share/atibi/seed/README"
 }
 seed_tree
-cp "$CFG"/etc/streamer/audio-*.txt "$T/"
+cp "$CFG"/etc/atibi/audio-*.txt "$T/"
 
 # --- the stand-in player ------------------------------------------------------
 # Holds its whole state in state.json, so a scenario can read back what the
@@ -142,7 +142,7 @@ def stuck_at():
     return None
 def cap(d, v):
     # cliamp has its own ceiling, and it is deliberately above the appliance's
-    # STREAMER_VOL_MAX: if the stand-in clamped at the same figure the appliance
+    # ATIBI_VOL_MAX: if the stand-in clamped at the same figure the appliance
     # aims for, a boot script that forgot its own ceiling would still look
     # correct, and the check would be about the stand-in rather than the script.
     # The stuck-at file stands in for a limit further down still, which is what
@@ -293,7 +293,7 @@ cat >"$T/bin/ip" <<'EOF'
 #!/bin/sh
 # The network as a build host has it: usable, unless a scenario says otherwise.
 # A stream URL is checked by resolving its host, but a playlist on a streaming
-# service has no host in its target, so streamer-play falls back to asking for a
+# service has no host in its target, so atibi-play falls back to asking for a
 # route and an address. Neither answer should depend on the machine running the
 # suite, which may have neither iproute2 nor a default route: so the answer is
 # here, and the file net-down is how a scenario takes it away. Each call is
@@ -328,51 +328,51 @@ EOF
 chmod +x "$T/bin/chown"
 
 # Every absolute path the scripts use comes from one of two places: the knobs
-# in /etc/streamer.conf, or a literal /usr/local/bin or /boot/firmware in the
+# in /etc/atibi.conf, or a literal /usr/local/bin or /boot/firmware in the
 # script itself. So the sandbox is two rewrites, and nothing else: the logic
 # under test is otherwise byte-for-byte what ships.
-cat >"$T/streamer.conf" <<EOF
-$(sed -e 's#^STREAMER_DATA=/data$#STREAMER_DATA='$T'/data/#' \
-    -e 's#^STREAMER_SEED=.*#STREAMER_SEED='$T'/share/streamer/seed#' \
-    -e 's#\$STREAMER_DATA#'$T'/data#g' "$CFG/etc/streamer.conf")
+cat >"$T/atibi.conf" <<EOF
+$(sed -e 's#^ATIBI_DATA=/data$#ATIBI_DATA='$T'/data/#' \
+    -e 's#^ATIBI_SEED=.*#ATIBI_SEED='$T'/share/atibi/seed#' \
+    -e 's#\$ATIBI_DATA#'$T'/data#g' "$CFG/etc/atibi.conf")
 # The default target points at localhost: a boot test that reached for the real
 # radio service would fail on an offline build host for reasons that have
 # nothing to do with the scripts. What matters here is that *some* URL start
 # gets a row of its own, and that row is the one that plays.
-STREAMER_START_TARGET=http://localhost/x.mp3
+ATIBI_START_TARGET=http://localhost/x.mp3
 # Small on purpose: one scenario checks that the log keeps its window and drops
 # the oldest lines, and that is cheaper to see with four than with two hundred.
 # The budgets are shortened too: the scenario where the player never comes up
 # has to sit through them.
-STREAMER_BOOTLOG_KEEP=4
-STREAMER_SOCKET_WAIT=1
-STREAMER_PLAY_WAIT=1
+ATIBI_BOOTLOG_KEEP=4
+ATIBI_SOCKET_WAIT=1
+ATIBI_PLAY_WAIT=1
 # A ramp this fast costs the suite nothing; MAX_STEPS stays at the shipped 16
 # except in the one scenario that deliberately runs the budget out.
-STREAMER_RAMP_START=0.05
-STREAMER_RAMP_DELAY=0.05
-STREAMER_RAMP_MAX_STEPS=16
+ATIBI_RAMP_START=0.05
+ATIBI_RAMP_DELAY=0.05
+ATIBI_RAMP_MAX_STEPS=16
 EOF
 sandbox() { # sandbox <script name>
     sed \
-        -e 's#^\. /etc/streamer\.conf$#. '$T'/streamer.conf#' \
-        -e 's#/etc/streamer\.conf#'$T'/streamer.conf#g' \
-        -e 's#/etc/streamer/audio-#'$T'/audio-#g' \
-        -e 's#/etc/streamer#'$T'/etc-streamer#g' \
+        -e 's#^\. /etc/atibi\.conf$#. '$T'/atibi.conf#' \
+        -e 's#/etc/atibi\.conf#'$T'/atibi.conf#g' \
+        -e 's#/etc/atibi/audio-#'$T'/audio-#g' \
+        -e 's#/etc/atibi#'$T'/etc-atibi#g' \
         -e 's#/boot/firmware/config.txt#'$T'/fw/config.txt#g' \
         -e 's#^boot_dir=/boot/firmware$#boot_dir='$T'/fw#' \
-        -e 's;/usr/local/bin/streamer;'"$T"'/streamer;g' \
-        -e 's#/usr/share/streamer#'"$T"'/share/streamer#g' \
+        -e 's;/usr/local/bin/atibi;'"$T"'/atibi;g' \
+        -e 's#/usr/share/atibi#'"$T"'/share/atibi#g' \
         "$CFG/usr/local/bin/$1" >"$T/$1"
     chmod +x "$T/$1"
 }
-for s in streamer-bootlog streamer-play streamer streamer-http; do
+for s in atibi-bootlog atibi-play atibi atibi-http; do
     sandbox "$s"
 done
 
 reset() { # the data partition as the card ships it, a player as a live daemon
           # has it, fresh boot files. It wipes $T/data rather than only
-          # data/streamer, because a scenario that tests the factory reset puts
+          # data/atibi, because a scenario that tests the factory reset puts
           # files all over that partition, and the next scenario is entitled to
           # the clean card the build gave it.
     rm -rf "$T/data" "$T/state.json" "$T/mount-root" "$T/systemctl"
@@ -388,19 +388,19 @@ fw_seed() { # fw_seed <jack|dac>: the boot partition as image/build.sh leaves it
     {
         printf 'initramfs initramfs.img\nauto cfg.txt followdtbs boot/initrd.img\n[all]\n'
         printf '#dtparam=audio=on\n#dtoverlay=vc4-kms-v3d\n'
-        awk -v f="$CFG/etc/streamer/audio-$1.txt" '
-            /^# --- streamer audio begin ---$/ {
+        awk -v f="$CFG/etc/atibi/audio-$1.txt" '
+            /^# --- atibi audio begin ---$/ {
                 print; while ((getline l < f) > 0) print l; skip = 1; next
             }
-            /^# --- streamer audio end ---$/   { skip = 0; print; next }
+            /^# --- atibi audio end ---$/   { skip = 0; print; next }
             { if (!skip) print }
         ' "$CFG/boot/appliance-config.txt"
     } >"$T/fw/config.txt"
     printf 'console=serial0,115200 initrd=initramfs.img rootwait ro\n' >"$T/fw/cmdline.txt"
 }
-export HOME=$T/home TESTROOT=$T PATH=$T/bin:$PATH STREAMER_SUDO=1
+export HOME=$T/home TESTROOT=$T PATH=$T/bin:$PATH ATIBI_SUDO=1
 sock=$HOME/.config/cliamp/cliamp.sock
-socket_on() { # the player is up: streamer-play only checks that the socket is there
+socket_on() { # the player is up: atibi-play only checks that the socket is there
     rm -f "$sock"
     # Detached from the harness's own stdout/stderr, and watching for its own
     # socket to vanish: a leftover listener holding the output pipes open would
@@ -456,13 +456,13 @@ http_start() {
     export http_port
     http_port=$(python3 -c 'import socket
 s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
-    STREAMER_CONF="$T/streamer.conf" \
-        STREAMER_HTTP_PORT="$http_port" \
-        STREAMER_HTTP_PIDFILE="$T/http.pid" \
-        STREAMER_CLIAMP_SOCKET="$sock" \
-        STREAMER_EXECUTABLE="$T/streamer" \
-        STREAMER_CLIAMP_EXECUTABLE="$T/bin/cliamp" \
-        setsid "$T/streamer-http" </dev/null >"$T/logs/http.out" 2>&1 &
+    ATIBI_CONF="$T/atibi.conf" \
+        ATIBI_HTTP_PORT="$http_port" \
+        ATIBI_HTTP_PIDFILE="$T/http.pid" \
+        ATIBI_CLIAMP_SOCKET="$sock" \
+        ATIBI_EXECUTABLE="$T/atibi" \
+        ATIBI_CLIAMP_EXECUTABLE="$T/bin/cliamp" \
+        setsid "$T/atibi-http" </dev/null >"$T/logs/http.out" 2>&1 &
     i=0
     until http_raw GET / >/dev/null 2>&1; do
         i=$((i + 1)); [ $i -gt 100 ] && break; sleep 0.05
@@ -475,7 +475,7 @@ http_stop() {
     fi
     return 0
 }
-# curl in this sandbox is a stub for `streamer stations`: it answers one URL
+# curl in this sandbox is a stub for `atibi stations`: it answers one URL
 # shape and fails every other one. So the HTTP client here is Python, one
 # request per call, and the token goes in as a header exactly the way the
 # browser sends it.
@@ -499,7 +499,7 @@ except urllib.error.HTTPError as e:
 }
 http() { # http GET|POST <path> [json body]: with the server's own token
     local tok=""
-    [ -f "$T/data/streamer/http.token" ] && tok=$(cat "$T/data/streamer/http.token")
+    [ -f "$T/data/atibi/http.token" ] && tok=$(cat "$T/data/atibi/http.token")
     http_raw "$1" "$2" "${3:-}" "$tok" 2>/dev/null
 }
 http_code() { # http_code GET|POST <path> [json body] [token]: status only.
@@ -509,7 +509,7 @@ http_code() { # http_code GET|POST <path> [json body] [token]: status only.
 }
 count_markers() { # exact marker lines only: the appliance block also mentions
                    # them in prose, which the awk splice does not match
-    grep -cE '^# --- streamer audio (begin|end) ---$' "$T/fw/config.txt"; }
+    grep -cE '^# --- atibi audio (begin|end) ---$' "$T/fw/config.txt"; }
 audio_lines() { grep -E '^(dtparam=audio|dtoverlay=(vc4-kms-v3d|iqaudio))' "$T/fw/config.txt" |
     tr '\n' ' '; }
 note() { printf '\n=== %s\n' "$1"; }
@@ -518,7 +518,7 @@ player() { printf 'player: state=%s row=%s rows=%s position=%s volume=%s\n' \
 rows() { # how many rows the stand-in player has loaded
     python3 -c 'import json, sys; print(len(json.load(sys.stdin).get("queue", [])))' \
         <"$T/state.json"; }
-log_tail() { printf 'boot.log:\n'; sed 's/^/  /' "$T/data/streamer/boot.log" 2>/dev/null || echo "  (none)"; }
+log_tail() { printf 'boot.log:\n'; sed 's/^/  /' "$T/data/atibi/boot.log" 2>/dev/null || echo "  (none)"; }
 oneline() { # oneline <file>: that file on one line, or a note that it is not there.
     # Reading what a script was supposed to write has to work when the script
     # did not write it: that is a failed check, and a check has to be runnable
@@ -540,7 +540,7 @@ run() { # run <scenario number>
     case "$1" in
     1) note "1. first boot: no saved state, the default station, ramp to the fallback level"
         reset; socket_on
-        if "$T/streamer-play" >"$T/logs/s1" 2>&1; then rc=0; else rc=$?; fi
+        if "$T/atibi-play" >"$T/logs/s1" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s1"; echo "  exit $rc"
         player
         socket_off
@@ -551,13 +551,13 @@ run() { # run <scenario number>
         ck "the boot floor is set on the player, and set before it makes a sound" \
             "[ $(pln 'volume -30') -gt 0 ] && [ $(pln 'volume -30') -lt $(pln 'url.load') ]"
         ck_eq "ramped to the fallback level" "$(jnum volume)" "-20"
-        ck_in "boot.log records the play" "$T/data/streamer/boot.log" "OK url http://localhost/x.mp3"
-        ck_in "boot.log records the level it reached" "$T/data/streamer/boot.log" "(target -20)"
+        ck_in "boot.log records the play" "$T/data/atibi/boot.log" "OK url http://localhost/x.mp3"
+        ck_in "boot.log records the level it reached" "$T/data/atibi/boot.log" "(target -20)"
         ck_in "it says the level came from the fallback" "$T/logs/s1" "no saved volume" ;;
     2) note "2. resume: playlist 'Late Night' at the saved -9 dB"
         reset; socket_on
-        printf 'mode=last\nkind=playlist\ntarget=Late Night\nvolume=-9\n' >"$T/data/streamer/state"
-        if "$T/streamer-play" >"$T/logs/s2" 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=last\nkind=playlist\ntarget=Late Night\nvolume=-9\n' >"$T/data/atibi/state"
+        if "$T/atibi-play" >"$T/logs/s2" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s2"; player
         socket_off
         ck_eq "exit status 0" "$rc" "0"
@@ -566,45 +566,45 @@ run() { # run <scenario number>
         ck_not "it does not reach back into the playlist" "$T/player.log" "seek.absolute"
         ck_eq "the saved level is replayed" "$(jnum volume)" "-9"
         ck_not "it does not claim there was no saved level" "$T/logs/s2" "no saved volume"
-        ck_in "boot.log records the play" "$T/data/streamer/boot.log" "OK playlist Late Night"
-        ck_in "boot.log records the level it reached" "$T/data/streamer/boot.log" "(target -9)" ;;
+        ck_in "boot.log records the play" "$T/data/atibi/boot.log" "OK playlist Late Night"
+        ck_in "boot.log records the level it reached" "$T/data/atibi/boot.log" "(target -9)" ;;
     3) note "3. saving on change: the level a person set, and a playlist the phone started"
         reset; socket_on
-        "$T/streamer-play" >/dev/null 2>&1
+        "$T/atibi-play" >/dev/null 2>&1
         # A session in progress: something is playing, and the level is wherever
         # the boot left it. Nothing writes the record on a timer, so the file is
         # still without a level line at this point.
         echo "  before anyone touches anything:"
-        oneline "$T/data/streamer/state"; echo
-        ck_not "nothing has recorded a level yet" "$T/data/streamer/state" "volume="
-        if "$T/streamer" vol -12 >"$T/logs/vol" 2>&1; then rc=0; else rc=$?; fi
+        oneline "$T/data/atibi/state"; echo
+        ck_not "nothing has recorded a level yet" "$T/data/atibi/state" "volume="
+        if "$T/atibi" vol -12 >"$T/logs/vol" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/vol"
-        echo "  after streamer vol -12:"; oneline "$T/data/streamer/state"; echo
+        echo "  after atibi vol -12:"; oneline "$T/data/atibi/state"; echo
         ck_eq "setting the level on a running player exits 0" "$rc" "0"
-        ck_in "the change is written down at once" "$T/data/streamer/state" "volume=-12"
-        ck_in "the boot target is recorded alongside it" "$T/data/streamer/state" "target=http://localhost/x.mp3"
-        if "$T/streamer" down 3 >"$T/logs/down" 2>&1; then rc=0; else rc=$?; fi
+        ck_in "the change is written down at once" "$T/data/atibi/state" "volume=-12"
+        ck_in "the boot target is recorded alongside it" "$T/data/atibi/state" "target=http://localhost/x.mp3"
+        if "$T/atibi" down 3 >"$T/logs/down" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/down"
-        echo "  after streamer down 3:"; oneline "$T/data/streamer/state"; echo
+        echo "  after atibi down 3:"; oneline "$T/data/atibi/state"; echo
         ck_eq "stepping the level down exits 0" "$rc" "0"
-        ck_in "a step up or down is remembered the same way" "$T/data/streamer/state" "volume=-15"
+        ck_in "a step up or down is remembered the same way" "$T/data/atibi/state" "volume=-15"
         # The phone tapping a Tidal playlist: playback is started over IPC, and
-        # the boot target is written through the streamer command with the
+        # the boot target is written through the atibi command with the
         # provider:id spelling, without restarting the sequence underneath it.
-        if "$T/streamer" remember playlist tidal:e407f56e >"$T/logs/rem" 2>&1; then
+        if "$T/atibi" remember playlist tidal:e407f56e >"$T/logs/rem" 2>&1; then
             rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/rem"
-        echo "  after remember playlist tidal:e407f56e:"; oneline "$T/data/streamer/state"; echo
+        echo "  after remember playlist tidal:e407f56e:"; oneline "$T/data/atibi/state"; echo
         ck_eq "recording next boot exits 0" "$rc" "0"
-        ck_in "the playlist is what plays next boot" "$T/data/streamer/state" "kind=provider"
-        ck_in "on that provider" "$T/data/streamer/state" "provider=tidal"
-        ck_in "by that id" "$T/data/streamer/state" "target=e407f56e"
-        ck_in "the level survives the rewrite" "$T/data/streamer/state" "volume=-15"
-        ck_not "and recording it did not restart the player" "$T/systemctl" "restart streamer-play.service"
+        ck_in "the playlist is what plays next boot" "$T/data/atibi/state" "kind=provider"
+        ck_in "on that provider" "$T/data/atibi/state" "provider=tidal"
+        ck_in "by that id" "$T/data/atibi/state" "target=e407f56e"
+        ck_in "the level survives the rewrite" "$T/data/atibi/state" "volume=-15"
+        ck_not "and recording it did not restart the player" "$T/systemctl" "restart atibi-play.service"
         echo "  and a boot from it, with the player as it is after a reboot:"
         rm -f "$T/state.json" "$T/player.log"
         "$T/bin/cliamp" --default-state >"$T/state.json"
-        if "$T/streamer-play" >"$T/logs/s3" 2>&1; then rc=0; else rc=$?; fi
+        if "$T/atibi-play" >"$T/logs/s3" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s3"; player
         socket_off
         ck_eq "exit status 0" "$rc" "0"
@@ -614,64 +614,64 @@ run() { # run <scenario number>
         ck "provider.load started it, so the boot did not start it again" \
             "[ -z \"$(pln 'queue.play')\" ]"
         ck_eq "and the level came back to the -15 dB that was saved" "$(jnum volume)" "-15"
-        ck_in "boot.log names the provider playlist" "$T/data/streamer/boot.log" "OK provider e407f56e" ;;
+        ck_in "boot.log names the provider playlist" "$T/data/atibi/boot.log" "OK provider e407f56e" ;;
     4) note "4. stop mode: stay quiet"
         reset; socket_on
-        printf 'mode=stop\nkind=url\ntarget=http://localhost/x.mp3\n' >"$T/data/streamer/state"
-        if "$T/streamer-play" >"$T/logs/s6" 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=stop\nkind=url\ntarget=http://localhost/x.mp3\n' >"$T/data/atibi/state"
+        if "$T/atibi-play" >"$T/logs/s6" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s6"; player
         socket_off
         ck_eq "exit status 0" "$rc" "0"
         ck_eq "nothing started" "$(jstr state)" "stopped"
         ck_eq "no row was picked" "$(jnum index)" "-1"
         ck_not "the default station was not queued" "$T/state.json" "http://localhost/x.mp3"
-        ck_in "boot.log says it stayed quiet on purpose" "$T/data/streamer/boot.log" "stop mode, nothing started" ;;
-    5) note "5. a saved level of +99 dB is clamped to STREAMER_VOL_MAX"
+        ck_in "boot.log says it stayed quiet on purpose" "$T/data/atibi/boot.log" "stop mode, nothing started" ;;
+    5) note "5. a saved level of +99 dB is clamped to ATIBI_VOL_MAX"
         reset; socket_on
-        printf 'mode=last\nkind=url\ntarget=http://localhost/x.mp3\n' >"$T/data/streamer/state"
-        printf 'volume=99\n' >>"$T/data/streamer/state"
-        if "$T/streamer-play" >"$T/logs/s7" 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=last\nkind=url\ntarget=http://localhost/x.mp3\n' >"$T/data/atibi/state"
+        printf 'volume=99\n' >>"$T/data/atibi/state"
+        if "$T/atibi-play" >"$T/logs/s7" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s7"; player
         socket_off
         ck_eq "exit status 0" "$rc" "0"
         ck_eq "the ceiling held" "$(jnum volume)" "6"
-        ck_in "and the clamp is in the log" "$T/data/streamer/boot.log" "(target 6)" ;;
+        ck_in "and the clamp is in the log" "$T/data/atibi/boot.log" "(target 6)" ;;
     6) note "6. the player never comes up: fail loudly, and say so in boot.log"
         reset; socket_off
-        if "$T/streamer-play" >"$T/logs/no-socket" 2>&1; then rc=0; else rc=$?; fi
+        if "$T/atibi-play" >"$T/logs/no-socket" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/no-socket"
         echo "  exit $rc (non-zero is the point: systemd records it and moves on)"
         ck "exit status is non-zero" "[ $rc -ne 0 ]"
-        ck_in "boot.log says what was waited for" "$T/data/streamer/boot.log" "FAIL no cliamp socket" ;;
-    7) note "7. streamer, the SSH-facing control: what it reports"
+        ck_in "boot.log says what was waited for" "$T/data/atibi/boot.log" "FAIL no cliamp socket" ;;
+    7) note "7. atibi, the SSH-facing control: what it reports"
         reset; socket_on
-        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'volume=-9\n' >>"$T/data/streamer/state"
-        echo "-- streamer last"; "$T/streamer" last >"$T/logs/last" 2>&1; sed 's/^/  /' "$T/logs/last"
-        echo "-- streamer status"; "$T/streamer" status >"$T/logs/status" 2>&1; sed 's/^/  /' "$T/logs/status"
-        echo "-- streamer audio, with no argument, reports the live block"
-        "$T/streamer" audio | grep -v '^#' | grep -v '^$' | sed 's/^/  /'
-        echo "-- streamer stations, from the list in STREAMER_STATION_LIST"
-        "$T/streamer" stations >"$T/logs/stations" 2>&1; sed 's/^/  /' "$T/logs/stations"
-        echo "-- streamer boots, the durable log"
-        printf 'mode=last\nkind=url\ntarget=http://localhost/x.mp3\n' >"$T/data/streamer/state"
-        if "$T/streamer-play" >/dev/null 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/atibi/state"
+        printf 'volume=-9\n' >>"$T/data/atibi/state"
+        echo "-- atibi last"; "$T/atibi" last >"$T/logs/last" 2>&1; sed 's/^/  /' "$T/logs/last"
+        echo "-- atibi status"; "$T/atibi" status >"$T/logs/status" 2>&1; sed 's/^/  /' "$T/logs/status"
+        echo "-- atibi audio, with no argument, reports the live block"
+        "$T/atibi" audio | grep -v '^#' | grep -v '^$' | sed 's/^/  /'
+        echo "-- atibi stations, from the list in ATIBI_STATION_LIST"
+        "$T/atibi" stations >"$T/logs/stations" 2>&1; sed 's/^/  /' "$T/logs/stations"
+        echo "-- atibi boots, the durable log"
+        printf 'mode=last\nkind=url\ntarget=http://localhost/x.mp3\n' >"$T/data/atibi/state"
+        if "$T/atibi-play" >/dev/null 2>&1; then rc=0; else rc=$?; fi
         ck_eq "the url start came up" "$rc" "0"
-        "$T/streamer" boots >"$T/logs/boots" 2>&1; sed 's/^/  /' "$T/logs/boots"
+        "$T/atibi" boots >"$T/logs/boots" 2>&1; sed 's/^/  /' "$T/logs/boots"
         socket_off
-        echo "-- streamer rw, then ro: the read-only root is the point of the"
+        echo "-- atibi rw, then ro: the read-only root is the point of the"
         echo "   whole power-cut design, so those two have to be the record"
-        "$T/streamer" rw >/dev/null 2>&1 || true
-        "$T/streamer" ro >/dev/null 2>&1 || true
+        "$T/atibi" rw >/dev/null 2>&1 || true
+        "$T/atibi" ro >/dev/null 2>&1 || true
         sed 's/^/  /' "$T/mount-root" 2>/dev/null | sed 's/^/  /'
-        echo "-- streamer nonsense is refused, with the usage text"
+        echo "-- atibi nonsense is refused, with the usage text"
         # set -e would abort the harness on a command meant to fail, so the
         # status is captured in the condition itself.
-        if "$T/streamer" nonsense >"$T/logs/nonsense" 2>&1; then rc=0; else rc=$?; fi
+        if "$T/atibi" nonsense >"$T/logs/nonsense" 2>&1; then rc=0; else rc=$?; fi
         echo "  exit $rc, $(wc -l <"$T/logs/nonsense") lines, first: $(sed -n 1p "$T/logs/nonsense")"
         echo "-- seven events into a boot.log that keeps four"
-        for i in 1 2 3 4 5 6 7; do "$T/streamer-bootlog" "line $i"; done
-        echo "  lines kept: $(wc -l <"$T/data/streamer/boot.log")"
+        for i in 1 2 3 4 5 6 7; do "$T/atibi-bootlog" "line $i"; done
+        echo "  lines kept: $(wc -l <"$T/data/atibi/boot.log")"
         ck_in "last reports the saved intent" "$T/logs/last" "Late Night"
         ck_in "and the level the next session starts at" "$T/logs/last" "at -9 dB"
         ck_in "status repeats the saved level" "$T/logs/status" "boot level:  -9 dB"
@@ -684,44 +684,44 @@ run() { # run <scenario number>
         ck_in "boots reads the durable log back" "$T/logs/boots" "OK url http://localhost/x.mp3"
         ck_eq "nonsense is refused with exit 2" "$rc" "2"
         ck_eq "the usage text is more than one line" "$([ "$(wc -l <"$T/logs/nonsense")" -gt 3 ] && echo yes)" "yes"
-        ck_in "usage starts with the synopsis" "$T/logs/nonsense" "streamer [command]"
-        ck_in "usage lists the audio switch" "$T/logs/nonsense" "streamer audio [jack|dac]"
+        ck_in "usage starts with the synopsis" "$T/logs/nonsense" "atibi [command]"
+        ck_in "usage lists the audio switch" "$T/logs/nonsense" "atibi audio [jack|dac]"
         ck_in "usage lists what gets remembered for the next boot" "$T/logs/nonsense" \
-            "streamer remember <what> <target>"
+            "atibi remember <what> <target>"
         ck_not "and no longer offers to drop a position that is not kept" "$T/logs/nonsense" \
             "forget"
-        ck_eq "streamer rw then ro leaves the root read-only, in that order" \
+        ck_eq "atibi rw then ro leaves the root read-only, in that order" \
             "$(tr '\n' ' ' <"$T/mount-root")" "rw ro "
-        ck_eq "boot.log keeps the configured window" "$(wc -l <"$T/data/streamer/boot.log")" "4"
+        ck_eq "boot.log keeps the configured window" "$(wc -l <"$T/data/atibi/boot.log")" "4"
         # The timestamp is compared as a prefix, never as a whole line: the log
         # line and the expected value are stamped a moment apart, and an exact
         # second-for-second match turns the suite into a coin toss whenever the
         # boot.log writes straddle a second boundary (it went red on the
         # mutation tool's own final clean run for exactly that reason).
         ck_eq "every kept line is stamped with today, in UTC" \
-            "$(cut -c1-20 "$T/data/streamer/boot.log" |
+            "$(cut -c1-20 "$T/data/atibi/boot.log" |
               grep -c "^$(date -u +%Y-%m-%dT)")" "4"
         ck_eq "the newest event is the one kept last" \
-            "$(sed -n 4p "$T/data/streamer/boot.log" | cut -c22-)" "line 7"
-        ck_in "and the oldest of the seven is gone" "$T/data/streamer/boot.log" "line 4"
-        ck_not "the lines before it did not survive" "$T/data/streamer/boot.log" "line 3" ;;
-    8) note "8. streamer audio jack|dac: only the marked block of config.txt moves"
+            "$(sed -n 4p "$T/data/atibi/boot.log" | cut -c22-)" "line 7"
+        ck_in "and the oldest of the seven is gone" "$T/data/atibi/boot.log" "line 4"
+        ck_not "the lines before it did not survive" "$T/data/atibi/boot.log" "line 3" ;;
+    8) note "8. atibi audio jack|dac: only the marked block of config.txt moves"
         reset
         untouched_before=$(grep -vE 'audio|kms-v3d' "$T/fw/config.txt" | tr '\n' '|')
         echo "  start (a jack build): $(audio_lines)"
         echo "  markers in config.txt: $(count_markers)"
-        "$T/streamer" audio dac
+        "$T/atibi" audio dac
         echo "  after dac:  $(audio_lines)"
         after_dac=$(audio_lines)
         ck_in "dac switched in the DAC overlay" "$T/fw/config.txt" "dtoverlay=iqaudio-dacplus"
         ck_eq "dac took the analog output away" \
             "$(grep -cxF 'dtparam=audio=on' "$T/fw/config.txt")" "0"
         ck_eq "still exactly one begin/end pair after the switch" "$(count_markers)" "2"
-        "$T/streamer" audio dac
+        "$T/atibi" audio dac
         echo "  after dac again, unchanged: $(audio_lines)"
         ck_eq "switching to what it already was changed nothing" "$after_dac" "$(audio_lines)"
         ck_eq "and no markers were duplicated" "$(count_markers)" "2"
-        "$T/streamer" audio jack
+        "$T/atibi" audio jack
         echo "  back to jack: $(audio_lines)"
         ck_in "jack switched back to the analog output" "$T/fw/config.txt" "dtparam=audio=on"
         ck_eq "everything outside the marked block survived all three writes" \
@@ -729,35 +729,35 @@ run() { # run <scenario number>
         ck_eq "the stock analog line stays commented" \
             "$(grep -c '^#dtparam=audio=on' "$T/fw/config.txt")" "1"
         ck_eq "each switch is one boot.log line" \
-            "$(grep -c 'audio output set to' "$T/data/streamer/boot.log")" "3" ;;
+            "$(grep -c 'audio output set to' "$T/data/atibi/boot.log")" "3" ;;
     9) note "9. a saved level at or below the floor is treated as parked, not replayed"
         reset; socket_on
-        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'volume=-30\n' >>"$T/data/streamer/state"
-        if "$T/streamer-play" >"$T/logs/s11a" 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/atibi/state"
+        printf 'volume=-30\n' >>"$T/data/atibi/state"
+        if "$T/atibi-play" >"$T/logs/s11a" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s11a"
         ck_eq "exit status 0" "$rc" "0"
         ck_eq "the parked -30 dB became the fallback" "$(jnum volume)" "-20"
-        ck_in "and boot.log says so" "$T/data/streamer/boot.log" "saved volume -30 at the floor, using -20"
-        printf 'volume=-99\n' >>"$T/data/streamer/state"
-        if "$T/streamer-play" >"$T/logs/s11b" 2>&1; then rc=0; else rc=$?; fi
+        ck_in "and boot.log says so" "$T/data/atibi/boot.log" "saved volume -30 at the floor, using -20"
+        printf 'volume=-99\n' >>"$T/data/atibi/state"
+        if "$T/atibi-play" >"$T/logs/s11b" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s11b"; player
         socket_off
         ck_eq "exit status 0" "$rc" "0"
         ck_eq "a level below the floor became the fallback too" "$(jnum volume)" "-20"
-        ck_in "and boot.log says so" "$T/data/streamer/boot.log" "saved volume -99 at the floor, using -20" ;;
+        ck_in "and boot.log says so" "$T/data/atibi/boot.log" "saved volume -99 at the floor, using -20" ;;
     10) note "10. a provider the player has no credentials for: the boot says which one, and stops"
         reset; socket_on
-        printf 'mode=last\nkind=provider\ntarget=pl-42\nprovider=qobuz\nvolume=-9\n' >"$T/data/streamer/state"
-        if "$T/streamer-play" >"$T/logs/s12" 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=last\nkind=provider\ntarget=pl-42\nprovider=qobuz\nvolume=-9\n' >"$T/data/atibi/state"
+        if "$T/atibi-play" >"$T/logs/s12" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s12"; player
         socket_off
         ck "exit status is non-zero" "[ $rc -ne 0 ]"
         ck_eq "nothing is playing" "$(jstr state)" "stopped"
         ck_in "boot.log names the provider and the list it could not fetch" \
-            "$T/data/streamer/boot.log" "FAIL provider.load qobuz pl-42"
+            "$T/data/atibi/boot.log" "FAIL provider.load qobuz pl-42"
         ck_not "it does not pretend the target was unknown" \
-            "$T/data/streamer/boot.log" "FAIL unknown kind provider"
+            "$T/data/atibi/boot.log" "FAIL unknown kind provider"
         ck_not "and it does not quietly swap in the default station" \
             "$T/player.log" "url.load" ;;
     11) note "11. the ramp never outlives the boot: a step budget, and a level that will not move"
@@ -767,33 +767,33 @@ run() { # run <scenario number>
         # the level is. Without a guard the loop would climb forever, and the
         # unit's start timeout is what would end it.
         printf -- '-12\n' >"$T/stuck-at"
-        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'volume=-9\n' >>"$T/data/streamer/state"
-        if "$T/streamer-play" >"$T/logs/s13a" 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/atibi/state"
+        printf 'volume=-9\n' >>"$T/data/atibi/state"
+        if "$T/atibi-play" >"$T/logs/s13a" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s13a"; player
         ck_eq "the boot still ends cleanly" "$rc" "0"
         ck_eq "music is playing" "$(jstr state)" "playing"
         ck_eq "the level stopped where the device stopped it" "$(jnum volume)" "-12"
-        ck_in "boot.log says where it got stuck" "$T/data/streamer/boot.log" "volume stuck at -12.0 dB, ramp stops"
-        ck_in "boot.log still records the play" "$T/data/streamer/boot.log" "OK playlist Late Night"
+        ck_in "boot.log says where it got stuck" "$T/data/atibi/boot.log" "volume stuck at -12.0 dB, ramp stops"
+        ck_in "boot.log still records the play" "$T/data/atibi/boot.log" "OK playlist Late Night"
         rm -f "$T/stuck-at"
         # 13b. Nothing refuses, and there is simply too much to climb: the
         # budget is what stops it, so the ramp cannot eat the boot budget.
-        sed -i 's/^STREAMER_RAMP_MAX_STEPS=.*$/STREAMER_RAMP_MAX_STEPS=2/' "$T/streamer.conf"
+        sed -i 's/^ATIBI_RAMP_MAX_STEPS=.*$/ATIBI_RAMP_MAX_STEPS=2/' "$T/atibi.conf"
         reset; socket_on
-        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'volume=-9\n' >>"$T/data/streamer/state"
-        if "$T/streamer-play" >"$T/logs/s13b" 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/atibi/state"
+        printf 'volume=-9\n' >>"$T/data/atibi/state"
+        if "$T/atibi-play" >"$T/logs/s13b" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s13b"; player
         socket_off
         ck_eq "the boot still ends cleanly" "$rc" "0"
         ck_eq "two steps of 3 dB above the floor" "$(jnum volume)" "-24"
-        ck_in "boot.log says the budget ran out" "$T/data/streamer/boot.log" "ramp budget of 2 steps exhausted at -24.0 dB"
+        ck_in "boot.log says the budget ran out" "$T/data/atibi/boot.log" "ramp budget of 2 steps exhausted at -24.0 dB"
         # The sandbox conf is written once for the whole run, so put the shipped
         # budget back: a two-step limit leaking into the scenarios after this one
         # makes them fail for a reason that has nothing to do with what they are
         # about.
-        sed -i 's/^STREAMER_RAMP_MAX_STEPS=.*$/STREAMER_RAMP_MAX_STEPS=16/' "$T/streamer.conf" ;;
+        sed -i 's/^ATIBI_RAMP_MAX_STEPS=.*$/ATIBI_RAMP_MAX_STEPS=16/' "$T/atibi.conf" ;;
     12) note "12. volume moved elsewhere mid-ramp: the person wins, the ramp backs off"
         reset; socket_on
         # The boot is climbing from the floor toward the saved -9 dB, and a
@@ -803,17 +803,17 @@ run() { # run <scenario number>
         # mistake being guarded against is the boot deciding it knows better and
         # climbing straight back over a level someone has just set by hand.
         printf -- '-40\n' >"$T/set-elsewhere"
-        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/streamer/state"
-        printf 'volume=-9\n' >>"$T/data/streamer/state"
-        if "$T/streamer-play" >"$T/logs/s14" 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=last\nkind=playlist\ntarget=Late Night\n' >"$T/data/atibi/state"
+        printf 'volume=-9\n' >>"$T/data/atibi/state"
+        if "$T/atibi-play" >"$T/logs/s14" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s14"; player
         socket_off; rm -f "$T/set-elsewhere"
         ck_eq "the boot still ends cleanly" "$rc" "0"
         ck_eq "the level the person actually set is what plays" "$(jnum volume)" "-40"
         ck_eq "the ramp did not climb to the saved target" "$(jnum volume)" "-40"
         ck_eq "and it got there in a single step, not by arguing" "$(jnum adjustments)" "1"
-        ck_in "boot.log says the level came from elsewhere" "$T/data/streamer/boot.log" "volume set elsewhere to -40.0 dB, ramp stops"
-        ck_in "boot.log still records the play" "$T/data/streamer/boot.log" "OK playlist Late Night" ;;
+        ck_in "boot.log says the level came from elsewhere" "$T/data/atibi/boot.log" "volume set elsewhere to -40.0 dB, ramp stops"
+        ck_in "boot.log still records the play" "$T/data/atibi/boot.log" "OK playlist Late Night" ;;
     13) note "13. build contract: the disk tools the image recipe calls really take those options"
         # A flag that *looks* obvious survives every green sandbox run, because
         # nothing in the sandbox runs a disk tool, and it dies only on the one
@@ -913,7 +913,7 @@ run() { # run <scenario number>
         # wrong. A check that it stays out of the payload is cheaper than the
         # afternoon it would otherwise cost.
         ck_not "no blockdev call left in the payload" \
-            "$CFG/usr/local/bin/streamer" "blockdev"
+            "$CFG/usr/local/bin/atibi" "blockdev"
         # The read-back build.sh does after writing the partition table parses
         # `sfdisk -d`. That is only worth believing against real output, so make
         # a real dos table with the real sfdisk and read it the way the script
@@ -967,7 +967,7 @@ run() { # run <scenario number>
         ck_in "the command the build runs asks for 4096-byte blocks" \
             "$T/contract-mkfs-cmd" "-b 4096"
         ck_in "and the label the fstab line mounts by" \
-            "$T/contract-mkfs-cmd" "-L streamer-data"
+            "$T/contract-mkfs-cmd" "-L atibi-data"
         # The guard is not ceremony: the command comes out of another file, so a
         # mangled one has to report as a failed check, not end the run.
         SEED="$seed"
@@ -978,7 +978,7 @@ run() { # run <scenario number>
         ec=0; e2fsck -fy "$fsimg" >/dev/null 2>&1 || ec=$?
         ck "the seeded filesystem passes a real e2fsck (0 clean, 1 corrected)" "[ $ec -le 1 ]"
         ck_eq "and carries the label the build's fstab line mounts by" \
-            "$(blkid -o value -s LABEL "$fsimg")" "streamer-data"
+            "$(blkid -o value -s LABEL "$fsimg")" "atibi-data"
         ck_eq "at 4096-byte blocks, which is what makes a 1 GiB volume's block count predictable" \
             "$(dumpe2fs -h "$fsimg" 2>/dev/null | awk -F: '/^Block size/ {gsub(/ /,"",$2); print $2}')" \
             "4096"
@@ -1044,31 +1044,31 @@ run() { # run <scenario number>
         ck_eq "running the editor over its own output changes nothing" "$again" "same"
         rm -f "$T/contract.img" "$T/spliced.img" "$T/pulled.img" "$fsimg"
         rm -rf "$seed" ;;
-    14) note "14. streamer reset --yes: the data partition goes back to the template"
+    14) note "14. atibi reset --yes: the data partition goes back to the template"
         reset; socket_on; seed_tree
         # A partition that has been lived on. The dotfile is the interesting
         # part: `rm -rf /data/*` would leave it behind, and a stale hidden file
         # under a freshly copied template is the half-reset state that is hardest
         # to diagnose a month later.
         printf 'mode=last\nkind=url\ntarget=https://example.org/stale/stream\n' \
-            >"$T/data/streamer/state"
-        printf 'volume=-4\n' >>"$T/data/streamer/state"
+            >"$T/data/atibi/state"
+        printf 'volume=-4\n' >>"$T/data/atibi/state"
         install -d "$T/data/cliamp" "$T/data/music" "$T/data/bin"
         printf 'token = "not-a-real-token"\n' >"$T/data/cliamp/config.toml"
         printf 'hidden\n' >"$T/data/.hidden"
         printf 'a track\n' >"$T/data/music/song.flac"
-        echo "-- streamer reset, with no --yes: refuse, name the cost, change nothing"
-        if "$T/streamer" reset >"$T/logs/reset-no" 2>&1; then rc_no=0; else rc_no=$?; fi
+        echo "-- atibi reset, with no --yes: refuse, name the cost, change nothing"
+        if "$T/atibi" reset >"$T/logs/reset-no" 2>&1; then rc_no=0; else rc_no=$?; fi
         echo "  exit $rc_no"; sed 's/^/  /' "$T/logs/reset-no"
         ck_eq "without --yes it refuses, exit 2" "$rc_no" "2"
         ck_in "the refusal says what it costs" "$T/logs/reset-no" "Tidal sign-in"
         ck_in "and lists the dotfile a plain glob would miss" "$T/logs/reset-no" ".hidden"
         ck "refusing really changes nothing: the intent is still there" \
-            "grep -q example.org \"$T/data/streamer/state\""
+            "grep -q example.org \"$T/data/atibi/state\""
         ck "refusing really changes nothing: the dotfile is still there" \
             "[ -f \"$T/data/.hidden\" ]"
-        echo "-- streamer reset --yes"
-        if "$T/streamer" reset --yes >"$T/logs/reset" 2>&1; then rc=0; else rc=$?; fi
+        echo "-- atibi reset --yes"
+        if "$T/atibi" reset --yes >"$T/logs/reset" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/reset"
         echo "-- the units it was asked to touch, in order"
         sed 's/^/  /' "$T/systemctl"
@@ -1081,17 +1081,17 @@ run() { # run <scenario number>
         # worth making is the stronger one: nothing else survived the wipe.
         ck_eq "after the reset the only files on the partition are the template README and the boot log" \
             "$(find "$T/data" -mindepth 1 -type f | sed "s|^$T/data/||" | LC_ALL=C sort | tr '\n' ' ')" \
-            "README streamer/boot.log "
+            "README atibi/boot.log "
         ck_in "the template's README came across too" "$T/data/README" "template"
         ck "the saved intent is gone, so the next boot starts from the defaults" \
-            "[ ! -e \"$T/data/streamer/state\" ]"
+            "[ ! -e \"$T/data/atibi/state\" ]"
         ck "as are the local music and the Tidal sign-in" \
             "[ ! -e \"$T/data/music/song.flac\" ] && [ ! -e \"$T/data/cliamp/config.toml\" ]"
         ck "and so is the dotfile, which is why this does not use a glob" \
             "[ ! -e \"$T/data/.hidden\" ]"
-        ck_eq "so 'streamer last' falls back to the configured default" \
-            "$("$T/streamer" last)" "last url http://localhost/x.mp3"
-        ck_in "the durable log records the reset" "$T/data/streamer/boot.log" "factory reset"
+        ck_eq "so 'atibi last' falls back to the configured default" \
+            "$("$T/atibi" last)" "last url http://localhost/x.mp3"
+        ck_in "the durable log records the reset" "$T/data/atibi/boot.log" "factory reset"
         # The order of the two systemctl calls is not decoration: the player holds
         # the IPC socket and its configuration directory open, and its exit handler
         # writes to both, so wiping the ground under it can drop a stale file back
@@ -1102,7 +1102,7 @@ run() { # run <scenario number>
         # string is luck. Sort both sides, and build the expected side from the
         # same directory list the build script seeds /data with.
         ck_eq "the template is untouched, so a second reset would do the same" \
-            "$(ls -1A "$T/share/streamer/seed" | LC_ALL=C sort | tr '\n' ' ')" \
+            "$(ls -1A "$T/share/atibi/seed" | LC_ALL=C sort | tr '\n' ' ')" \
             "$(printf '%s\n' $DATA_DIRS README | LC_ALL=C sort | tr '\n' ' ')" ;;
     15) note "15. packaging: what lands on the card is something systemd can exec"
         # The card that came up mute was not broken by logic. A script had lost its
@@ -1118,7 +1118,7 @@ run() { # run <scenario number>
             n=$((n + 1))
             ck_eq "$name begins with a shebang, because systemd execs rather than parses" \
                 "$(head -c 2 "$f")" "#!"
-            if [ "$name" = streamer-http ]; then
+            if [ "$name" = atibi-http ]; then
                 # The one payload program that is not shell: the LAN control
                 # server is python3, and image/build.sh checks the base image
                 # really ships that interpreter, per script. So the payload
@@ -1157,7 +1157,7 @@ run() { # run <scenario number>
         for f in "$CFG"/usr/local/bin/*; do
             name=$(basename "$f")
             case $name in
-                streamer) continue ;;   # the human command, run over SSH
+                atibi) continue ;;   # the human command, run over SSH
             esac
             hits=$(grep -l "$name" "$CFG"/etc/systemd/system/* "$CFG"/usr/local/bin/* 2>/dev/null |
                 grep -v "^$f$" | wc -l)
@@ -1166,7 +1166,7 @@ run() { # run <scenario number>
         for dep in $(sed -n 's/^\(Requires\|After\|WantedBy\)=//p' \
                 "$CFG"/etc/systemd/system/* | sort -u); do
             case $dep in
-                streamer-*.service|streamer-*.timer|streamer.target)
+                atibi-*.service|atibi-*.timer|atibi.target)
                     ck "$dep is a unit the payload really ships" \
                         "[ -f \"$CFG/etc/systemd/system/$dep\" ]" ;;
                 network.target|network-online.target|multi-user.target|timers.target|basic.target)
@@ -1184,27 +1184,27 @@ run() { # run <scenario number>
         # validity. The daemon reports such a stream load as ok; only the
         # wait for a playing state notices, twenty seconds late. So the
         # script waits for the sync flag file first, bounded.
-        sed -i 's/^STREAMER_SYNC_WAIT=.*$/STREAMER_SYNC_WAIT=1/' "$T/streamer.conf"
+        sed -i 's/^ATIBI_SYNC_WAIT=.*$/ATIBI_SYNC_WAIT=1/' "$T/atibi.conf"
         # 16a. The clock never syncs in this scenario: the wait runs out,
         # says so in both logs, and the boot plays anyway rather than not.
         reset; socket_on
-        printf 'mode=last\nkind=url\ntarget=https://radio.cliamp.stream/lofi/stream\n' >"$T/data/streamer/state"
-        if STREAMER_TIME_SYNC_FLAG="$T/no-such-sync-flag" \
-            "$T/streamer-play" >"$T/logs/s16a" 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=last\nkind=url\ntarget=https://radio.cliamp.stream/lofi/stream\n' >"$T/data/atibi/state"
+        if ATIBI_TIME_SYNC_FLAG="$T/no-such-sync-flag" \
+            "$T/atibi-play" >"$T/logs/s16a" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s16a"; player
         socket_off
         ck_eq "the boot still ends cleanly" "$rc" "0"
         ck_eq "playing" "$(jstr state)" "playing"
         ck_in "the warning says the clock is what was missing" "$T/logs/s16a" "clock not synchronized"
-        ck_in "boot.log carries the warn too" "$T/data/streamer/boot.log" "WARN clock unsynced"
+        ck_in "boot.log carries the warn too" "$T/data/atibi/boot.log" "WARN clock unsynced"
         # 16b. The clock is synced already, which is every warm boot: the
         # flag file is there, so there is no wait and no warning.
         reset; socket_on
         install -d "$T/timesync"
         : >"$T/timesync/synchronized"
-        printf 'mode=last\nkind=url\ntarget=https://radio.cliamp.stream/lofi/stream\n' >"$T/data/streamer/state"
-        if STREAMER_TIME_SYNC_FLAG="$T/timesync/synchronized" \
-            "$T/streamer-play" >"$T/logs/s16b" 2>&1; then rc=0; else rc=$?; fi
+        printf 'mode=last\nkind=url\ntarget=https://radio.cliamp.stream/lofi/stream\n' >"$T/data/atibi/state"
+        if ATIBI_TIME_SYNC_FLAG="$T/timesync/synchronized" \
+            "$T/atibi-play" >"$T/logs/s16b" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s16b"; player
         socket_off; rm -rf "$T/timesync"
         ck_eq "the boot ends cleanly" "$rc" "0"
@@ -1212,7 +1212,7 @@ run() { # run <scenario number>
         ck_not "no wait and no warning when the clock is synced" "$T/logs/s16b" "clock not synchronized"
         # The shipped budget goes back: like the ramp steps above, a leaked
         # one-second wait would confuse the scenarios that run after this one.
-        sed -i 's/^STREAMER_SYNC_WAIT=.*$/STREAMER_SYNC_WAIT=30/' "$T/streamer.conf" ;;
+        sed -i 's/^ATIBI_SYNC_WAIT=.*$/ATIBI_SYNC_WAIT=30/' "$T/atibi.conf" ;;
     17) note "17. the LAN control server: token-guarded, and every playback path goes through the sanctioned writers"
         reset
         # build.sh and the payload have to agree on the interpreter, from both
@@ -1221,17 +1221,17 @@ run() { # run <scenario number>
         ck_in "the build cross-checks every unit's interpreter against the base image" \
             "$BUILD" 'runs python3, which this base image does not ship'
         ck_in "the build enables the control unit at boot" \
-            "$BUILD" 'enable streamer-http.service   streamer.target'
-        ck_in "streamer.conf carries the port and token knobs" \
-            "$T/streamer.conf" "STREAMER_HTTP_TOKEN="
+            "$BUILD" 'enable atibi-http.service   atibi.target'
+        ck_in "atibi.conf carries the port and token knobs" \
+            "$T/atibi.conf" "ATIBI_HTTP_TOKEN="
         # Packaging, without listening: the config the server would run with.
-        no_listen=$(STREAMER_HTTP_TEST_NO_LISTEN=1 "$T/streamer-http" 2>&1); rc=$?
-        ck_eq "it reads its knobs from streamer.conf without a listen" "$rc" "0"
+        no_listen=$(ATIBI_HTTP_TEST_NO_LISTEN=1 "$T/atibi-http" 2>&1); rc=$?
+        ck_eq "it reads its knobs from atibi.conf without a listen" "$rc" "0"
         ck_has "it takes the port from the config" "$no_listen" "port=8077"
         ck_has "it takes the token path from the config" \
-            "$no_listen" "token=$T/data/streamer/http.token"
+            "$no_listen" "token=$T/data/atibi/http.token"
         ck_not "the no-listen pass does not create the token file" \
-            "$T/data/streamer/http.token" "x"
+            "$T/data/atibi/http.token" "x"
         # A stand-in player that speaks the same IPC V2 as the real daemon, so
         # the checks below are about this server's behaviour, not about whether
         # json.loads happened to work.
@@ -1240,10 +1240,10 @@ run() { # run <scenario number>
         ck_eq "no token: the API says no" "$(http_code GET /api/status)" "401"
         ck_eq "the page itself needs no token (the token arrives in the URL)" \
             "$(http_code GET /)" "200"
-        ck_eq "once running, it has made the token" "$([ -f "$T/data/streamer/http.token" ] && echo y)" "y"
+        ck_eq "once running, it has made the token" "$([ -f "$T/data/atibi/http.token" ] && echo y)" "y"
         ck_eq "the token file is readable only by its owner" \
-            "$(stat -c %a "$T/data/streamer/http.token")" "600"
-        tk=$(cat "$T/data/streamer/http.token")
+            "$(stat -c %a "$T/data/atibi/http.token")" "600"
+        tk=$(cat "$T/data/atibi/http.token")
         ck_has "with the token, the player's state comes back" \
             "$(http GET /api/status)" '"state":"stopped"'
         ck_has "the boot intent rides along, read from the appliance state file" \
@@ -1256,7 +1256,7 @@ run() { # run <scenario number>
         ck_has "a level set from the phone lands on the player" \
             "$(http POST /api/op/volume '{"value":-12}'; http GET /api/status)" '"volume":-12'
         ck_in "and it is the level the next boot will start at" \
-            "$T/data/streamer/state" "volume=-12"
+            "$T/data/atibi/state" "volume=-12"
         # Browsing a provider the TUI reached for: Tidal over HTTP is the whole
         # reason this server exists next to the widget.
         ck_has "the provider list names Tidal" "$(http GET /api/providers)" '"key":"tidal"'
@@ -1284,43 +1284,43 @@ run() { # run <scenario number>
             "$(grep -c '^track.play ' "$T/ipc.log")" "1"
         # The intent file as it stands before the tap, kept for the check
         # after it: see the three lines below.
-        before_tap=$(cat "$T/data/streamer/state")
+        before_tap=$(cat "$T/data/atibi/state")
         ck_has "a listed playlist loads through provider.load" \
             "$(http POST /api/load/playlist '{"provider":"tidal","id":"pl-1"}')" '"ok":true'
         ck_eq "provider.load carried the provider and the list id" \
             "$(grep -c '^provider.load {"provider":"tidal","playlist":"pl-1"}' "$T/ipc.log")" "1"
         # What plays next boot is a decision someone makes, not a side effect
         # of a tap (docs/PRD.md: the intent file has exactly one writer, the
-        # streamer command, and the page reaches it only through the "use the
+        # atibi command, and the page reaches it only through the "use the
         # now playing" button). So the intent file is compared byte for byte:
         # a load that quietly recorded itself would change these lines, and the
         # next reboot would come back to a list nobody chose.
         ck_eq "a tapped list does not rewrite what the next boot loads" \
-            "$(cat "$T/data/streamer/state")" "$before_tap"
+            "$(cat "$T/data/atibi/state")" "$before_tap"
         ck_not "and nothing about it is restarted under the music" \
-            "$T/systemctl" "restart streamer-play.service"
+            "$T/systemctl" "restart atibi-play.service"
         # Boot intent is the part with consequences, so the guards are checked
         # in both directions: the sanctioned path, and the rejections around it.
         ck_has "a station set from the phone writes the boot intent" \
             "$(http POST /api/intent '{"kind":"station","target":"http://station.example/s"}')" '"ok":true'
         ck_eq "the intent file says the new station plays next boot" \
-            "$(sed -n 's/^target=//p' "$T/data/streamer/state")" "http://station.example/s"
+            "$(sed -n 's/^target=//p' "$T/data/atibi/state")" "http://station.example/s"
         ck_in "and it restarts playback through the ramp path, not around it" \
-            "$T/systemctl" "restart streamer-play.service"
+            "$T/systemctl" "restart atibi-play.service"
         ck_has "the status call now shows the new station as next boot's target" \
             "$(http GET /api/status)" "station.example/s"
         ck_eq "a non-http station target is refused before anything is written" \
             "$(http_code POST /api/intent '{"kind":"station","target":"file:///etc/passwd"}' "$tk")" "400"
         ck_eq "the intent file did not move" \
-            "$(sed -n 's/^target=//p' "$T/data/streamer/state")" "http://station.example/s"
+            "$(sed -n 's/^target=//p' "$T/data/atibi/state")" "http://station.example/s"
         ck_eq "a non-http url.load is refused too" \
             "$(http_code POST /api/load/url '{"url":"javascript:alert(1)"}' "$tk")" "400"
         ck_eq "and with no token at all it is refused before even that" \
             "$(http_code POST /api/intent '{"kind":"mode","target":"stop"}')" "401"
-        ck_has "the boot mode toggles through the streamer command as well" \
+        ck_has "the boot mode toggles through the atibi command as well" \
             "$(http POST /api/intent '{"kind":"mode","target":"stop"}')" '"ok":true'
         ck_eq "mode=stop is what the state file says now" \
-            "$(sed -n 's/^mode=//p' "$T/data/streamer/state")" "stop"
+            "$(sed -n 's/^mode=//p' "$T/data/atibi/state")" "stop"
         http_stop; ipc_off ;;
     18) note "18. a provider playlist whose network has not arrived yet"
         reset; socket_on
@@ -1329,11 +1329,11 @@ run() { # run <scenario number>
         # refresh Tidal's session with and answered "sign-in required". A
         # provider target is a bare playlist id with no hostname in it, which is
         # why the name-resolution wait never applied to it.
-        sed -i 's/^STREAMER_NET_WAIT=.*$/STREAMER_NET_WAIT=2/' "$T/streamer.conf"
-        printf 'mode=last\nkind=provider\ntarget=pl-42\nprovider=tidal\nvolume=-9\n' >"$T/data/streamer/state"
+        sed -i 's/^ATIBI_NET_WAIT=.*$/ATIBI_NET_WAIT=2/' "$T/atibi.conf"
+        printf 'mode=last\nkind=provider\ntarget=pl-42\nprovider=tidal\nvolume=-9\n' >"$T/data/atibi/state"
         # The lease lands half a second into the boot.
         touch "$T/net-down"; ( sleep 0.5; rm -f "$T/net-down" ) >/dev/null 2>&1 &
-        if "$T/streamer-play" >"$T/logs/s18a" 2>&1; then rc=0; else rc=$?; fi
+        if "$T/atibi-play" >"$T/logs/s18a" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s18a"; player
         echo "  route asked for: $(wc -l <"$T/ip.log") times"
         ck_eq "a lease that arrives late does not fail the boot" "$rc" "0"
@@ -1341,29 +1341,29 @@ run() { # run <scenario number>
             "[ $(wc -l <"$T/ip.log") -gt 1 ]"
         ck_eq "the provider playlist is playing" "$(jrow 0)" "pl-42: row 0"
         ck_eq "at the level that was saved" "$(jnum volume)" "-9"
-        ck_not "a boot that got there wrote no failure" "$T/data/streamer/boot.log" "FAIL"
-        ck_in "the one line it did write is the play" "$T/data/streamer/boot.log" "OK provider pl-42"
+        ck_not "a boot that got there wrote no failure" "$T/data/atibi/boot.log" "FAIL"
+        ck_in "the one line it did write is the play" "$T/data/atibi/boot.log" "OK provider pl-42"
         # And it said so while it waited: the journal here is volatile, so a
         # boot that spent four seconds without a route is only findable
         # afterwards if the waiting leaves a line of its own.
         ck_in "the journal says it was waiting for a route" "$T/logs/s18a" "network not up yet"
-        ck_in "and boot.log says so too, once" "$T/data/streamer/boot.log" "WARN network not up"
+        ck_in "and boot.log says so too, once" "$T/data/atibi/boot.log" "WARN network not up"
         ck_eq "once, not once per probe" \
-            "$(grep -c "WARN network not up" "$T/data/streamer/boot.log")" "1"
+            "$(grep -c "WARN network not up" "$T/data/atibi/boot.log")" "1"
         # No network at all, the other half: it has to stop, inside the budget it
         # was given, and without ever asking the player for something the player
         # could not have fetched.
-        rm -f "$T/state.json" "$T/player.log" "$T/ip.log" "$T/data/streamer/boot.log"
+        rm -f "$T/state.json" "$T/player.log" "$T/ip.log" "$T/data/atibi/boot.log"
         "$T/bin/cliamp" --default-state >"$T/state.json"
         touch "$T/net-down"
-        if "$T/streamer-play" >"$T/logs/s18b" 2>&1; then rc=0; else rc=$?; fi
+        if "$T/atibi-play" >"$T/logs/s18b" 2>&1; then rc=0; else rc=$?; fi
         sed 's/^/  /' "$T/logs/s18b"
         socket_off
         ck_eq "with no network the boot fails" "$rc" "1"
         ck_eq "inside the seconds it was given, not one more" \
             "$(wc -l <"$T/ip.log")" "$((2 * 4 + 1))"
         ck_in "boot.log says what was missing" \
-            "$T/data/streamer/boot.log" "FAIL no network route for provider pl-42"
+            "$T/data/atibi/boot.log" "FAIL no network route for provider pl-42"
         ck_in "after first saying it had waited" "$T/logs/s18b" "network not up yet"
         ck_not "and it never asked the player for the playlist" \
             "$T/player.log" "provider.load" ;;
@@ -1377,38 +1377,38 @@ run() { # run <scenario number>
         # to be: a trim had renamed a short file over the log under a writer that
         # was still appending at its old offset.
         reset; socket_on
-        sed -i 's/^STREAMER_BOOTLOG_KEEP=.*$/STREAMER_BOOTLOG_KEEP=8/' "$T/streamer.conf"
+        sed -i 's/^ATIBI_BOOTLOG_KEEP=.*$/ATIBI_BOOTLOG_KEEP=8/' "$T/atibi.conf"
         echo "-- 200 writers at one time into a window of 8"
-        for i in $(seq 1 200); do "$T/streamer-bootlog" "event $i" & done
+        for i in $(seq 1 200); do "$T/atibi-bootlog" "event $i" & done
         wait
-        echo "  kept: $(wc -l <"$T/data/streamer/boot.log") lines, \
-$(wc -c <"$T/data/streamer/boot.log") bytes, \
-$(tr -dc '\000' <"$T/data/streamer/boot.log" | wc -c) NUL bytes"
-        sed 's/^/  /' "$T/data/streamer/boot.log"
+        echo "  kept: $(wc -l <"$T/data/atibi/boot.log") lines, \
+$(wc -c <"$T/data/atibi/boot.log") bytes, \
+$(tr -dc '\000' <"$T/data/atibi/boot.log" | wc -c) NUL bytes"
+        sed 's/^/  /' "$T/data/atibi/boot.log"
         ck_eq "the window holds, however many writers collide" \
-            "$(wc -l <"$T/data/streamer/boot.log")" "8"
+            "$(wc -l <"$T/data/atibi/boot.log")" "8"
         ck_eq "not one NUL byte in it, which is what an unlocked trim leaves behind" \
-            "$(tr -dc '\000' <"$T/data/streamer/boot.log" | wc -c)" "0"
+            "$(tr -dc '\000' <"$T/data/atibi/boot.log" | wc -c)" "0"
         ck_eq "and every kept line is a whole line, not a fragment of two" \
             "$(grep -c '^[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9:]*Z event [0-9]*$' \
-                "$T/data/streamer/boot.log")" "8"
+                "$T/data/atibi/boot.log")" "8"
         ck_eq "the log is still readable as a log" \
-            "$("$T/streamer" boots | grep -c "event ")" "8"
+            "$("$T/atibi" boots | grep -c "event ")" "8"
         ck_eq "a helper that only logs leaves nothing but the log behind" \
             "$(find "$T/data" -name 'boot.log*' | wc -l)" "1"
         # Ownership is the part that cannot be enacted in a sandbox with one
         # user. What can be tested is that the writer asks for it: the log is
-        # written both by the service, as pi, and by a `streamer` command typed
+        # written both by the service, as pi, and by a `atibi` command typed
         # over SSH, as root, and whichever came first owns the file.
         ck_in "it puts the log back in the boot user's hands, if it can" \
-            "$T/chown.log" "pi:pi $T/data/streamer/boot.log"
+            "$T/chown.log" "pi:pi $T/data/atibi/boot.log"
         echo "-- and one writer, the ordinary case, still keeps the window"
-        for i in 1 2 3; do "$T/streamer-bootlog" "solo $i"; done
+        for i in 1 2 3; do "$T/atibi-bootlog" "solo $i"; done
         ck_eq "three more events leave the same window, oldest gone" \
-            "$(wc -l <"$T/data/streamer/boot.log")" "8"
-        ck_in "the newest event is in it" "$T/data/streamer/boot.log" "solo 3"
+            "$(wc -l <"$T/data/atibi/boot.log")" "8"
+        ck_in "the newest event is in it" "$T/data/atibi/boot.log" "solo 3"
         ck_eq "the oldest of the collisions is not" \
-            "$(grep -c " event 1$" "$T/data/streamer/boot.log")" "0"
+            "$(grep -c " event 1$" "$T/data/atibi/boot.log")" "0"
         # The other half of the same device lesson: the log had been made
         # unreadable-by-the-boot-user by a root SSH session, and the service's
         # lines stopped coming. With one user in the sandbox the ownership cannot
@@ -1416,16 +1416,16 @@ $(tr -dc '\000' <"$T/data/streamer/boot.log" | wc -c) NUL bytes"
         # the same path, and the helper has to come back with the log working,
         # the lines it could read kept, and no complaint on stderr.
         echo "-- then the log is closed to the writer, as a root session left it"
-        chmod 444 "$T/data/streamer/boot.log"
-        "$T/streamer-bootlog" "after the lockout" 2>"$T/logs/s19perm"
+        chmod 444 "$T/data/atibi/boot.log"
+        "$T/atibi-bootlog" "after the lockout" 2>"$T/logs/s19perm"
         echo "  stderr: $(sed 's/^/  /' "$T/logs/s19perm")"
         ck_eq "it makes no noise about not being able to write" \
             "$(wc -l <"$T/logs/s19perm")" "0"
-        ck_in "its line still lands" "$T/data/streamer/boot.log" "after the lockout"
+        ck_in "its line still lands" "$T/data/atibi/boot.log" "after the lockout"
         ck_in "and the line it could read of the old one is kept" \
-            "$T/data/streamer/boot.log" "solo 3"
+            "$T/data/atibi/boot.log" "solo 3"
         ck_eq "the log is writable again, and only the log is there" \
-            "$([ -w "$T/data/streamer/boot.log" ] && echo w)$(find "$T/data" -name 'boot.log*' | wc -l)" "w1"
+            "$([ -w "$T/data/atibi/boot.log" ] && echo w)$(find "$T/data" -name 'boot.log*' | wc -l)" "w1"
         # Where the rewrite is not possible - no directory to write in at all -
         # the only thing left to get right is silence. Two redirects make that a
         # matter of their order: a redirect the shell cannot open is reported at
@@ -1435,8 +1435,8 @@ $(tr -dc '\000' <"$T/data/streamer/boot.log" | wc -c) NUL bytes"
         echo "-- and a log with nowhere to be created at all"
         install -d "$T/data/ro"
         chmod 555 "$T/data/ro"
-        sed -i "s#^STREAMER_BOOTLOG=.*#STREAMER_BOOTLOG=$T/data/ro/gone/boot.log#" "$T/streamer.conf"
-        "$T/streamer-bootlog" "into a closed directory" 2>"$T/logs/s19ro"
+        sed -i "s#^ATIBI_BOOTLOG=.*#ATIBI_BOOTLOG=$T/data/ro/gone/boot.log#" "$T/atibi.conf"
+        "$T/atibi-bootlog" "into a closed directory" 2>"$T/logs/s19ro"
         ck_eq "it succeeds, because a log that cannot be written must not fail a boot" \
             "$?" "0"
         ck_eq "and it keeps the complaint to itself" \

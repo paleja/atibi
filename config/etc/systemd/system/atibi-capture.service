@@ -1,9 +1,9 @@
 [Unit]
 Description=Remember a level set on the player outside the appliance
-Documentation=file:/etc/streamer.conf
+Documentation=file:/etc/atibi.conf
 # Ordering, not a requirement: the subscription begins once this boot's play has
 # finished ramping, so the climb's own steps are not each remembered as a choice.
-After=streamer-play.service
+After=atibi-play.service
 RequiresMountsFor=/data
 
 [Service]
@@ -12,14 +12,14 @@ User=pi
 Group=pi
 Environment=HOME=/home/pi
 Environment=LANG=C.UTF-8
-ExecStart=/usr/local/bin/streamer-capture
+ExecStart=/usr/local/bin/atibi-capture
 Restart=always
 RestartSec=2
 NoNewPrivileges=yes
 PrivateTmp=yes
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=streamer-capture
+SyslogIdentifier=atibi-capture
 
 [Install]
-WantedBy=streamer.target
+WantedBy=atibi.target

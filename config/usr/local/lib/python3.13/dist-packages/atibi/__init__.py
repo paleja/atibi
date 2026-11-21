@@ -1,5 +1,5 @@
 """The appliance's shared library, stdlib only: one implementation of the knobs,
-the boot record, the player's IPC socket and boot.log, used by every streamer-*
+the boot record, the player's IPC socket and boot.log, used by every atibi-*
 entry point. Nothing here reads a path, an executable or a clock it was not
 given, which is what makes the pieces testable on their own.
 """
@@ -20,7 +20,7 @@ def num(value):
 def own(path, user, group):
     """Hand a file back to the appliance account.
 
-    Two identities write the durable files: the units as STREAMER_USER, and a
+    Two identities write the durable files: the units as ATIBI_USER, and a
     command typed over SSH as root. Whoever made the file closes it to the other
     one, so an ownership accident cannot leave a record nobody can rewrite.
     """

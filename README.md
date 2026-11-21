@@ -1,6 +1,6 @@
-# rpi-streamer
+# rpi-atibi
 
-Purpose-built Raspberry Pi appliance image: a music streamer (cliamp on a Pi 4
+Purpose-built Raspberry Pi appliance image: a music atibi (cliamp on a Pi 4
 with an I2S DAC HAT) that comes back playing whatever was going when the power
 was pulled, and survives being unplugged without warning.
 
@@ -24,8 +24,8 @@ whatever was playing when the power was last pulled.
 
 ## Build
 
-    ./image/build.sh --audio jack --ssh-key ~/.ssh/streamer.pub \
-        --hostname streamer --tz Europe/Bratislava
+    ./image/build.sh --audio jack --ssh-key ~/.ssh/atibi.pub \
+        --hostname atibi --tz Europe/Bratislava
 
 `--audio dac` builds for the I2S HAT (an IQaudIO Pi-DAC+ or anything else that
 takes `dtoverlay=iqaudio-dacplus`) instead of the 3.5mm jack. If you give
@@ -53,7 +53,7 @@ sudo: start it from a terminal.
 
 Check the device name first; `dd` writes to whatever you give it.
 
-    sudo xz -dc output/streamer-jack-20261118.img.xz |
+    sudo xz -dc output/atibi-jack-20261118.img.xz |
         sudo dd of=/dev/sdX bs=8M status=progress conv=fsync
 
 Raspberry Pi Imager works too: choose the `.xz` as a custom image.
@@ -65,25 +65,25 @@ card you built.
 
 ## First boot
 
-    ssh -i <key> pi@streamer.local
+    ssh -i <key> pi@atibi.local
     cliamp --provider tidal   # first time only: visit the printed URL, enter the code
 
 Credentials land on `/data` and survive anything done to the read-only root.
 
 ## Using it
 
-    streamer stations           # what the built-in radio list offers
-    streamer station <url>      # play this one from now on, next boot too
-    streamer                    # status
+    atibi stations           # what the built-in radio list offers
+    atibi station <url>      # play this one from now on, next boot too
+    atibi                    # status
 
 Transport, level, playlists and what to play next boot, the jack/dac audio
 output switch, diagnostics and a factory reset all hang off this one command;
-`streamer help` is the reference.
+`atibi help` is the reference.
 
 The card also serves a control page to anything on the LAN: open
-`http://streamer.local:8077/` and the page asks for the token, made once at
-first boot and kept at `/data/streamer/http.token` (owner-readable only, and
-printed once to the journal, so `streamer log` shows the full signed-in URL for
+`http://atibi.local:8077/` and the page asks for the token, made once at
+first boot and kept at `/data/atibi/http.token` (owner-readable only, and
+printed once to the journal, so `atibi log` shows the full signed-in URL for
 the first phone that connects). From that page: transport, volume, shuffle and
 repeat, the queue, the radio list, and browsing, playlists and search on every
 provider the player has, Tidal included.
@@ -91,5 +91,5 @@ provider the player has, Tidal included.
 Whatever route a change takes — SSH or the web page — the volume floor, the
 boot ramp and the boot log always apply: boot intent goes through one command.
 
-`streamer reset --yes` wipes `/data` and puts back exactly the tree a fresh
+`atibi reset --yes` wipes `/data` and puts back exactly the tree a fresh
 card ships with.

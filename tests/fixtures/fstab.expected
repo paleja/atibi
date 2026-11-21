@@ -2,11 +2,11 @@ proc            /proc           proc    defaults          0       0
 PARTUUID=27b94958-01  /boot/firmware  vfat    defaults,ro          0       2
 PARTUUID=27b94958-02  /               ext4    defaults,noatime,ro  0       1
 
-# streamer data partition: cliamp state, playlists, downloads.
-# The filesystem is made at build time and streamer-firstboot grows it
+# atibi data partition: cliamp state, playlists, downloads.
+# The filesystem is made at build time and atibi-firstboot grows it
 # into the rest of the card, so it is mountable from the very first boot.
 # nofail is for the case where the partition entry itself is gone (a card
 # written from an older image): a missing /data must not stop the boot.
 # The last two fields are zero: the fsck pass is skipped at boot because
-# streamer-firstboot runs e2fsck itself, before it resizes anything.
+# atibi-firstboot runs e2fsck itself, before it resizes anything.
 PARTUUID=27b94958-03  /data  ext4  defaults,nofail,noatime  0  0

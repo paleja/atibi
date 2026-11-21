@@ -1,7 +1,7 @@
 [Unit]
-Description=streamer LAN control server (web page on the appliance's player)
+Description=atibi LAN control server (web page on the appliance's player)
 Documentation=file:/data/cliamp/cliamp.log
-After=streamer-cliamp.service
+After=atibi-cliamp.service
 RequiresMountsFor=/data
 
 [Service]
@@ -10,7 +10,7 @@ User=pi
 Group=pi
 Environment=HOME=/home/pi
 Environment=LANG=C.UTF-8
-ExecStart=/usr/local/bin/streamer-http
+ExecStart=/usr/local/bin/atibi-http
 Restart=always
 RestartSec=2
 PrivateTmp=yes
@@ -18,7 +18,7 @@ ProtectSystem=strict
 ReadWritePaths=/data
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=streamer-http
+SyslogIdentifier=atibi-http
 
 [Install]
-WantedBy=streamer.target
+WantedBy=atibi.target

@@ -8,16 +8,16 @@ survives a power cut and the file it describes does not.
 
 import os
 
-from streamer.conf import CONF_PATH, Config
-from streamer.ipc import Ipc
-from streamer.log import BootLog
-from streamer.player import Player
-from streamer.state import Record
+from atibi.conf import CONF_PATH, Config
+from atibi.ipc import Ipc
+from atibi.log import BootLog
+from atibi.player import Player
+from atibi.state import Record
 
 
 class Appliance:
     def __init__(self, conf_path=None):
-        self.conf = Config(conf_path or os.environ.get("STREAMER_CONF",
+        self.conf = Config(conf_path or os.environ.get("ATIBI_CONF",
                                                       CONF_PATH))
         self.record = Record(self.conf.state_path, self.conf.user, self.conf.group)
         self.bootlog = BootLog(self.conf.bootlog, self.conf.bootlog_keep,

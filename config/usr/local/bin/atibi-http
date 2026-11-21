@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""streamer-http - the appliance's LAN control server.
+"""atibi-http - the appliance's LAN control server.
 
 One small HTTP server on the card so a phone or any other computer can drive
 the player without SSH, without a client binary, and without Omarchy: it
@@ -27,16 +27,16 @@ Design rules this file keeps to, and why:
   and nothing here may assume a package install on a read-only root.
 
 Environment overrides (used by the test suite; systemd sets none):
-  STREAMER_CONF       where the knobs live   (default /etc/streamer.conf)
-  STREAMER_HTTP_PORT  TCP port               (default streamer.conf, then 8077)
-  STREAMER_HTTP_TOKEN token file path        (default streamer.conf, then <data>/streamer/http.token)
-  STREAMER_CLIAMP_SOCKET  the daemon socket  (default $HOME/.config/cliamp/cliamp.sock)
-  STREAMER_HTTP_PIDFILE   write our pid here (test harness only; setsid detaches)
-  STREAMER_HTTP_TEST_NO_LISTEN  print the config and exit 0 (packaging checks)
-  STREAMER_RADIO_SIZE     how many similar songs the radio offers (streamer.conf, then 50)
-  STREAMER_TIDAL_CRED     the Tidal login this server borrows (streamer.conf, then <data>/cliamp/tidal_credentials.json)
-  STREAMER_PROVIDERS      the prefixes a target may carry (streamer.conf, then tidal qobuz spotify)
-  STREAMER_RADIO_PROVIDERS  providers whose rows the radio can follow (streamer.conf, then tidal)
+  ATIBI_CONF       where the knobs live   (default /etc/atibi.conf)
+  ATIBI_HTTP_PORT  TCP port               (default atibi.conf, then 8077)
+  ATIBI_HTTP_TOKEN token file path        (default atibi.conf, then <data>/atibi/http.token)
+  ATIBI_CLIAMP_SOCKET  the daemon socket  (default $HOME/.config/cliamp/cliamp.sock)
+  ATIBI_HTTP_PIDFILE   write our pid here (test harness only; setsid detaches)
+  ATIBI_HTTP_TEST_NO_LISTEN  print the config and exit 0 (packaging checks)
+  ATIBI_RADIO_SIZE     how many similar songs the radio offers (atibi.conf, then 50)
+  ATIBI_TIDAL_CRED     the Tidal login this server borrows (atibi.conf, then <data>/cliamp/tidal_credentials.json)
+  ATIBI_PROVIDERS      the prefixes a target may carry (atibi.conf, then tidal qobuz spotify)
+  ATIBI_RADIO_PROVIDERS  providers whose rows the radio can follow (atibi.conf, then tidal)
 """
 
 import errno
@@ -55,11 +55,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from streamer.app import Appliance
-from streamer.intent import (NoTarget, parse_target, record_level, record_mode,
+from atibi.app import Appliance
+from atibi.intent import (NoTarget, parse_target, record_level, record_mode,
                              record_now, record_target)
 
-CONF_PATH_DEFAULT = "/etc/streamer.conf"
+CONF_PATH_DEFAULT = "/etc/atibi.conf"
 IPC_LOCK = threading.Lock()
 PROVIDERS_CACHE = {"at": 0.0, "data": []}
 # The appliance this server writes through: knobs, record, log and player from
@@ -70,10 +70,10 @@ APP = None
 
 
 def read_conf(path):
-    """The few key=value lines this server needs. Same file every streamer-*
+    """The few key=value lines this server needs. Same file every atibi-*
     script sources, so the knob set (port, token path) lives in one place. A
     double-quoted value may hold spaces, which is how the shell sources it too:
-    STREAMER_PROVIDERS is a list of names, and reading it unquoted would hand
+    ATIBI_PROVIDERS is a list of names, and reading it unquoted would hand
     this server a first word and a stray quote."""
     conf = {}
     try:
@@ -88,51 +88,51 @@ def read_conf(path):
 
 
 def expand(value, conf):
-    """streamer.conf uses $STREAMER_DATA inside later values; the shell would
+    """atibi.conf uses $ATIBI_DATA inside later values; the shell would
     expand that when sourcing, here we resolve just that one variable."""
-    return value.replace("$STREAMER_DATA", conf.get("STREAMER_DATA", "/data"))
+    return value.replace("$ATIBI_DATA", conf.get("ATIBI_DATA", "/data"))
 
 
 class Config:
     def __init__(self):
-        conf = read_conf(os.environ.get("STREAMER_CONF", CONF_PATH_DEFAULT))
+        conf = read_conf(os.environ.get("ATIBI_CONF", CONF_PATH_DEFAULT))
         self.port = int(os.environ.get(
-            "STREAMER_HTTP_PORT", conf.get("STREAMER_HTTP_PORT", "8077")))
-        token = os.environ.get("STREAMER_HTTP_TOKEN") or expand(
-            conf.get("STREAMER_HTTP_TOKEN",
-                     "$STREAMER_DATA/streamer/http.token"), conf)
+            "ATIBI_HTTP_PORT", conf.get("ATIBI_HTTP_PORT", "8077")))
+        token = os.environ.get("ATIBI_HTTP_TOKEN") or expand(
+            conf.get("ATIBI_HTTP_TOKEN",
+                     "$ATIBI_DATA/atibi/http.token"), conf)
         self.token_path = token
         home = os.environ.get("HOME", "")
         self.socket_path = os.environ.get(
-            "STREAMER_CLIAMP_SOCKET",
+            "ATIBI_CLIAMP_SOCKET",
             os.path.join(home, ".config", "cliamp", "cliamp.sock"))
         # The player's own command, for the one thing the IPC snapshot cannot answer
         # (see live_volume). Absolute rather than looked up: this server should not
         # find a different cliamp than the daemon it is controlling.
-        self.cliamp = os.environ.get("STREAMER_CLIAMP_EXECUTABLE",
+        self.cliamp = os.environ.get("ATIBI_CLIAMP_EXECUTABLE",
                                      "/usr/local/bin/cliamp")
         self.radio_size = int(os.environ.get(
-            "STREAMER_RADIO_SIZE", conf.get("STREAMER_RADIO_SIZE", "50")))
-        self.tidal_cred = os.environ.get("STREAMER_TIDAL_CRED") or expand(
-            conf.get("STREAMER_TIDAL_CRED",
-                     "$STREAMER_DATA/cliamp/tidal_credentials.json"), conf)
-        # The list the streamer command reads, read here as well so a target this
+            "ATIBI_RADIO_SIZE", conf.get("ATIBI_RADIO_SIZE", "50")))
+        self.tidal_cred = os.environ.get("ATIBI_TIDAL_CRED") or expand(
+            conf.get("ATIBI_TIDAL_CRED",
+                     "$ATIBI_DATA/cliamp/tidal_credentials.json"), conf)
+        # The list the atibi command reads, read here as well so a target this
         # server writes is one that command spells the same way: this is what tells
         # both where a provider name ends and a bare id begins.
-        self.providers = (os.environ.get("STREAMER_PROVIDERS")
-                          or conf.get("STREAMER_PROVIDERS",
+        self.providers = (os.environ.get("ATIBI_PROVIDERS")
+                          or conf.get("ATIBI_PROVIDERS",
                                       "tidal qobuz spotify")).split()
         # Which providers the radio can follow. Tidal is the only one whose API answers
         # a track radio at all (see the note in the Tidal section), so this is the one
         # honest place where that is written down; the page asks the card instead of
         # naming a provider itself.
-        self.radio_providers = (os.environ.get("STREAMER_RADIO_PROVIDERS")
-                                or conf.get("STREAMER_RADIO_PROVIDERS",
+        self.radio_providers = (os.environ.get("ATIBI_RADIO_PROVIDERS")
+                                or conf.get("ATIBI_RADIO_PROVIDERS",
                                             "tidal")).split()
 
     def token(self):
         """The LAN secret, made once and kept on /data. Printed to the journal
-        the time it is created so the owner can read it off `streamer log`
+        the time it is created so the owner can read it off `atibi log`
         without any client configured yet."""
         try:
             with open(self.token_path, encoding="utf-8") as f:
@@ -353,7 +353,7 @@ def tidal_seed():
 def radio_tracks(seed):
     """Tidal's similar songs for one track, in Tidal's own order: the seed
     itself dropped (the first row of the answer is usually it), unstreamable
-    rows dropped, cut at STREAMER_RADIO_SIZE. The rows carry everything the
+    rows dropped, cut at ATIBI_RADIO_SIZE. The rows carry everything the
     player needs to queue them without resolving them again - track.queue
     asked for a bare path leaves an unresolved stub row, verified on the card
     - and no year key at all rather than an empty one, which the player
@@ -394,7 +394,7 @@ ALBUM_ROW = re.compile(r"\A([a-z][a-z0-9-]*)://album/(\S+)\Z")
 
 # The matching shape for a single track row: the scheme names the provider and the tail
 # is the provider's own track id, which is exactly what the boot needs to rebuild the
-# row (see the album|track branch of streamer-play, and why the display strings are
+# row (see the album|track branch of atibi-play, and why the display strings are
 # saved with it). A row whose path is not this shape - a file on the card, say - plays
 # but is not remembered: the boot cannot reach anything by that id anyway.
 TRACK_ROW = re.compile(r"\A([a-z][a-z0-9-]*)://track/(\S+)\Z")
@@ -479,7 +479,7 @@ def radio_of(snap):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "streamer-http/1"
+    server_version = "atibi-http/1"
 
     def log_message(self, fmt, *args):
         print("%s %s" % (self.address_string(), fmt % args), flush=True)
@@ -682,7 +682,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             ipc_op("provider.load", {"provider": provider, "playlist": pid})
             # Nothing is remembered here. What plays next boot is set only by the
-            # `streamer` command and the page's "use the now playing" button; a tap
+            # `atibi` command and the page's "use the now playing" button; a tap
             # in the browse tab plays, and that is all it claims to do - the boot target
             # is a separate decision, taken in the boot tab.
             self._json_out({"ok": True})
@@ -778,7 +778,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # here rather than taken from the page's preview: the preview is a look,
             # the action is whatever Tidal calls similar now, and a body of hand-written
             # ids would let a page push arbitrary rows into the player - the same reason
-            # the boot intent is only ever written by the streamer command.
+            # the boot intent is only ever written by the atibi command.
             seed, _playing = tidal_seed()
             if not seed:
                 self._json_out({"ok": False,
@@ -827,7 +827,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "PUT",
                     "/v2/my-collection/playlists/folders/create-playlist",
                     {"name": title,
-                     "description": ("streamer radio, from " + from_line)
+                     "description": ("atibi radio, from " + from_line)
                                      if from_line else "",
                      "folderId": "root"})
                 uuid = ""
@@ -884,7 +884,7 @@ PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>streamer</title>
+<title>atibi</title>
 <style>
 :root{color-scheme:dark;--bg:#101418;--card:#1a2028;--fg:#dde3ea;--dim:#7f8b99;
 --acc:#4ec9a0;--bad:#e2655f}
@@ -1007,8 +1007,8 @@ function setToken(t){
   // there cannot fail every later load. Empty deletes the stored one: a card re-flashed
   // with a new token must not leave the page locked out by its own memory of the old one.
   TOKEN=t||'';
-  if(TOKEN)localStorage.setItem('streamer-token',TOKEN);
-  else localStorage.removeItem('streamer-token');
+  if(TOKEN)localStorage.setItem('atibi-token',TOKEN);
+  else localStorage.removeItem('atibi-token');
 }
 async function tokenOk(t){
   // The cheapest question the card answers with the token: its own status.
@@ -1036,11 +1036,11 @@ async function unlock(){
   // or the redirect from /?token=...), one the browser remembers, then a typed one.
   // Whichever the card accepts is the one kept, so the secret is fetched over SSH once,
   // not at every desk.
-  for(const cand of[FROM_URL,localStorage.getItem('streamer-token')])
+  for(const cand of[FROM_URL,localStorage.getItem('atibi-token')])
     if(cand&&await tokenOk(cand)){setToken(cand);return true;}
   setToken('');
   for(let i=0;i<3;i++){
-    const t=prompt('card token (from: sudo cat /data/streamer/http.token)');
+    const t=prompt('card token (from: sudo cat /data/atibi/http.token)');
     if(!t)return false;                      // cancelled, or typed nothing
     if(await tokenOk(t)){setToken(t);return true;}
   }
@@ -1231,7 +1231,7 @@ function mark(){
 function useAtBoot(){
   // One question, the card answers it: what should the next boot load? Only the
   // player knows whether it sits on a playlist, an album, one track or a stream,
-  // and the answer goes to `streamer remember` - the verb that writes the boot intent
+  // and the answer goes to `atibi remember` - the verb that writes the boot intent
   // without restarting what is already playing (see /api/boot/now).
   api('/api/boot/now',{}).then(d=>{if(!d.ok){fail(d.error);return;}poll();});
 }
@@ -1254,19 +1254,19 @@ start();
 
 def main():
     global APP
-    if pidfile := os.environ.get("STREAMER_HTTP_PIDFILE"):
+    if pidfile := os.environ.get("ATIBI_HTTP_PIDFILE"):
         # setsid detaches this process, and only its pid can kill it then. The
         # test harness asks for one; systemd never sets this knob.
         with open(pidfile, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()) + "\n")
-    if os.environ.get("STREAMER_HTTP_TEST_NO_LISTEN"):
+    if os.environ.get("ATIBI_HTTP_TEST_NO_LISTEN"):
         print("port=%d token=%s socket=%s" %
               (CFG.port, CFG.token_path, CFG.socket_path))
         return 0
     APP = Appliance()
     CFG.token()   # makes the token on the first run, and says so in the journal
     server = http.server.ThreadingHTTPServer(("0.0.0.0", CFG.port), Handler)
-    print("streamer-http: token-guarded, on :%d, player socket %s" %
+    print("atibi-http: token-guarded, on :%d, player socket %s" %
           (CFG.port, CFG.socket_path), flush=True)
     try:
         server.serve_forever()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""streamer-capture - hear the level a person sets outside the appliance.
+"""atibi-capture - hear the level a person sets outside the appliance.
 
 The Omarchy panel's volume slider sends the `volume` operation straight to the
 player's socket: no CLI verb runs on the card, and cliamp does not persist its
@@ -14,9 +14,9 @@ away is transient, and the unit's Restart=always reconnects.
 
 import sys
 
-from streamer.app import Appliance
-from streamer.capture import follow, level_events
-from streamer.conf import KnobError
+from atibi.app import Appliance
+from atibi.capture import follow, level_events
+from atibi.conf import KnobError
 
 
 def main():

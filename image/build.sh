@@ -2,7 +2,7 @@
 # build.sh - make the card image this appliance boots from.
 
 #   ./image/build.sh [--audio jack|dac] [--ssh-key PATH | --new-key]
-#                    [--hostname streamer] [--tz Europe/Bratislava]
+#                    [--hostname atibi] [--tz Europe/Bratislava]
 #                    [--data-size 1024] [--output DIR] [--keep-raw] [--no-compress]
 
 # Needs root - it mounts filesystems - so it re-runs itself under sudo.
@@ -56,15 +56,15 @@ STAGE=$CACHE/stage
 # mounted; see the identity step and the output step.
 hostkey=$STAGE/ssh_host_ed25519_key.pub
 
-# The starting tree of the writable partition, and the template `streamer reset`
+# The starting tree of the writable partition, and the template `atibi reset`
 # restores it from: both belong to the appliance user, everything at the top of
 # /data, so one `rm -rf /data/*` is a clean slate.
 #   cliamp   its configuration, Tidal credentials, socket, log
 #   bin      your own scripts, on PATH ahead of /usr/local/bin
 #   music    local files, if you put any there
-#   streamer state - what plays next boot - plus boot.log, the one record of a
+#   atibi state - what plays next boot - plus boot.log, the one record of a
 #            boot that outlives a power cut
-DATA_DIRS="cliamp bin music streamer"
+DATA_DIRS="cliamp bin music atibi"
 
 # /data in MiB, fixed at build time: room for playlists and a small library, not
 # a music collection. 1024 leaves room on any card you can buy (an 8 GB card holds
@@ -75,7 +75,7 @@ DATA_SIZE_MIB=1024
 AUDIO=jack
 SSH_KEY=""
 NEW_KEY=0
-NEW_HOSTNAME=streamer
+NEW_HOSTNAME=atibi
 TZONE=""
 KEEP_RAW=0
 COMPRESS=1
@@ -91,7 +91,7 @@ usage: ./image/build.sh [options]
   --audio jack|dac     which output is live on the first boot (default jack)
   --ssh-key PATH       public key to authorise for the appliance user
   --new-key            generate a keypair instead, under <output>/keys/
-  --hostname NAME      appliance hostname, for ssh <name>.local (default streamer)
+  --hostname NAME      appliance hostname, for ssh <name>.local (default atibi)
   --tz ZONE            timezone, for example Europe/Bratislava
   --data-size MIB      size of the /data partition in MiB (default 1024)
   --output DIR         where the finished image goes (default output/)
@@ -132,7 +132,7 @@ case $AUDIO in
     jack|dac) ;;
     *) die "--audio is jack or dac" ;;
 esac
-[ -f "$CONFIG/etc/streamer/audio-$AUDIO.txt" ] || die "no audio fragment for $AUDIO"
+[ -f "$CONFIG/etc/atibi/audio-$AUDIO.txt" ] || die "no audio fragment for $AUDIO"
 case $NEW_HOSTNAME in
     *[!a-z0-9-]*|'') die "hostname has to be lower case letters, digits and dashes: $NEW_HOSTNAME" ;;
 esac
@@ -171,10 +171,10 @@ done
 if [ "$(id -u)" -ne 0 ]; then
     # One re-exec only: if the re-run is still not root, say so rather than asking
     # for the password forever.
-    [ -z "${STREAMER_BECAME_ROOT:-}" ] || die "sudo ran the build again, still without root privileges"
+    [ -z "${ATIBI_BECAME_ROOT:-}" ] || die "sudo ran the build again, still without root privileges"
     log ""
     log "the build writes a partition table and mounts filesystems: asking for sudo now"
-    STREAMER_BECAME_ROOT=1 exec sudo -E "$SELF" ${RAW_ARGS[@]+"${RAW_ARGS[@]}"}
+    ATIBI_BECAME_ROOT=1 exec sudo -E "$SELF" ${RAW_ARGS[@]+"${RAW_ARGS[@]}"}
 fi
 
 # --- ssh access -------------------------------------------------------------------------------
@@ -337,10 +337,10 @@ cat >"$SEED/README" <<EOF
 This is what the data partition held when the card was built, and the template a
 factory reset copies back over an emptied data partition:
 
-    streamer reset --yes
+    atibi reset --yes
 
 Everything in it is lost by that command, including the Tidal sign-in. The
-template lives in the read-only part of the image, at /usr/share/streamer/seed.
+template lives in the read-only part of the image, at /usr/share/atibi/seed.
 
 The directories at the top of the data partition:
 
@@ -348,10 +348,10 @@ The directories at the top of the data partition:
              its log, and where it had got to in a local playlist
     bin      your own scripts, on PATH ahead of /usr/local/bin
     music    local files, if you put any there
-    streamer state, the file that says what to play next boot, plus boot.log,
+    atibi state, the file that says what to play next boot, plus boot.log,
              the one record of a boot that outlives a power cut
 
-A card that has never been set up plays the station named in /etc/streamer.conf.
+A card that has never been set up plays the station named in /etc/atibi.conf.
 EOF
 log "  $(find "$SEED" -mindepth 1 -maxdepth 1 -type d | wc -l) directories, owned by 1000:1000"
 
@@ -470,7 +470,7 @@ truncate -s $((DATA_SECTORS * 512)) "$fsimg"
 # -b 4096 is not decoration: mkfs.ext4 sizes its block size from what it is handed
 # and picked 1 KiB blocks for a small filesystem. -d seeds the tree with no mount,
 # -m 0 skips the 5% root reserve, which here is space the player is not allowed to use.
-mkfs.ext4 -q -F -b 4096 -L streamer-data -m 0 -d "$SEED" "$fsimg" >"$STAGE/data-mkfs.log" 2>&1 ||
+mkfs.ext4 -q -F -b 4096 -L atibi-data -m 0 -d "$SEED" "$fsimg" >"$STAGE/data-mkfs.log" 2>&1 ||
     die "making the ${DATA_SIZE_MIB} MiB /data filesystem failed:
 $(cat "$STAGE/data-mkfs.log")"
 # e2fsck exits 0 for clean and 1 for "errors corrected"; 1 is a pass here, and
@@ -516,10 +516,10 @@ log "$LOOP: p2 -> $R, p1 -> $FW"
 # --- the appliance ----------------------------------------------------------------------------
 
 step "files"
-install -d "$R/etc/streamer" "$R/usr/local/bin" "$R/data"
+install -d "$R/etc/atibi" "$R/usr/local/bin" "$R/data"
 cp -a "$CONFIG/etc/systemd/system/." "$R/etc/systemd/system/"
-cp -a "$CONFIG/etc/streamer/." "$R/etc/streamer/"
-install -m 644 "$CONFIG/etc/streamer.conf" "$R/etc/streamer.conf"
+cp -a "$CONFIG/etc/atibi/." "$R/etc/atibi/"
+install -m 644 "$CONFIG/etc/atibi.conf" "$R/etc/atibi.conf"
 for script in "$CONFIG"/usr/local/bin/*; do
     [ -f "$script" ] || continue
     install -m 755 "$script" "$R/usr/local/bin/$(basename "$script")"
@@ -530,7 +530,7 @@ done
 # it is checked: an image shipping another minor version would put the package
 # where its python never looks, and every unit would come up ModuleNotFound.
 install -d -m 755 "$R/usr/local/lib/python3.13/dist-packages"
-cp -a "$CONFIG/usr/local/lib/python3.13/dist-packages/streamer" \
+cp -a "$CONFIG/usr/local/lib/python3.13/dist-packages/atibi" \
        "$R/usr/local/lib/python3.13/dist-packages/"
 # Host byte-code does not belong on a card: a .pyc written by another minor
 # version is ignored by the card's python, and a read-only root means the card
@@ -544,7 +544,7 @@ find "$R/usr/local/lib/python3.13/dist-packages" -name __pycache__ -type d \
 install -m 755 "$CLIAMP" "$R/usr/local/bin/cliamp"
 install -m 755 "$FFMPEG" "$R/usr/local/bin/ffmpeg"
 # A unit naming an interpreter the image lacks comes up 203/EXEC: a silent speaker
-# here. The payload is python3 except streamer-daemon, which is /bin/sh. cliamp
+# here. The payload is python3 except atibi-daemon, which is /bin/sh. cliamp
 # and ffmpeg are compiled and carry no interpreter, so only the two-byte marker
 # decides whether a file here has a claim to check.
 for script in "$R"/usr/local/bin/*; do
@@ -586,25 +586,25 @@ fi
 # 10 s budget absorbs with room.
 if [ -x /usr/bin/python3.13 ]; then
     /usr/bin/python3.13 -m compileall -q \
-        "$R/usr/local/lib/python3.13/dist-packages/streamer" >/dev/null ||
+        "$R/usr/local/lib/python3.13/dist-packages/atibi" >/dev/null ||
         die "the payload does not compile with python3.13"
     log "  byte-code baked for python3.13"
 else
     log "  no python3.13 on the build host: the tree ships unbaked"
 fi
-# The same check for the base-image tool the payload calls: streamer-daemon trims the
+# The same check for the base-image tool the payload calls: atibi-daemon trims the
 # DAC's codec volume with amixer. Without it the trim fails silently every boot and
 # the board plays at 0 dB while every knob says otherwise.
 [ -x "$R/usr/bin/amixer" ] ||
-    die "streamer-daemon trims the codec with amixer, which this base image does not ship"
+    die "atibi-daemon trims the codec with amixer, which this base image does not ship"
 # The factory-reset template, the same tree the filesystem above was made from, on
 # the read-only root owned by the appliance user so `cp -a` onto /data lands with the
-# ownership the player needs. The path is the one `streamer reset` names.
-rm -rf "$R/usr/share/streamer"
-install -d -m 755 "$R/usr/share/streamer/seed"
-cp -a "$SEED/." "$R/usr/share/streamer/seed/"
+# ownership the player needs. The path is the one `atibi reset` names.
+rm -rf "$R/usr/share/atibi"
+install -d -m 755 "$R/usr/share/atibi/seed"
+cp -a "$SEED/." "$R/usr/share/atibi/seed/"
 log "  $(find "$CONFIG"/usr/local/bin -maxdepth 1 -type f | wc -l) scripts, cliamp and ffmpeg in /usr/local/bin"
-log "  reset template in /usr/share/streamer"
+log "  reset template in /usr/share/atibi"
 
 step "units"
 # The symlinks `systemctl enable` would create, made here so the build does not depend
@@ -614,11 +614,11 @@ enable() { # enable <unit> <target>
     ln -sfn "/etc/systemd/system/$1" "$R/etc/systemd/system/$2.wants/$1"
     log "  $1 -> $2"
 }
-enable streamer.target         multi-user.target
-enable streamer-cliamp.service streamer.target
-enable streamer-play.service   streamer.target
-enable streamer-http.service   streamer.target
-enable streamer-capture.service streamer.target
+enable atibi.target         multi-user.target
+enable atibi-cliamp.service atibi.target
+enable atibi-play.service   atibi.target
+enable atibi-http.service   atibi.target
+enable atibi-capture.service atibi.target
 
 # Stock Raspberry Pi OS leaves ssh off unless a /boot/firmware/ssh marker exists at
 # boot: no screen or keyboard here, so ssh comes up from the first boot on its own.
@@ -632,7 +632,7 @@ log "  ssh.service -> multi-user.target"
 #     a user name: it can only stall with no screen, and it is free to rename the uid
 #     1000 account the units assume. Access here is the SSH key installed below.
 #   apt-daily timers     a background writer that can turn a read-only root into a
-#     half-written one at a moment nobody chose; updating this box is `streamer rw`
+#     half-written one at a moment nobody chose; updating this box is `atibi rw`
 #     and apt, by hand.
 #   e2scrub_all.timer    checks LVM thin volumes; this box has no LVM.
 #   console-setup        a console font and keymap for a box with no console, failed
@@ -641,7 +641,7 @@ log "  ssh.service -> multi-user.target"
 #     it failed on the day it fired.
 #   logrotate.timer      cannot create its stub state file under /var, so it exits 3;
 #     there are no rotating logs here - journald is volatile and boot.log is trimmed
-#     by the appliance's log writer, streamer.log.
+#     by the appliance's log writer, atibi.log.
 #   rpi-resize.service  grows the last partition when the kernel command line says
 #     `resize`; that token is stripped below, but the unit still pulls
 #     systemd-growfs-root.service into every boot, which fails against a read-only root.
@@ -683,7 +683,7 @@ user_home=$(awk -F: '$3 == 1000 {print $6; exit}' "$R/etc/passwd")
 # at boot with no obvious reason.
 [ "$user_name" = pi ] || die "the uid 1000 account is called $user_name, but the
    player units assume pi: update User=/Group=/HOME= in
-   $CONFIG/etc/systemd/system/streamer-*.service"
+   $CONFIG/etc/systemd/system/atibi-*.service"
 awk -F: -v OFS=: '$3 == 1000 { $7 = "/bin/bash" } 1' "$R/etc/passwd" >"$R/etc/passwd.new"
 install -m 644 "$R/etc/passwd.new" "$R/etc/passwd"
 rm -f "$R/etc/passwd.new"
@@ -701,7 +701,7 @@ chown -h 1000:1000 "$R$user_home/.config/cliamp"
 
 # Password-free sudo for the appliance user: the account has no password and the only
 # way in is an SSH key, so a password prompt is an obstacle and not a boundary -
-# `streamer audio dac` and `streamer rw` re-run themselves through sudo with no screen
+# `atibi audio dac` and `atibi rw` re-run themselves through sudo with no screen
 # to type into. NOPASSWD alone is enough: requiretty is off in the sudo this image ships.
 # visudo when available, because a sudoers syntax error locks everybody out of a box
 # that has no password.
@@ -714,11 +714,11 @@ else
     log "  no visudo on this machine, so the fragment goes in unchecked"
 fi
 install -d "$R/etc/sudoers.d"
-install -m 0440 "$tmp" "$R/etc/sudoers.d/streamer"
+install -m 0440 "$tmp" "$R/etc/sudoers.d/atibi"
 rm -f "$tmp"
 log "  $user_name ALL=(ALL) NOPASSWD:ALL"
 rm -f "$tmp"
-log "  streamer commands need no password"
+log "  atibi commands need no password"
 
 step "fstab"
 # Two changes to the fstab the vendor shipped, and no new syntax.
@@ -747,18 +747,18 @@ rm -f "$R/etc/fstab.new"
 
 if ! grep -qsE '^[^#][^[:space:]]+[[:space:]]+/data[[:space:]]' "$R/etc/fstab"; then
     {
-        printf '\n# streamer data partition: the player state, and nothing else.\n'
-        printf '# Made at build time, %s MiB, labelled streamer-data: the label lives\n' "$DATA_SIZE_MIB"
+        printf '\n# atibi data partition: the player state, and nothing else.\n'
+        printf '# Made at build time, %s MiB, labelled atibi-data: the label lives\n' "$DATA_SIZE_MIB"
         printf '# inside the filesystem, so this line is true whatever the card is.\n'
         printf '# nofail: a /data that cannot be mounted must not stop the boot.\n'
         printf '# fsck runs here only when the volume was left dirty by a power cut.\n'
-        printf 'LABEL=streamer-data  /data  ext4  defaults,nofail,noatime  0  2\n'
+        printf 'LABEL=atibi-data  /data  ext4  defaults,nofail,noatime  0  2\n'
     } >>"$R/etc/fstab"
 fi
 grep -qsE '^[^#][^[:space:]]+[[:space:]]+/data[[:space:]]' "$R/etc/fstab" ||
     die "the /data line did not land in $R/etc/fstab"
 install -d -m 755 "$R/data"
-sed -n '/streamer data partition/,$p' "$R/etc/fstab" | sed 's/^/  /' >&2
+sed -n '/atibi data partition/,$p' "$R/etc/fstab" | sed 's/^/  /' >&2
 
 step "identity"
 if [ -n "$NEW_HOSTNAME" ]; then
@@ -783,7 +783,7 @@ fi
 #   machine-id     the base image ships one, so every stock card on earth starts with
 #     the same, and it leaks into DHCP requests and mDNS names.
 #   ssh host keys  shipped in the clear for anyone who downloads the image; if every
-#     streamer on a network answered with the same private host key, the first ssh session
+#     atibi on a network answered with the same private host key, the first ssh session
 #     to any of them is one somebody else could have set up. The fingerprint printed at
 #     the end is how you check the new ones landed.
 #   login banner   the stock rename_user.conf prints "SSH may not work until a valid
@@ -806,7 +806,7 @@ install -m 644 "$R/etc/ssh/ssh_host_ed25519_key.pub" "$hostkey"
 log "  ssh host keys generated for this build"
 if [ -f "$R/etc/ssh/sshd_config.d/rename_user.conf" ]; then
     printf '%s\n' \
-        '# streamer: the stock banner talks about setting up a user. This box has' \
+        '# atibi: the stock banner talks about setting up a user. This box has' \
         '# one, and it is reached with an SSH key. See image/build.sh.' >"$R/etc/ssh/sshd_config.d/rename_user.conf"
     log "  stock ssh login banner replaced"
 fi
@@ -849,7 +849,7 @@ install -d -m 755 "$R/var/lib/NetworkManager"
 install -d -m 755 "$R/etc/NetworkManager/conf.d"
 cat >"$R/etc/NetworkManager/conf.d/10-ro-root.conf" <<'EOF'
 [main]
-# streamer: / is read-only, so NM must not write /etc/resolv.conf directly; rc-manager
+# atibi: / is read-only, so NM must not write /etc/resolv.conf directly; rc-manager
 # =symlink has it write /run/NetworkManager/resolv.conf, which the image bakes /etc/resolv
 # .conf as a symlink to. Both keys live in [main]: under [global] they only earn an
 # "unknown key" warn.
@@ -875,7 +875,7 @@ sed -i '/^h \/var\/log\/journal/d' "$R/usr/lib/tmpfiles.d/journal-nocow.conf"
 #     failed restore, plus two level-err lines for a GOTO label missing from the vendor
 #     file itself. udev reads only the highest-priority file of a basename, so an empty
 #     file in /etc turns the whole rule off. Nothing here saves or restores a card state:
-#     cliamp owns the playing volume, and streamer-daemon pins the DAC's codec trim with
+#     cliamp owns the playing volume, and atibi-daemon pins the DAC's codec trim with
 #     amixer directly at every start.
 install -d "$R/etc/udev/rules.d"
 : >"$R/etc/udev/rules.d/90-alsa-restore.rules"
@@ -898,14 +898,14 @@ log "  mtab, journal-ACL and journal-attr tmpfiles lines, and the alsa restore r
 # partition, and a hard power cut is exactly the moment that journal gets left dirty, on
 # a card the player is writing to at the same time.
 # What survives a power cut is instead the one-line-per-boot record in
-# /data/streamer/boot.log: small, append-only, written by the scripts at both ends of
+# /data/atibi/boot.log: small, append-only, written by the scripts at both ends of
 # the boot.
 step "journal"
 install -d -m 755 "$R/etc/journald.conf.d"
-cat >"$R/etc/journald.conf.d/streamer.conf" <<'EOF'
+cat >"$R/etc/journald.conf.d/atibi.conf" <<'EOF'
 [Journal]
 # Read-only root: /var/log/journal cannot be written to. The appliance keeps its own
-# durable record on /data; see /etc/streamer.conf.
+# durable record on /data; see /etc/atibi.conf.
 Storage=volatile
 
 # /run is tmpfs: about half of RAM by default on a 1 GB Pi, and the player
@@ -913,7 +913,7 @@ Storage=volatile
 RuntimeMaxUse=32M
 EOF
 log "  journald: volatile, 32M in /run"
-log "  durable per-boot line: /data/streamer/boot.log"
+log "  durable per-boot line: /data/atibi/boot.log"
 
 # --- firmware partition -----------------------------------------------------------------------
 
@@ -925,7 +925,7 @@ CMDLINE=$FW/cmdline.txt
 # reads as what the vendor shipped, with the appliance saying what it replaced.
 awk '
     $0 == "dtparam=audio=on" {
-        print "# streamer: the audio setup lives in the appliance block at the end"
+        print "# atibi: the audio setup lives in the appliance block at the end"
         print "# of this file, so the stock line below is switched off."
         print "#dtparam=audio=on"
         next
@@ -938,19 +938,19 @@ rm -f "$CFG.new"
 
 # config.txt is read top to bottom and a later section overrides an earlier one,
 # so the appliance block goes at the end, under its own [all] header. The audio
-# text from etc/streamer/audio-<output>.txt is spliced into it between the two
-# markers, which is the block `streamer audio jack|dac` rewrites later on.
+# text from etc/atibi/audio-<output>.txt is spliced into it between the two
+# markers, which is the block `atibi audio jack|dac` rewrites later on.
 tail_new=$(mktemp)
 {
-    sed -e '/^# --- streamer audio begin ---$/,/^# --- streamer audio end ---$/d' \
+    sed -e '/^# --- atibi audio begin ---$/,/^# --- atibi audio end ---$/d' \
         "$CONFIG/boot/appliance-config.txt"
-    printf '# --- streamer audio begin ---\n'
-    cat "$CONFIG/etc/streamer/audio-$AUDIO.txt"
-    printf '# --- streamer audio end ---\n'
+    printf '# --- atibi audio begin ---\n'
+    cat "$CONFIG/etc/atibi/audio-$AUDIO.txt"
+    printf '# --- atibi audio end ---\n'
 } >"$tail_new"
 # Anything of ours from an earlier run goes first, from our own header to the
 # end of the file, so a config.txt never ends up with two appliance blocks.
-awk '/^# --- streamer appliance ---$/ { exit } { print }' "$CFG" >"$CFG.new"
+awk '/^# --- atibi appliance ---$/ { exit } { print }' "$CFG" >"$CFG.new"
 cat "$tail_new" >>"$CFG.new"
 install -m 644 "$CFG.new" "$CFG"
 rm -f "$CFG.new" "$tail_new"
@@ -1080,13 +1080,13 @@ log "  vendor tmpfiles edits, logrotate off, NM hand-off: read back from the ima
 # loop partition a desktop may have mounted.
 data_type=$(blkid -o value -s TYPE "${LOOP}p3")
 data_label=$(blkid -o value -s LABEL "${LOOP}p3")
-[ "$data_type" = ext4 ] && [ "$data_label" = streamer-data ] ||
-    die "the data partition is $data_type/$data_label, expected ext4/streamer-data"
+[ "$data_type" = ext4 ] && [ "$data_label" = atibi-data ] ||
+    die "the data partition is $data_type/$data_label, expected ext4/atibi-data"
 # Read-only debugfs: the one place the build looks *inside* the spliced filesystem without
 # mounting it, to prove the seeded tree really is in there. Nothing is ever written through
 # debugfs: writes that matter go through a real mount, by tools that check afterwards.
 seeded=$(debugfs -R 'ls -l /' "${LOOP}p3" 2>/dev/null | awk '{ print $NF }' |
-    grep -cxE 'cliamp|bin|music|streamer' || true)
+    grep -cxE 'cliamp|bin|music|atibi' || true)
 [ "${seeded:-0}" -eq 4 ] ||
     die "the /data filesystem does not hold the seeded tree (found $seeded of 4 directories):
 the filesystem did not land at sector $p3_start"
@@ -1100,7 +1100,7 @@ log "data partition reads back as $data_label ($data_type), $data_blocks blocks,
 # firmware will read, not what this script thinks it wrote.
 mount -o ro "${LOOP}p1" "$FW"
 log "config.txt, the block the Pi will apply:"
-sed -n '/^# --- streamer appliance ---$/,/^# --- streamer audio end ---$/p' "$FW/config.txt" |
+sed -n '/^# --- atibi appliance ---$/,/^# --- atibi audio end ---$/p' "$FW/config.txt" |
     grep -vE '^[[:space:]]*(#|$)' | sed 's/^/  /' >&2
 log "cmdline.txt: $(cat "$FW/cmdline.txt")"
 umount "$FW"
@@ -1155,8 +1155,8 @@ log "it plays the first time it is powered on, with no setup step in between."
 log "then, over ssh:"
 log "  ssh -i <key> pi@$NEW_HOSTNAME.local"
 log "  cliamp            # sign in to Tidal: https://link.tidal.com/<code>"
-log "  streamer stations # pick a radio station"
-log "  streamer station <url>"
+log "  atibi stations # pick a radio station"
+log "  atibi station <url>"
 if [ -n "$KEY_PRIVATE" ]; then
     log ""
     log "the private key is $KEY_PRIVATE, and is nowhere in the image."

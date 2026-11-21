@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""streamer - the appliance's control surface, typed over SSH or driven by the
+"""atibi - the appliance's control surface, typed over SSH or driven by the
 LAN page. One verb per thing, and the verbs that decide do not overlap:
 
   play     what sounds now. Writes nothing to the card.
@@ -7,33 +7,33 @@ LAN page. One verb per thing, and the verbs that decide do not overlap:
   level    one number, the player's own dB, remembered as the player settled at
            it, never as the number that was asked for.
 
-  streamer                      what plays now, and what plays next boot
-  streamer now                  the row, the list it came from, the level
-  streamer boots                the durable log, the one that survives a cut
-  streamer log                  this boot's journal
-  streamer stations             the built-in endpoints, as the service lists them
-  streamer boot                 show the record
-  streamer boot now             next boot = what is playing now
-  streamer boot station <url>   ditto for a target typed out
-  streamer boot playlist <name | provider:id>
-  streamer boot album|track <provider>:<id> [title] [artist] [album]
-  streamer boot on|off          resume on boot, or stay quiet after it
-  streamer play                 play the source the record holds, now
-  streamer play station <url>   play this stream now
-  streamer play playlist <name | provider:id>
-  streamer play album|track <provider>:<id> [title] [artist] [album]
-  streamer resume|pause|toggle|next|prev|stop
-  streamer level <dB> | now | up <N> | down <N>
-  streamer restart              the saved target again, from the floor, with the ramp
-  streamer reload               the daemon and playback
-  streamer audio [jack|dac]     show or switch the output, then reboot
-  streamer rw | ro              make / writable, then read-only again
-  streamer reset --yes          /data back to what the card was built with
+  atibi                      what plays now, and what plays next boot
+  atibi now                  the row, the list it came from, the level
+  atibi boots                the durable log, the one that survives a cut
+  atibi log                  this boot's journal
+  atibi stations             the built-in endpoints, as the service lists them
+  atibi boot                 show the record
+  atibi boot now             next boot = what is playing now
+  atibi boot station <url>   ditto for a target typed out
+  atibi boot playlist <name | provider:id>
+  atibi boot album|track <provider>:<id> [title] [artist] [album]
+  atibi boot on|off          resume on boot, or stay quiet after it
+  atibi play                 play the source the record holds, now
+  atibi play station <url>   play this stream now
+  atibi play playlist <name | provider:id>
+  atibi play album|track <provider>:<id> [title] [artist] [album]
+  atibi resume|pause|toggle|next|prev|stop
+  atibi level <dB> | now | up <N> | down <N>
+  atibi restart              the saved target again, from the floor, with the ramp
+  atibi reload               the daemon and playback
+  atibi audio [jack|dac]     show or switch the output, then reboot
+  atibi rw | ro              make / writable, then read-only again
+  atibi reset --yes          /data back to what the card was built with
 
 `stop` stops: staying quiet after the next boot is a separate decision, said
 with `boot off`. Root comes back on its own for the verbs that need it - the
-image ships a passwordless sudoers drop-in, and STREAMER_SUDO marks the second
-pass - and STREAMER_CONF is the knob file the harness points elsewhere.
+image ships a passwordless sudoers drop-in, and ATIBI_SUDO marks the second
+pass - and ATIBI_CONF is the knob file the harness points elsewhere.
 """
 
 import argparse
@@ -43,18 +43,18 @@ import subprocess
 import sys
 import urllib.request
 
-from streamer import num, own
-from streamer.app import Appliance
-from streamer.conf import KnobError
-from streamer.ipc import IpcError
-from streamer.intent import (NoTarget, parse_target, record_level, record_mode,
+from atibi import num, own
+from atibi.app import Appliance
+from atibi.conf import KnobError
+from atibi.ipc import IpcError
+from atibi.intent import (NoTarget, parse_target, record_level, record_mode,
                              record_now, record_target)
-from streamer.player import PlayerError
+from atibi.player import PlayerError
 
-CONF_PATH = "/etc/streamer.conf"
-AUDIO_BEGIN = "# --- streamer audio begin ---"
-AUDIO_END = "# --- streamer audio end ---"
-BOOT_UNITS = ("streamer-cliamp.service", "streamer-play.service")
+CONF_PATH = "/etc/atibi.conf"
+AUDIO_BEGIN = "# --- atibi audio begin ---"
+AUDIO_END = "# --- atibi audio end ---"
+BOOT_UNITS = ("atibi-cliamp.service", "atibi-play.service")
 
 # The transport verbs, spelled as the operations they send. `stop` stops and
 # says nothing about the next boot: staying quiet after a reboot is `boot off`.
@@ -150,13 +150,13 @@ class Show:
             return
         for name, stream in rows:
             self.out.write("%s\t%s\n" % (name, stream))
-        self.out.write("then: streamer play station <url>"
-                       " | streamer boot station <url>\n")
+        self.out.write("then: atibi play station <url>"
+                       " | atibi boot station <url>\n")
 
 
 class Play:
     """What sounds now. Writes nothing to the card: the next boot is a separate
-    decision, taken in the boot tab or by `streamer boot`.
+    decision, taken in the boot tab or by `atibi boot`.
 
     Four shapes of target, and one path to the daemon each: the words a person
     types are turned into the record's field names by `parse_target`, and the
@@ -193,7 +193,7 @@ class Play:
         if fields["mode"] != "last":
             self.out.write("boot mode is stop: %s %s is kept but not played\n"
                            % (fields["kind"], fields["target"]))
-            self.out.write("say so first: streamer boot on\n")
+            self.out.write("say so first: atibi boot on\n")
             return 1
         self.start({"kind": fields["kind"], "target": fields["target"],
                     "provider": fields.get("provider", "")},
@@ -205,7 +205,7 @@ class Play:
         """pause, resume, toggle, next, prev, stop: the transport, nothing else.
 
         `stop` stops and says nothing about the next boot; staying quiet after
-        a reboot is `streamer boot off`, said out loud.
+        a reboot is `atibi boot off`, said out loud.
         """
         self.app.player.transport(operation)
         return 0
@@ -236,7 +236,7 @@ class Level:
         current = app.player.level()
         if value in ("up", "down"):
             if amount is None:
-                raise ValueError("usage: streamer level up|down <dB>")
+                raise ValueError("usage: atibi level up|down <dB>")
             step = float(amount) * (1 if value == "up" else -1)
             if current is None:
                 raise ValueError("the level is unreadable, so it cannot be stepped")
@@ -329,7 +329,7 @@ class Box:
     def restart(self):
         """The saved target again, from the floor and with the ramp: that is the
         boot path, so it goes through the unit that owns the floor."""
-        self.systemctl("restart", "streamer-play.service")
+        self.systemctl("restart", "atibi-play.service")
 
     def reload(self):
         self.systemctl("restart", *BOOT_UNITS)
@@ -337,7 +337,7 @@ class Box:
     def rw(self):
         subprocess.run(("mount", "-o", "remount,rw", "/"), check=True)
         self.app.bootlog.note("/ made writable")
-        self.out.write("/ is writable. Undo with: streamer ro\n")
+        self.out.write("/ is writable. Undo with: atibi ro\n")
 
     def ro(self):
         os.sync()
@@ -360,10 +360,10 @@ class Box:
                     self.out.write("%s\n" % line)
                 if line == AUDIO_END:
                     break
-            self.out.write("switch with: streamer audio jack|dac\n")
+            self.out.write("switch with: atibi audio jack|dac\n")
             return 0
         try:
-            with open("/etc/streamer/audio-%s.txt" % want,
+            with open("/etc/atibi/audio-%s.txt" % want,
                       encoding="utf-8") as handle:
                 fragment = ["%s\n" % line for line in handle.read().splitlines()]
         except OSError as exc:
@@ -392,7 +392,7 @@ class Box:
                     self.out.write("  %s\n" % name)
             except OSError:
                 pass
-            self.out.write("to go ahead: streamer reset --yes\n")
+            self.out.write("to go ahead: atibi reset --yes\n")
             return 2
         # Stop the player first: it holds the IPC socket and its config directory
         # open, and its exit handler writes to both.
@@ -425,7 +425,7 @@ class Box:
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog="streamer", description=__doc__,
+        prog="atibi", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     verbs = parser.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -486,9 +486,9 @@ def main(argv=None, out=None, conf_path=None):
     command = args.command
 
     if needs_root(command, getattr(args, "want", None)) and os.geteuid() != 0:
-        if not os.environ.get("STREAMER_SUDO"):
+        if not os.environ.get("ATIBI_SUDO"):
             sys.stderr.write("%s needs root: re-running with sudo\n" % command)
-            env = dict(os.environ, STREAMER_SUDO="1")
+            env = dict(os.environ, ATIBI_SUDO="1")
             os.execvpe("sudo", ["sudo", "-E", sys.argv[0]] + argv, env)
 
     app = Appliance(conf_path)
@@ -528,9 +528,9 @@ def main(argv=None, out=None, conf_path=None):
     if command in TRANSPORT:
         return play.transport(TRANSPORT[command])
     if command == "log":
-        subprocess.run(("journalctl", "-u", "streamer-cliamp.service",
-                        "-u", "streamer-play.service",
-                        "-u", "streamer-http.service", "-b", "--no-pager"))
+        subprocess.run(("journalctl", "-u", "atibi-cliamp.service",
+                        "-u", "atibi-play.service",
+                        "-u", "atibi-http.service", "-b", "--no-pager"))
         return 0
     parser.print_help(out)
     sys.stderr.write("unknown command: %s\n" % command)

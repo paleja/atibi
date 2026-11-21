@@ -1,14 +1,14 @@
 """The boot record on /data: what plays next boot and how loud.
 
 One writer, this class. The format stays key=value with last-line-wins while
-streamer-play is still /bin/sh, so a value carrying a newline is cleaned rather
+atibi-play is still /bin/sh, so a value carrying a newline is cleaned rather
 than trusted: it would forge a line and with it a second answer to the same key.
 """
 
 import fcntl
 import os
 
-from streamer import own
+from atibi import own
 
 KEYS = ("mode", "kind", "target", "provider", "volume",
         "title", "artist", "album")

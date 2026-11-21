@@ -11,7 +11,7 @@ import fcntl
 import os
 import time
 
-from streamer import own
+from atibi import own
 
 STAMP = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -25,7 +25,7 @@ class BootLog:
         self.clock = clock
 
     def note(self, text):
-        """One line, stamped in UTC: the shape `streamer boots` reads back.
+        """One line, stamped in UTC: the shape `atibi boots` reads back.
         False when the log could not be written. A log is never worth failing
         an operation over, but a caller may want to know it was skipped."""
         line = "%s %s\n" % (time.strftime(STAMP, time.gmtime(self.clock())),

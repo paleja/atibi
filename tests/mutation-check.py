@@ -41,11 +41,11 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-JOURNAL = Path("/tmp/opencode/rpi-streamer-mutation.journal")
-PLAY = "config/usr/local/bin/streamer-play"
-CTRL = "config/usr/local/bin/streamer"
-BOOTLOG = "config/usr/local/bin/streamer-bootlog"
-HTTP = "config/usr/local/bin/streamer-http"
+JOURNAL = Path("/tmp/opencode/rpi-atibi-mutation.journal")
+PLAY = "config/usr/local/bin/atibi-play"
+CTRL = "config/usr/local/bin/atibi"
+BOOTLOG = "config/usr/local/bin/atibi-bootlog"
+HTTP = "config/usr/local/bin/atibi-http"
 META = "tests/mutation-check.py"
 BUILD = "image/build.sh"
 FSTAB_AWK = "image/fstab-ro.awk"
@@ -75,28 +75,28 @@ MUTATIONS = [
      "debugfs -w -R 'ls -l /'",
      "the build never writes through debugfs"),
 
-    # streamer, the command a person types over SSH. What is worth breaking here
+    # atibi, the command a person types over SSH. What is worth breaking here
     # is the damage it can do: the data partition, and the read-only root.
     ("reset wipes without being asked twice", CTRL,
      'if [ "${1:-}" != --yes ]; then',
      "if false; then",
      "without --yes it refuses, exit 2"),
     ("reset clears the data partition with a shell glob", CTRL,
-     'find "$STREAMER_DATA" -mindepth 1 -maxdepth 1 -exec rm -rf {} +',
-     'rm -rf "$STREAMER_DATA"/*',
+     'find "$ATIBI_DATA" -mindepth 1 -maxdepth 1 -exec rm -rf {} +',
+     'rm -rf "$ATIBI_DATA"/*',
      "and so is the dotfile, which is why this does not use a glob"),
     ("reset wipes under a player that is still running", CTRL,
-     "systemctl stop streamer-play.service streamer-cliamp.service",
+     "systemctl stop atibi-play.service atibi-cliamp.service",
      "true",
      "the player is stopped first, then both units come back"),
-    ("streamer ro leaves the root writable", CTRL,
+    ("atibi ro leaves the root writable", CTRL,
      "        mount -o remount,ro /\n",
      "        mount -o remount,rw /\n",
-     "streamer rw then ro leaves the root read-only, in that order"),
+     "atibi rw then ro leaves the root read-only, in that order"),
     # The durable boot log is the only record of a boot that survives a hard
     # power cut, because the journal on this appliance is deliberately volatile.
     ("the boot log is never trimmed", BOOTLOG,
-     'if [ "$lines" -gt "$STREAMER_BOOTLOG_KEEP" ]; then',
+     'if [ "$lines" -gt "$ATIBI_BOOTLOG_KEEP" ]; then',
      "if false; then",
      "boot.log keeps the configured window"),
     # A boot that keeps failing writes this log from attempts that overlap, and
@@ -108,32 +108,32 @@ MUTATIONS = [
     # by is the writer's visible trace, not the corruption. The corruption
     # itself is a device observation.
     ("the boot log's append and trim race each other", BOOTLOG,
-     '(boot_log "$*") 2>/dev/null 9>>"$STREAMER_BOOTLOG" || true',
+     '(boot_log "$*") 2>/dev/null 9>>"$ATIBI_BOOTLOG" || true',
      '(boot_log "$*") 2>/dev/null || true',
      "a helper that only logs leaves nothing but the log behind"),
     # The log is written from two identities: the service as pi, and whoever
-    # types a `streamer` command over SSH, which is root. A file that the first
+    # types a `atibi` command over SSH, which is root. A file that the first
     # of those created is closed to the second.
     ("the boot log leaves the log owned by whoever happened to write it first", BOOTLOG,
-     'chown "$STREAMER_USER:$STREAMER_GROUP" "$STREAMER_BOOTLOG" 2>/dev/null || true',
+     'chown "$ATIBI_USER:$ATIBI_GROUP" "$ATIBI_BOOTLOG" 2>/dev/null || true',
      ":",
      "it puts the log back in the boot user's hands, if it can"),
     # Proved on the card: a root SSH session closed the log, and the service had
     # no way to open it again. The directory is the boot user's, and that is what
     # gives the helper a way out.
     ("the boot log gives up when the log is closed to it", BOOTLOG,
-     'if [ -e "$STREAMER_BOOTLOG" ] && [ ! -w "$STREAMER_BOOTLOG" ]; then',
+     'if [ -e "$ATIBI_BOOTLOG" ] && [ ! -w "$ATIBI_BOOTLOG" ]; then',
      "if false; then",
      "its line still lands"),
     # The order of the two redirects is the whole of this one: a redirect that
     # cannot be opened is reported at the point in the list where it fails, so
     # `9>>... 2>/dev/null` shouted one line per unwritable log at the journal.
     ("the boot log complains to whoever is watching when it cannot write", BOOTLOG,
-     '(boot_log "$*") 2>/dev/null 9>>"$STREAMER_BOOTLOG" || true',
-     '(boot_log "$*") 9>>"$STREAMER_BOOTLOG" 2>/dev/null || true',
+     '(boot_log "$*") 2>/dev/null 9>>"$ATIBI_BOOTLOG" || true',
+     '(boot_log "$*") 9>>"$ATIBI_BOOTLOG" 2>/dev/null || true',
      "and it keeps the complaint to itself"),
     ("a parked volume is replayed verbatim", PLAY,
-     r"""elif awk -v l="$level" -v f="$STREAMER_VOL_FLOOR" 'BEGIN{ exit (l+0 <= f+0) ? 0 : 1 }'; then""",
+     r"""elif awk -v l="$level" -v f="$ATIBI_VOL_FLOOR" 'BEGIN{ exit (l+0 <= f+0) ? 0 : 1 }'; then""",
      "elif false; then",
      "the parked -30 dB became the fallback"),
 
@@ -173,8 +173,8 @@ MUTATIONS = [
      "a lease that arrives late does not fail the boot"),
 
     ("the network budget for a provider boot is divided by four", PLAY,
-     '        [ "$i" -gt "$((STREAMER_NET_WAIT * 4))" ] && {',
-     '        [ "$i" -gt "$STREAMER_NET_WAIT" ] && {',
+     '        [ "$i" -gt "$((ATIBI_NET_WAIT * 4))" ] && {',
+     '        [ "$i" -gt "$ATIBI_NET_WAIT" ] && {',
      "inside the seconds it was given, not one more"),
 
     ("a boot that waits for the network leaves no trace of it in the logs", PLAY,
@@ -192,7 +192,7 @@ MUTATIONS = [
      r"""grep -o '"url":"[^"]*"'""",
      "stations pairs each name with its stream"),
 
-    # Saving on change: the level and the target are written by the streamer
+    # Saving on change: the level and the target are written by the atibi
     # command when a person changes them, and each write carries on what the
     # previous one recorded. Without that, turning the volume down would forget
     # the station, and the two guards in the ramp would have no level to guard.
@@ -222,13 +222,13 @@ MUTATIONS = [
      "on that provider"),
 
     ("remembering the next boot also restarts what is playing now", CTRL,
-     '            playlist)\n                playlist_target "${2:?usage: streamer remember playlist <name>}"\n                save_state last "$pl_kind" "$pl_name" "$pl_provider"\n                ;;\n',
-     '            playlist)\n                playlist_target "${2:?usage: streamer remember playlist <name>}"\n                save_state last "$pl_kind" "$pl_name" "$pl_provider"\n                systemctl restart streamer-play.service\n                ;;\n',
+     '            playlist)\n                playlist_target "${2:?usage: atibi remember playlist <name>}"\n                save_state last "$pl_kind" "$pl_name" "$pl_provider"\n                ;;\n',
+     '            playlist)\n                playlist_target "${2:?usage: atibi remember playlist <name>}"\n                save_state last "$pl_kind" "$pl_name" "$pl_provider"\n                systemctl restart atibi-play.service\n                ;;\n',
      "and recording it did not restart the player"),
 
     ("the ramp has no step budget", PLAY,
-     '[ "$steps" -ge "$STREAMER_RAMP_MAX_STEPS" ]',
-     '[ 0 -ge "$STREAMER_RAMP_MAX_STEPS" ]',
+     '[ "$steps" -ge "$ATIBI_RAMP_MAX_STEPS" ]',
+     '[ 0 -ge "$ATIBI_RAMP_MAX_STEPS" ]',
      "two steps of 3 dB above the floor"),
 
     ("the ramp ignores a level that will not move", PLAY,
@@ -242,7 +242,7 @@ MUTATIONS = [
      "the level the person actually set is what plays"),
 
     ("the boot never sets the floor before it makes a sound", PLAY,
-     'if ! cliamp volume "$STREAMER_VOL_FLOOR"; then',
+     'if ! cliamp volume "$ATIBI_VOL_FLOOR"; then',
      "if true; then",
      "the boot floor is set on the player"),
     ("the boot hands an https target to TLS with the clock still wrong", PLAY,
@@ -252,7 +252,7 @@ MUTATIONS = [
 
     # The LAN control server: its guarantees are the token, the scheme guards
     # around anything that reaches the player or the boot intent, and the fact
-    # that the intent file is only ever written by the streamer command.
+    # that the intent file is only ever written by the atibi command.
     ("the LAN server lets anyone on the network drive it", HTTP,
      """    def check_token(self, candidate):
         return bool(candidate) and hmac.compare_digest(""",
@@ -272,11 +272,11 @@ MUTATIONS = [
      "if False:",
      "a non-http url.load is refused too"),
     ("the intent route skips the sanctioned writer", HTTP,
-     'out = run_streamer("station", "--save", target)',
+     'out = run_atibi("station", "--save", target)',
      'out = ""',
      "the intent file says the new station plays next boot"),
     ("the page sets the level on the player only, so the next boot does not know it", HTTP,
-     'self._json_out({"ok": True, "streamer": run_streamer("vol", repr(db))})',
+     'self._json_out({"ok": True, "atibi": run_atibi("vol", repr(db))})',
      'self._json_out(self._op("volume", {"value": db}))',
      "and it is the level the next boot will start at"),
     ("the level the page reads comes from the IPC snapshot, as it did while the"
@@ -288,7 +288,7 @@ MUTATIONS = [
      "for", HTTP,
      '            ipc_op("provider.load", {"provider": provider, "playlist": pid})',
      '            ipc_op("provider.load", {"provider": provider, "playlist": pid})\n'
-     '            run_streamer("remember", "playlist", "%s:%s" % (provider, pid))',
+     '            run_atibi("remember", "playlist", "%s:%s" % (provider, pid))',
      "a tapped list does not rewrite what the next boot loads"),
     ("the submit envelope nests its operation inside params, as the fixture "
      "used to allow and the real player never did", HTTP,

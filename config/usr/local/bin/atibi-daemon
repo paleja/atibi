@@ -1,9 +1,9 @@
 #!/bin/sh
-# Started by streamer-cliamp.service. Never starts playback: only
-# streamer-play starts audio, which keeps the floor and the ramp unbypassable.
+# Started by atibi-cliamp.service. Never starts playback: only
+# atibi-play starts audio, which keeps the floor and the ramp unbypassable.
 set -eu
 
-. /etc/streamer.conf
+. /etc/atibi.conf
 
 # cliamp needs ffmpeg for AAC/Opus/ALAC/HLS streams; /data/bin first, so a
 # newer binary can be dropped on the writable partition without a remount.
@@ -12,7 +12,7 @@ export PATH
 
 # The codec's 'Digital' control wakes at 0 dB every power-on, so it is set
 # absolutely: 100% first, then the dB, so a restart cannot stack the trim.
-gain=${STREAMER_DAC_GAIN:-}
+gain=${ATIBI_DAC_GAIN:-}
 case $gain in ''|0) gain= ;; esac
 if [ -n "$gain" ]; then
     card=0
@@ -34,6 +34,6 @@ if [ -n "$gain" ]; then
 fi
 
 exec cliamp --daemon \
-    --vol "$STREAMER_VOL_FLOOR" \
-    --buffer-ms "$STREAMER_BUFFER_MS" \
-    --sample-rate "$STREAMER_SAMPLE_RATE"
+    --vol "$ATIBI_VOL_FLOOR" \
+    --buffer-ms "$ATIBI_BUFFER_MS" \
+    --sample-rate "$ATIBI_SAMPLE_RATE"

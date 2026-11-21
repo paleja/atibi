@@ -1,6 +1,6 @@
 """The boot: bring playback up, then ramp the level.
 
-`/usr/local/bin/streamer-play` is a thin entry onto `Boot.run`, and that unit
+`/usr/local/bin/atibi-play` is a thin entry onto `Boot.run`, and that unit
 is the only thing that starts audio, which is what keeps the floor and the
 ramp unbypassable from the page, from the command and from a reboot.
 
@@ -12,10 +12,10 @@ by running into systemd's timeout.
 import sys
 import time
 
-from streamer import net, ramp
-from streamer import num
-from streamer.ipc import IpcError
-from streamer.player import PlayerError
+from atibi import net, ramp
+from atibi import num
+from atibi.ipc import IpcError
+from atibi.player import PlayerError
 
 FAILED, OK = 1, 0
 
@@ -42,7 +42,7 @@ def level_plan(saved, floor, default, ceiling):
     floor has to be the last word, so a stale level can never make the first
     sample loud. A saved level at or below the floor is a parked control, not
     a preference, so it falls back to the default and says so. The way to ask
-    for a quiet box is `streamer boot off`, said out loud.
+    for a quiet box is `atibi boot off`, said out loud.
     """
     if saved is None:
         return default, ("no saved level, ramping to the default %s dB"

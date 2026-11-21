@@ -11,7 +11,7 @@ level the boot never intended:
   wins and the climb stops.
 """
 
-from streamer.ipc import IpcError
+from atibi.ipc import IpcError
 
 STEP_SLACK = 0.02
 NOT_MOVED = 0.01
