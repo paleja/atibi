@@ -520,12 +520,25 @@ install -m 644 "$CONFIG/etc/streamer.conf" "$R/etc/streamer.conf"
 for script in "$CONFIG"/usr/local/bin/*; do
     install -m 755 "$script" "$R/usr/local/bin/$(basename "$script")"
 done
+# The payload's shared library: one implementation of the knobs, the record,
+# the player's socket and boot.log, in the directory the card's own interpreter
+# looks in first. The version in that path is a fact about the base image, so
+# it is checked: an image shipping another minor version would put the package
+# where its python never looks, and every unit would come up ModuleNotFound.
+install -d -m 755 "$R/usr/local/lib/python3.13/dist-packages"
+cp -a "$CONFIG/usr/local/lib/python3.13/dist-packages/streamer" \
+       "$R/usr/local/lib/python3.13/dist-packages/"
+[ -d "$R/usr/lib/python3.13" ] ||
+    die "the payload is a python3.13 package and this base image has no such "
+        "standard library: the units would not find it"
 install -m 755 "$CLIAMP" "$R/usr/local/bin/cliamp"
 install -m 755 "$FFMPEG" "$R/usr/local/bin/ffmpeg"
 # A unit naming an interpreter the image lacks comes up 203/EXEC: a silent speaker
-# here. The payload is /bin/sh except the HTTP control server, which is python3 -
-# RasPiOS Lite happens to ship it, and this check turns that into a fact.
+# here. The payload is python3 except streamer-daemon, which is /bin/sh. cliamp
+# and ffmpeg are compiled and carry no interpreter, so only the two-byte marker
+# decides whether a file here has a claim to check.
 for script in "$R"/usr/local/bin/*; do
+    head -c 2 "$script" | grep -q '^#!' || continue
     shebang=$(head -1 "$script")
     case $shebang in
         "#!/bin/sh")
@@ -534,11 +547,41 @@ for script in "$R"/usr/local/bin/*; do
         "#!/usr/bin/env python3")
             [ -x "$R/usr/bin/python3" ] ||
                 die "$(basename "$script") runs python3, which this base image does not ship: "
-                    "the HTTP control server cannot start" ;;
+                    "the payload cannot start" ;;
         *)
             die "$(basename "$script") names an unexpected interpreter: $shebang" ;;
     esac
 done
+# The payload's python is parsed here, as the card's python and not this host's:
+# an entry point with a typo in an import comes up as a silent speaker or a page
+# that answers 500, and the suite is the only place a module-level mistake shows
+# without a boot.
+if ! PYTHONDONTWRITEBYTECODE=1 python3 - "$CONFIG" <<PY
+import ast, sys, pathlib
+root = pathlib.Path(sys.argv[1])
+files = list(root.glob("usr/local/lib/**/*.py")) + [
+    root / "usr/local/bin/streamer", root / "usr/local/bin/streamer-play",
+    root / "usr/local/bin/streamer-http"]
+for path in files:
+    ast.parse(path.read_text(), str(path), "exec")
+print("  %d payload modules parse" % len(files))
+PY
+then
+    die "a payload module does not parse"
+fi
+# Byte-code is baked only when the build host has the card's minor version: a
+# .pyc from another one is ignored by the card's interpreter, and the root is
+# read-only, so the card can never rewrite it. An unbaked tree pays the parse
+# every boot instead, measured at 18 ms for the whole boot chain, which the
+# 10 s budget absorbs with room.
+if [ -x /usr/bin/python3.13 ]; then
+    /usr/bin/python3.13 -m compileall -q \
+        "$R/usr/local/lib/python3.13/dist-packages/streamer" >/dev/null ||
+        die "the payload does not compile with python3.13"
+    log "  byte-code baked for python3.13"
+else
+    log "  no python3.13 on the build host: the tree ships unbaked"
+fi
 # The same check for the base-image tool the payload calls: streamer-daemon trims the
 # DAC's codec volume with amixer. Without it the trim fails silently every boot and
 # the board plays at 0 dB while every knob says otherwise.
@@ -565,6 +608,7 @@ enable streamer.target         multi-user.target
 enable streamer-cliamp.service streamer.target
 enable streamer-play.service   streamer.target
 enable streamer-http.service   streamer.target
+enable streamer-capture.service streamer.target
 
 # Stock Raspberry Pi OS leaves ssh off unless a /boot/firmware/ssh marker exists at
 # boot: no screen or keyboard here, so ssh comes up from the first boot on its own.
@@ -587,7 +631,7 @@ log "  ssh.service -> multi-user.target"
 #     it failed on the day it fired.
 #   logrotate.timer      cannot create its stub state file under /var, so it exits 3;
 #     there are no rotating logs here - journald is volatile and boot.log is trimmed
-#     by streamer-bootlog.
+#     by the appliance's log writer, streamer.log.
 #   rpi-resize.service  grows the last partition when the kernel command line says
 #     `resize`; that token is stripped below, but the unit still pulls
 #     systemd-growfs-root.service into every boot, which fails against a read-only root.

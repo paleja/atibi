@@ -1,461 +1,554 @@
-#!/bin/sh
-# streamer [command] - the control for the appliance, meant to be used over SSH.
-# The command list below is what `streamer nonsense` prints, so keep it current.
-#
-#   streamer                    same as: streamer status
-#   streamer status             what is playing now, and what plays next boot
-#   streamer play               play the saved target again, with the ramp
-#   streamer pause | toggle     transport
-#   streamer stop               stop now, and stay quiet after the next boot
-#   streamer next | prev        skip
-#   streamer vol -12            set the level to -12 dB, next boot too
-#   streamer up 3 | down 3      move the level by N dB, next boot too
-#   streamer station <url>      play this stream now
-#   streamer playlist <name>    play a saved cliamp playlist now
-#   streamer playlist tidal:ID  play a streaming service playlist now
-#   streamer album tidal:ID     play an album from a streaming service
-#   streamer track tidal:ID     play one track from a streaming service
-#                               --save on those four: this one plays next boot too
-#   streamer remember <what> <target>
-#                               next boot only, without touching what plays now
-#   streamer stations           list the built-in radio endpoints
-#   streamer last               what the appliance will play on next boot
-#   streamer mode [last|stop]   resume-on-boot behaviour
-#   streamer log                this boot's player log
-#   streamer boots              the durable boot log, the one that survives a cut
-#   streamer reload             restart daemon and playback
-#   streamer audio [jack|dac]   show or switch the audio output
-#   streamer rw | ro            make / writable, then read-only again
-#   streamer reset --yes        wipe /data and put back what the card shipped with
-set -eu
+#!/usr/bin/env python3
+"""streamer - the appliance's control surface, typed over SSH or driven by the
+LAN page. One verb per thing, and the verbs that decide do not overlap:
 
-. /etc/streamer.conf
-# A card flashed before this knob existed keeps the same default path.
-STREAMER_PLAY_NOW=${STREAMER_PLAY_NOW:-/run/streamer/play-now}
+  play     what sounds now. Writes nothing to the card.
+  boot     what plays next boot. Touches nothing that is playing.
+  level    one number, the player's own dB, remembered as the player settled at
+           it, never as the number that was asked for.
 
-usage() { # the command list at the top of this file, which is its own help text
-    awk 'NR == 1 { next } /^set -eu/ { exit } { sub(/^# ?/, ""); print }' "$0"
-}
+  streamer                      what plays now, and what plays next boot
+  streamer now                  the row, the list it came from, the level
+  streamer boots                the durable log, the one that survives a cut
+  streamer log                  this boot's journal
+  streamer stations             the built-in endpoints, as the service lists them
+  streamer boot                 show the record
+  streamer boot now             next boot = what is playing now
+  streamer boot station <url>   ditto for a target typed out
+  streamer boot playlist <name | provider:id>
+  streamer boot album|track <provider>:<id> [title] [artist] [album]
+  streamer boot on|off          resume on boot, or stay quiet after it
+  streamer play                 play the source the record holds, now
+  streamer play station <url>   play this stream now
+  streamer play playlist <name | provider:id>
+  streamer play album|track <provider>:<id> [title] [artist] [album]
+  streamer resume|pause|toggle|next|prev|stop
+  streamer level <dB> | now | up <N> | down <N>
+  streamer restart              the saved target again, from the floor, with the ramp
+  streamer reload               the daemon and playback
+  streamer audio [jack|dac]     show or switch the output, then reboot
+  streamer rw | ro              make / writable, then read-only again
+  streamer reset --yes          /data back to what the card was built with
 
-# Some commands need root: system units, the read-only root, /data. The
-# image ships a sudoers drop-in for exactly this, so they re-run under sudo
-# once (STREAMER_SUDO marks the second pass).
-needs_root() { # needs_root <command> [argument]
-    case "$1" in
-        play|station|playlist|album|track|reload|reset|rw|ro) return 0 ;;
-        audio) [ -n "${2:-}" ] && return 0 ; return 1 ;;
-        *) return 1 ;;
-    esac
-}
+`stop` stops: staying quiet after the next boot is a separate decision, said
+with `boot off`. Root comes back on its own for the verbs that need it - the
+image ships a passwordless sudoers drop-in, and STREAMER_SUDO marks the second
+pass - and STREAMER_CONF is the knob file the harness points elsewhere.
+"""
 
-# Atomically replaces the record of what plays next boot and how loud. Omitted
-# arguments carry on what the file already holds, so changing the level cannot
-# forget the target. Nothing else writes this file.
-#
-# title/artist/album belong to a kind=track target: cliamp 2.4.1 cannot fetch
-# a track by id, so streamer-play rebuilds the row from these strings. An
-# omitted triple carries on what the file holds; any other kind drops it.
-save_state() { # save_state <mode> <kind> <target> [provider] [volume] [title] [artist] [album]
-    mode=$1 kind=$2 cur=$3
-    [ "$#" -ge 4 ] && provider=$4
-    [ "$#" -ge 5 ] && cur_vol=$5
-    [ "$#" -ge 6 ] && t_title=$6
-    [ "$#" -ge 7 ] && t_artist=$7
-    [ "$#" -ge 8 ] && t_album=$8
-    if [ "$kind" = track ]; then
-        [ "$#" -ge 6 ] || t_title=$(state_last title)
-        [ "$#" -ge 7 ] || t_artist=$(state_last artist)
-        [ "$#" -ge 8 ] || t_album=$(state_last album)
-    else
-        t_title= t_artist= t_album=
-    fi
-    # A newline in a value would forge a line: guard, not trust.
-    t_title=$(printf '%s' "${t_title:-}" | tr -d '\n\r')
-    t_artist=$(printf '%s' "${t_artist:-}" | tr -d '\n\r')
-    t_album=$(printf '%s' "${t_album:-}" | tr -d '\n\r')
-    mkdir -p "$(dirname "$STREAMER_STATE")"
-    tmp="$STREAMER_STATE.tmp"
-    {
-        printf 'mode=%s\nkind=%s\ntarget=%s\n' "$mode" "$kind" "$cur"
-        [ -n "$provider" ] && printf 'provider=%s\n' "$provider"
-        [ -n "$cur_vol" ] && printf 'volume=%s\n' "$cur_vol"
-        if [ "$kind" = track ]; then
-            [ -n "$t_title" ] && printf 'title=%s\n' "$t_title"
-            [ -n "$t_artist" ] && printf 'artist=%s\n' "$t_artist"
-            [ -n "$t_album" ] && printf 'album=%s\n' "$t_album"
-        fi
-        true
-    } >"$tmp"
-    mv -f "$tmp" "$STREAMER_STATE"
-    sync
-    # journald is volatile, so intent changes also go to the durable log.
-    /usr/local/bin/streamer-bootlog "intent set: mode=$mode kind=$kind target=$cur${provider:+ provider=$provider}${cur_vol:+ volume=$cur_vol}${t_title:+ title=$t_title}"
-}
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.request
 
-# This session's play request, when the command was not given --save: the same
-# key=value shape as the state record, on tmpfs, so a reboot cannot find it. The
-# directory belongs to the daemon's account because streamer-play (User=pi) reads
-# the file and unlinks it; the command that writes it re-ran under sudo.
-request_play() { # request_play <kind> <target> [provider] [title] [artist] [album]
-    dir=${STREAMER_PLAY_NOW%/*}
-    mkdir -p "$dir" && chown "$STREAMER_USER:$STREAMER_GROUP" "$dir" && chmod 770 "$dir"
-    r_target=$(printf '%s' "$2" | tr -d '\n\r')
-    r_provider=$(printf '%s' "${3:-}" | tr -d '\n\r')
-    r_title=$(printf '%s' "${4:-}" | tr -d '\n\r')
-    r_artist=$(printf '%s' "${5:-}" | tr -d '\n\r')
-    r_album=$(printf '%s' "${6:-}" | tr -d '\n\r')
-    tmp="$STREAMER_PLAY_NOW.tmp"
-    {
-        printf 'kind=%s\ntarget=%s\n' "$1" "$r_target"
-        [ -n "$r_provider" ] && printf 'provider=%s\n' "$r_provider"
-        [ -n "$r_title" ] && printf 'title=%s\n' "$r_title"
-        [ -n "$r_artist" ] && printf 'artist=%s\n' "$r_artist"
-        [ -n "$r_album" ] && printf 'album=%s\n' "$r_album"
-        true
-    } >"$tmp"
-    chmod 660 "$tmp"
-    mv -f "$tmp" "$STREAMER_PLAY_NOW"
-    sync
-}
+from streamer import num, own
+from streamer.app import Appliance
+from streamer.conf import KnobError
+from streamer.ipc import IpcError
+from streamer.intent import (NoTarget, parse_target, record_level, record_mode,
+                             record_now, record_target)
+from streamer.player import PlayerError
 
-# One start of the play unit, whichever record it was asked for. When the command
-# saved the choice instead of only asking for it, any older one-shot request goes
-# first: the play unit reads that file in preference to the record.
-start_play() { # the play-unit restart shared by the four play verbs
-    [ "$do_save" = 1 ] && rm -f "$STREAMER_PLAY_NOW"
-    systemctl restart streamer-play.service
-}
+CONF_PATH = "/etc/streamer.conf"
+AUDIO_BEGIN = "# --- streamer audio begin ---"
+AUDIO_END = "# --- streamer audio end ---"
+BOOT_UNITS = ("streamer-cliamp.service", "streamer-play.service")
 
-playlist_target() { # playlist_target <name | provider:id>
-    # Splits into pl_kind, pl_name, pl_provider. A bare name is a playlist cliamp
-# saved on disk, loaded with `cliamp load`; provider:id is the spelling cliamp
-# itself uses, and only provider.load can fetch it.
-    pl_kind=playlist
-    pl_name=$1
-    pl_provider=
-    case "$1" in
-        local:*) pl_name=${1#local:} ;;
-    esac
-    for pr in ${STREAMER_PROVIDERS:-tidal qobuz spotify}; do
-        case "$1" in
-            "$pr":*) pl_provider=$pr; pl_kind=provider; pl_name=${1#"$pr":} ;;
-        esac
-    done
-}
+# The transport verbs, spelled as the operations they send. `stop` stops and
+# says nothing about the next boot: staying quiet after a reboot is `boot off`.
+TRANSPORT = {"resume": "play", "pause": "pause", "toggle": "toggle",
+             "next": "next", "prev": "prev", "stop": "stop"}
 
-provider_target() { # provider_target <what> <provider:id>
-    # Unlike a saved playlist name, a bare id means nothing until the service that
-# minted it is named, so a missing prefix here is an error, not a local list.
-    pt_id=$2 pt_provider=
-    for pr in ${STREAMER_PROVIDERS:-tidal qobuz spotify}; do
-        case "$2" in
-            "$pr":*) pt_provider=$pr; pt_id=${2#"$pr":} ;;
-        esac
-    done
-    [ -n "$pt_provider" ] || {
-        echo "$1 target must be written <provider>:<id>, like tidal:1306459" >&2
-        exit 2
-    }
-}
+# The verbs whose work is a system unit, the read-only root or /boot: they re-run
+# once under sudo, which the image's passwordless sudoers drop-in allows.
+NEEDS_ROOT = ("restart", "reload", "reset", "rw", "ro")
 
-json_num() { # key's number, sign included: last hit wins, keys repeat
-    printf '%s' "$1" |
-        sed -n "s/.*\"$2\": *\(-\{0,1\}[0-9][0-9.]*\).*/\1/p" | tail -n 1
-}
 
-player_level() { # the level the player is actually at, empty if it said nothing
-    lvl=$(json_num "$(cliamp status --json 2>/dev/null || true)" volume)
-    case "$lvl" in ''|*[!0-9.-]*) return 0 ;; esac
-    printf '%s\n' "$lvl"
-}
+def splice_config(text, fragment):
+    """Replace only what sits between the two audio markers, so switching the
+    output is idempotent and a hand-added line elsewhere in config.txt survives
+    every switch."""
+    out, skipping = [], False
+    for line in text.splitlines(True):
+        if line.rstrip("\r\n") == AUDIO_BEGIN:
+            out.append(line)
+            out.extend(fragment)
+            skipping = True
+            continue
+        if line.rstrip("\r\n") == AUDIO_END:
+            skipping = False
+            out.append(line)
+            continue
+        if not skipping:
+            out.append(line)
+    return "".join(out)
 
-save_level() { # record the level the player is actually at, after a change
-    lvl=$(player_level)
-    [ -n "$lvl" ] || return 0
-    [ "$lvl" = "$cur_vol" ] && return 0
-    save_state "$mode" "$kind" "$cur" "$provider" "$lvl"
-}
 
-# Last line wins per key, as in the boot script.
-state_last() { sed -n "s/^$1=//p" "$STREAMER_STATE" 2>/dev/null | tail -n 1; }
-mode=$(state_last mode)
-kind=$(state_last kind)
-cur=$(state_last target)
-provider=$(state_last provider)
-cur_vol=$(state_last volume)
-title=$(state_last title)
-mode=${mode:-last}
-kind=${kind:-$STREAMER_START_KIND}
-cur=${cur:-$STREAMER_START_TARGET}
+class Show:
+    def __init__(self, app, out):
+        self.app = app
+        self.out = out
 
-cmd=${1:-status}
-shift || true
+    def now(self):
+        app = self.app
+        try:
+            snap = app.player.snapshot()
+        except IpcError as exc:
+            # The player not answering is worth saying, and the record is still
+            # worth showing: a daemon that has not come up is not a reason to
+            # hide what the next boot would load.
+            self.out.write("player: %s\n" % exc)
+            return
+        row = snap.get("track") if isinstance(snap.get("track"), dict) else {}
+        level = app.player.level()
+        self.out.write("state:   %s\n" % snap.get("state", "unknown"))
+        if row:
+            self.out.write("track:   %s - %s (%s)\n" % (
+                row.get("artist", ""), row.get("title", ""), row.get("album", "")))
+            self.out.write("row:     %s of %s in %s\n" % (
+                int(snap.get("index", 0)) + 1, snap.get("total", "?"),
+                snap.get("playlist", "one track")))
+        if snap.get("position") is not None:
+            self.out.write("position: %d of %d s\n" % (
+                int(snap["position"]), int(snap.get("duration") or 0)))
+        self.out.write("level:   %s dB\n" % (num(level) if level is not None
+                                             else "unknown"))
 
-if [ "$(id -u)" != 0 ] && needs_root "$cmd" "${1:-}" && [ -z "${STREAMER_SUDO:-}" ]; then
-    # One attempt: with no sudoers drop-in the failure should land on the
-# operation that needs root, not loop here.
-    echo "$cmd needs root: re-running with sudo" >&2
-    STREAMER_SUDO=1 exec sudo -E "$0" "$cmd" "$@"
-fi
+    def boots(self):
+        try:
+            with open(self.app.conf.bootlog, encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            self.out.write("no boot log yet\n")
+            return
+        for line in lines[-20:]:
+            self.out.write("%s\n" % line)
 
-# `--save` decides whether a play command also records what plays next boot; it
-# may sit anywhere among the arguments. Stripping it after the sudo pass means
-# both passes see the same arguments and the verbs keep their ${1:?} usages.
-do_save=0
-case "$cmd" in
-    station | playlist | album | track)
-        i=$#
-        while [ "$i" -gt 0 ]; do
-            a=$1
-            shift
-            if [ "$a" = --save ]; then
-                do_save=1
-            else
-                set -- "$@" "$a"
-            fi
-            i=$((i - 1))
-        done
-        ;;
-esac
+    def stations(self):
+        """Fetched, never duplicated in the image, so the two cannot drift.
+        The pairing is what the next command wants: name, then its stream."""
+        try:
+            with urllib.request.urlopen(self.app.conf.station_list,
+                                        timeout=10) as answer:
+                body = answer.read().decode("utf-8", "replace")
+        except (OSError, ValueError) as exc:
+            self.out.write("could not read %s: %s\n" % (self.app.conf.station_list,
+                                                        exc))
+            return
+        try:
+            entries = json.loads(body).get("stations", [])
+        except ValueError:
+            entries = []
+        rows = [(entry.get("name", ""), entry["stream"])
+                for entry in entries if isinstance(entry, dict) and entry.get("stream")]
+        if not rows:
+            # Not the shape expected: show the body rather than hide it.
+            for line in body.replace(",", ",\n").splitlines()[:60]:
+                self.out.write("  %s\n" % line)
+            return
+        for name, stream in rows:
+            self.out.write("%s\t%s\n" % (name, stream))
+        self.out.write("then: streamer play station <url>"
+                       " | streamer boot station <url>\n")
 
-case "$cmd" in
-    status)
-        cliamp status
-        printf 'boot mode:   %s\n' "$mode"
-        printf 'boot target: %s %s%s%s\n' "$kind" "$cur" \
-            "${provider:+ on $provider}" "${title:+ ($title)}"
-        lvl="${cur_vol:-}"
-        [ -n "$lvl" ] || lvl="$STREAMER_VOL_TARGET (default, never saved)"
-        printf 'boot level:  %s dB\n' "$lvl"
-        ;;
-    last)
-        # Everything the next boot needs, on one line.
-        printf '%s %s %s%s%s%s\n' "$mode" "$kind" "$cur" \
-            "${provider:+ on $provider}" "${title:+ ($title)}" "${cur_vol:+ at $cur_vol dB}"
-        ;;
-    mode)
-        case "${1:-}" in
-            last|stop) save_state "$1" "$kind" "$cur" ;;
-            "")        ;;
-            *)         echo "usage: streamer mode [last|stop]" >&2; exit 2 ;;
-        esac
-        printf 'boot mode: %s\n' "${1:-$mode}"
-        ;;
-    play)
-        # Replay what the listener saved: any play request that was only for this
-        # session is dropped along the way.
-        rm -f "$STREAMER_PLAY_NOW" || true
-        save_state last "$kind" "$cur"
-        systemctl restart streamer-play.service
-        ;;
-    station)
-        url=${1:?usage: streamer station <url> [--save]}
-        if [ "$do_save" = 1 ]; then
-            save_state last url "$url" ""
-        else
-            request_play url "$url"
-        fi
-        start_play
-        ;;
-    playlist)
-        playlist_target "${1:?usage: streamer playlist <name> | <provider>:<id> [--save]}"
-        if [ "$do_save" = 1 ]; then
-            save_state last "$pl_kind" "$pl_name" "$pl_provider"
-        else
-            request_play "$pl_kind" "$pl_name" "$pl_provider"
-        fi
-        start_play
-        ;;
-    album)
-        provider_target album "${1:?usage: streamer album <provider>:<id> [--save]}"
-        if [ "$do_save" = 1 ]; then
-            save_state last album "$pt_id" "$pt_provider"
-        else
-            request_play album "$pt_id" "$pt_provider"
-        fi
-        start_play
-        ;;
-    track)
-        provider_target track "${1:?usage: streamer track <provider>:<id> [title] [artist] [album] [--save]}"
-        # The strings only decide what "now playing" shows after the boot.
-        if [ "$do_save" = 1 ]; then
-            save_state last track "$pt_id" "$pt_provider" "$cur_vol" "${2:-}" "${3:-}" "${4:-}"
-        else
-            request_play track "$pt_id" "$pt_provider" "${2:-}" "${3:-}" "${4:-}"
-        fi
-        start_play
-        ;;
-    remember)
-        # Next boot only, without touching playback: a tapped playlist already started
-# the music, and `streamer playlist` on top would restart the boot sequence
-# from the floor mid-track.
-        # The level is captured with the source, read back from the player: the
-        # Omarchy bar panel drives cliamp's dB directly, so a level moved there
-        # reaches the record at this capture rather than never. A level at or
-        # below the boot floor is a parked control, not a preference: then the
-        # saved one carries on.
-        lvl=$(player_level)
-        if [ -n "$lvl" ] && ! awk -v l="$lvl" -v f="$STREAMER_VOL_FLOOR" \
-            'BEGIN{ exit (l+0 <= f+0) ? 0 : 1 }'; then
-            cur_vol=$lvl
-        fi
-        what=${1:?usage: streamer remember <station|playlist|album|track|mode> <target>}
-        case "$what" in
-            station)
-                url=${2:?usage: streamer remember station <url>}
-                save_state last url "$url" ""
-                ;;
-            playlist)
-                playlist_target "${2:?usage: streamer remember playlist <name>}"
-                save_state last "$pl_kind" "$pl_name" "$pl_provider"
-                ;;
-            album)
-                provider_target album "${2:?usage: streamer remember album <provider>:<id>}"
-                save_state last album "$pt_id" "$pt_provider"
-                ;;
-            track)
-                provider_target track "${2:?usage: streamer remember track <provider>:<id> [title] [artist] [album]}"
-                # Always pass the triple, empty included: a row tapped without strings must
-# not inherit the last track's title.
-                save_state last track "$pt_id" "$pt_provider" "$cur_vol" "${3:-}" "${4:-}" "${5:-}"
-                ;;
-            mode)
-                case "${2:-}" in
-                    last|stop) save_state "$2" "$kind" "$cur" ;;
-                    *) echo "usage: streamer remember mode [last|stop]" >&2; exit 2 ;;
-                esac
-                ;;
-            *) echo "usage: streamer remember <station|playlist|album|track|mode> <target>" >&2
-               exit 2 ;;
-        esac
-        ;;
-    stations)
-        # The list belongs to the radio service, so this needs the network. grep, not a
-# JSON parser: no jq on the image, and the body's line shape varies. "stream"
-# quoted so "tracks_url" does not match.
-        if out=$(curl -fsS --max-time 10 "$STREAMER_STATION_LIST" 2>/dev/null) && [ -n "$out" ]; then
-            names=$(printf '%s' "$out" | grep -o '"name":"[^"]*"' | sed 's/^"name":"//; s/"$//')
-            urls=$(printf '%s' "$out" | grep -o '"stream":"[^"]*"' | sed 's/^"stream":"//; s/"$//')
-            if [ -n "$names" ] && [ -n "$urls" ]; then
-                tmpd=$(mktemp -d)
-                printf '%s\n' "$names" >"$tmpd/names"
-                printf '%s\n' "$urls" >"$tmpd/urls"
-                paste "$tmpd/names" "$tmpd/urls"
-                rm -rf "$tmpd"
-            else
-                # Not the shape expected: show the body instead of hiding it.
-                printf '%s\n' "$out" | tr ',' '\n' | sed -n '1,60p'
-            fi
-        else
-            echo "could not read $STREAMER_STATION_LIST" >&2
-        fi
-        echo "then: streamer station <url> [--save]"
-        ;;
-    stop)
-        cliamp stop || true
-        save_state stop "$kind" "$cur"
-        ;;
-    pause|toggle|next|prev)
-        cliamp "$cmd"
-        ;;
-    vol|volume)
-        db=${1:?usage: streamer vol <dB>}
-        case "$db" in -[0-9]*|[0-9]*) ;; *) echo "not a dB value: $db" >&2; exit 2 ;; esac
-        cliamp volume "$db"
-        # Read back from the player, not from the request: it has its own floor and
-# ceiling, and what it settled at is what the next boot aims at. Not a timer.
-        save_level
-        ;;
-    up|down)
-        n=${1:-3}
-        case "$n" in ''|*[!0-9.]) echo "not a dB amount: $n" >&2; exit 2 ;; esac
-        sign=
-        [ "$cmd" = down ] && sign=-
-        cliamp remote call volume.adjust --params "{\"value\":$sign$n}" --wait >/dev/null
-        save_level
-        ;;
-    reset)
-        # /data goes back to the tree the build seeded the partition from, so a reset
-# card and a fresh card are the same box. Costs the local music and the Tidal
-# sign-in.
-        if [ "${1:-}" != --yes ]; then
-            echo "this removes everything on $STREAMER_DATA, the Tidal sign-in with it:" >&2
-            ls -1A "$STREAMER_DATA" 2>/dev/null | sed 's/^/  /' >&2
-            echo "to go ahead: streamer reset --yes" >&2
-            exit 2
-        fi
-        # Stop the player first: it holds the IPC socket and the config directory open,
-# and its exit handler writes to both.
-        systemctl stop streamer-play.service streamer-cliamp.service
-        # find, not a shell glob: a glob skips dotfiles and leaves half a stale state.
-        find "$STREAMER_DATA" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-        cp -a "$STREAMER_SEED/." "$STREAMER_DATA/"
-        # cp -a keeps the template's ownership; insurance against a hand-made template.
-        chown -R "$STREAMER_USER:$STREAMER_GROUP" "$STREAMER_DATA"
-        sync
-        /usr/local/bin/streamer-bootlog \
-            "factory reset: $STREAMER_DATA restored to the built-in template"
-        systemctl restart streamer-cliamp.service streamer-play.service
-        echo "$STREAMER_DATA is back to the state the card was built with"
-        echo "it is playing the default station; sign in to Tidal again with: cliamp"
-        ;;
-    log)
-        journalctl -u streamer-cliamp.service -u streamer-play.service -u streamer-http.service -b --no-pager
-        ;;
-    boots)
-        # The record that survives a power cut; the journal covers only this boot.
-        [ -f "$STREAMER_BOOTLOG" ] && tail -n 20 "$STREAMER_BOOTLOG" || echo "no boot log yet"
-        ;;
-    reload)
-        systemctl restart streamer-cliamp.service streamer-play.service
-        ;;
-    audio)
-        want=${1:-}
-        case "$want" in
-            "")
-                sed -n '/# --- streamer audio begin ---/,/# --- streamer audio end ---/p' \
-                    /boot/firmware/config.txt
-                echo "switch with: streamer audio jack|dac"
-                ;;
-            jack|dac)
-                frag=/etc/streamer/audio-$want.txt
-                [ -f "$frag" ] || { echo "no fragment $frag" >&2; exit 1; }
-                mount -o remount,rw /boot/firmware
-                awk -v f="$frag" '
-                    /^# --- streamer audio begin ---$/ {
-                        print; while ((getline l < f) > 0) print l; skip = 1; next
-                    }
-                    /^# --- streamer audio end ---$/   { skip = 0; print; next }
-                    !skip                              { print }
-                ' /boot/firmware/config.txt >/boot/firmware/config.txt.new
-                mv -f /boot/firmware/config.txt.new /boot/firmware/config.txt
-                sync
-                mount -o remount,ro /boot/firmware 2>/dev/null || true
-                /usr/local/bin/streamer-bootlog "audio output set to $want, rebooting"
-                echo "audio output is now $want; rebooting"
-                systemctl --no-block reboot
-                ;;
-            *)
-                echo "usage: streamer audio [jack|dac]" >&2; exit 2 ;;
-        esac
-        ;;
-    rw)
-        mount -o remount,rw /
-        /usr/local/bin/streamer-bootlog "/ made writable"
-        echo "/ is writable. Undo with: streamer ro"
-        ;;
-    ro)
-        sync
-        mount -o remount,ro /
-        /usr/local/bin/streamer-bootlog "/ made read-only again"
-        echo "/ is read-only"
-        ;;
-    help|-h|--help)
-        usage
-        ;;
-    *)
-        echo "unknown command: $cmd" >&2
-        usage >&2
-        exit 2
-        ;;
-esac
+
+class Play:
+    """What sounds now. Writes nothing to the card: the next boot is a separate
+    decision, taken in the boot tab or by `streamer boot`.
+
+    Four shapes of target, and one path to the daemon each: the words a person
+    types are turned into the record's field names by `parse_target`, and the
+    player knows which operation each kind needs. Nothing here reads or writes
+    the boot record, so a play cannot change what a reboot would load.
+    """
+
+    def __init__(self, app, out):
+        self.app = app
+        self.out = out
+
+    def target(self, what, target, strings=()):
+        fields = parse_target(what, target, self.app.conf.providers)
+        self.start(fields, strings)
+        return 0
+
+    def start(self, fields, strings=()):
+        app = self.app
+        app.player.start(fields["kind"], fields["target"], fields["provider"],
+                         tuple(strings))
+        app.bootlog.note("played: %s %s%s" % (
+            fields["kind"], fields["target"],
+            " on %s" % fields["provider"] if fields["provider"] else ""))
+        self.out.write("playing: %s %s%s\n" % (
+            fields["kind"], fields["target"],
+            " on %s" % fields["provider"] if fields["provider"] else ""))
+
+    def last(self):
+        """The source the record holds, at the level the player is already at:
+        what a boot would have played, played now. No floor and no ramp - a
+        ramp is only what a boot does before anyone is listening.
+        """
+        fields = self.app.read_record()
+        if fields["mode"] != "last":
+            self.out.write("boot mode is stop: %s %s is kept but not played\n"
+                           % (fields["kind"], fields["target"]))
+            self.out.write("say so first: streamer boot on\n")
+            return 1
+        self.start({"kind": fields["kind"], "target": fields["target"],
+                    "provider": fields.get("provider", "")},
+                   (fields.get("title", ""), fields.get("artist", ""),
+                    fields.get("album", "")))
+        return 0
+
+    def transport(self, operation):
+        """pause, resume, toggle, next, prev, stop: the transport, nothing else.
+
+        `stop` stops and says nothing about the next boot; staying quiet after
+        a reboot is `streamer boot off`, said out loud.
+        """
+        self.app.player.transport(operation)
+        return 0
+
+
+class Level:
+    """One control surface, cliamp's own dB.
+
+    The number is read back after it is set, and the record is written through
+    the same capture the page uses: cliamp clamps to the volume_min in
+    /data/cliamp/config.toml and to +6, and what it settled at is what the
+    next boot aims at. A level at or below the boot floor is a parked control,
+    so it is not remembered - the floor is the last word by design.
+    """
+
+    def __init__(self, app, out):
+        self.app = app
+        self.out = out
+
+    def show(self, value):
+        level = self.app.player.level()
+        self.out.write("level: %s dB\n" % (num(level) if level is not None
+                                          else "unknown"))
+        return 0
+
+    def set(self, value, amount):
+        app = self.app
+        current = app.player.level()
+        if value in ("up", "down"):
+            if amount is None:
+                raise ValueError("usage: streamer level up|down <dB>")
+            step = float(amount) * (1 if value == "up" else -1)
+            if current is None:
+                raise ValueError("the level is unreadable, so it cannot be stepped")
+            app.player.adjust_level(step)
+        else:
+            app.player.set_level(float(value))
+        settled = app.player.level()
+        remembered = record_level(app)
+        self.out.write("level: %s dB\n" % (num(settled) if settled is not None
+                                          else "unknown"))
+        if remembered is None:
+            self.out.write("not remembered: at or below the %s dB boot floor, so the"
+                           " next boot comes up at the default %s dB\n"
+                           % (num(app.conf.vol_floor), num(app.conf.vol_target)))
+        return 0
+
+    def now(self):
+        return self.show(None)
+
+
+class NextBoot:
+    """What plays next boot, and how loud: the only writer of the record.
+
+    One rule the class exists for: writing the record never touches playback.
+    A tapped playlist has already started its music, and a start on top of it
+    would mean a second start and a trip back to the floor mid-track.
+    """
+
+    def __init__(self, app, out):
+        self.app = app
+        self.out = out
+
+    def show(self):
+        fields = self.app.read_record()
+        source = "%s %s" % (fields["kind"], fields["target"])
+        if fields.get("provider"):
+            source += " on %s" % fields["provider"]
+        if fields.get("title"):
+            source += " (%s)" % fields["title"]
+        level = fields.get("volume")
+        if level is None:
+            level = "%s (default, never saved)" % num(self.app.conf.vol_target)
+        self.out.write("mode:    %s\n" % fields["mode"])
+        self.out.write("boot:    %s\n" % source)
+        self.out.write("level:   %s dB\n" % level)
+        return 0
+
+    def now(self):
+        try:
+            saved = record_now(self.app)
+        except NoTarget as exc:
+            self.out.write("%s\n" % exc)
+            return 1
+        self.out.write("next boot: %s %s%s\n" % (
+            saved["kind"], saved["target"],
+            " on %s" % saved["provider"] if saved.get("provider") else ""))
+        return 0
+
+    def mode(self, resume):
+        saved = record_mode(self.app, resume == "on")
+        self.out.write("boot mode: %s\n" % saved["mode"])
+        return 0
+
+    def target(self, what, target, strings=()):
+        fields = parse_target(what, target, self.app.conf.providers)
+        if fields["kind"] == "track":
+            # title, artist, album decide what "now playing" shows for a row
+            # rebuilt from an id, and they are named even when empty: a track
+            # chosen without strings must not inherit the track before it.
+            fields["title"], fields["artist"], fields["album"] = (
+                list(strings) + ["", "", ""])[:3]
+        saved = record_target(self.app, fields)
+        self.out.write("next boot: %s %s%s\n" % (
+            saved["kind"], saved["target"],
+            " on %s" % saved["provider"] if saved.get("provider") else ""))
+        return 0
+
+
+class Box:
+    """The box itself: units, the read-only root, /data. All of it needs the
+    root the sudo pass brings, except showing the audio block."""
+
+    def __init__(self, app, out):
+        self.app = app
+        self.out = out
+
+    def systemctl(self, *args):
+        subprocess.run(("systemctl",) + args, check=True)
+
+    def restart(self):
+        """The saved target again, from the floor and with the ramp: that is the
+        boot path, so it goes through the unit that owns the floor."""
+        self.systemctl("restart", "streamer-play.service")
+
+    def reload(self):
+        self.systemctl("restart", *BOOT_UNITS)
+
+    def rw(self):
+        subprocess.run(("mount", "-o", "remount,rw", "/"), check=True)
+        self.app.bootlog.note("/ made writable")
+        self.out.write("/ is writable. Undo with: streamer ro\n")
+
+    def ro(self):
+        os.sync()
+        subprocess.run(("mount", "-o", "remount,ro", "/"), check=True)
+        self.app.bootlog.note("/ made read-only again")
+        self.out.write("/ is read-only\n")
+
+    def audio(self, want):
+        path = "/boot/firmware/config.txt"
+        try:
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        except OSError as exc:
+            raise PlayerError("cannot read %s: %s" % (path, exc)) from exc
+        if want is None:
+            inside = False
+            for line in text.splitlines():
+                inside = inside or line == AUDIO_BEGIN
+                if inside:
+                    self.out.write("%s\n" % line)
+                if line == AUDIO_END:
+                    break
+            self.out.write("switch with: streamer audio jack|dac\n")
+            return 0
+        try:
+            with open("/etc/streamer/audio-%s.txt" % want,
+                      encoding="utf-8") as handle:
+                fragment = ["%s\n" % line for line in handle.read().splitlines()]
+        except OSError as exc:
+            raise PlayerError("no fragment for %s: %s" % (want, exc)) from exc
+        subprocess.run(("mount", "-o", "remount,rw", "/boot/firmware"), check=True)
+        with open("%s.new" % path, "w", encoding="utf-8") as handle:
+            handle.write(splice_config(text, fragment))
+        os.replace("%s.new" % path, path)
+        os.sync()
+        subprocess.run(("mount", "-o", "remount,ro", "/boot/firmware"),
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       check=False)
+        self.app.bootlog.note("audio output set to %s, rebooting" % want)
+        self.out.write("audio output is now %s; rebooting\n" % want)
+        self.systemctl("--no-block", "reboot")
+        return 0
+
+    def reset(self, yes):
+        """/data goes back to the tree the build seeded the partition with, so a
+        reset card and a fresh card are the same box."""
+        if not yes:
+            self.out.write("this removes everything on %s, the Tidal sign-in with"
+                           " it:\n" % self.app.conf.data)
+            try:
+                for name in sorted(os.listdir(self.app.conf.data)):
+                    self.out.write("  %s\n" % name)
+            except OSError:
+                pass
+            self.out.write("to go ahead: streamer reset --yes\n")
+            return 2
+        # Stop the player first: it holds the IPC socket and its config directory
+        # open, and its exit handler writes to both.
+        self.systemctl("stop", *BOOT_UNITS)
+        for name in os.listdir(self.app.conf.data):
+            subprocess.run(("rm", "-rf", os.path.join(self.app.conf.data, name)),
+                           check=True)
+        subprocess.run(("cp", "-a", "%s/." % self.app.conf.seed,
+                        self.app.conf.data), check=True)
+        # cp -a keeps the template's ownership; this is insurance against a
+        # hand-made template, the same insurance the build's copy cannot have.
+        self._chown(self.app.conf.data)
+        os.sync()
+        self.app.bootlog.note("factory reset: %s restored to the built-in template"
+                              % self.app.conf.data)
+        self.systemctl("restart", *BOOT_UNITS)
+        self.out.write("%s is back to the state the card was built with\n"
+                       % self.app.conf.data)
+        self.out.write("it is playing the default station; sign in to Tidal again"
+                       " with: cliamp\n")
+        return 0
+
+    def _chown(self, root):
+        paths = [root]
+        for base, dirs, files in os.walk(root):
+            paths.extend(os.path.join(base, name) for name in dirs + files)
+        for path in paths:
+            own(path, self.app.conf.user, self.app.conf.group)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="streamer", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    verbs = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    def add(name, help_text, **kwargs):
+        return verbs.add_parser(name, help=help_text, **kwargs)
+
+    add("status", "what plays now and what plays next boot")
+    add("now", "what is playing now")
+    add("boots", "the durable boot log")
+    add("log", "this boot's journal")
+    add("stations", "the built-in radio endpoints")
+    for name, help_text in (("resume", "resume the transport"),
+                            ("pause", "pause the transport"),
+                            ("toggle", "pause or resume"),
+                            ("next", "skip forward"),
+                            ("prev", "skip back"),
+                            ("stop", "stop: and nothing about the next boot")):
+        add(name, help_text)
+    add("restart", "the saved target again, from the floor, with the ramp")
+    add("reload", "the daemon and playback")
+    add("rw", "make / writable")
+    add("ro", "make / read-only again")
+
+    boot = add("boot", "what plays next boot")
+    boot.add_argument("what", nargs="?", default=None, metavar="WHAT",
+                      help="now | on | off | station | playlist | album | track")
+    boot.add_argument("target", nargs="?", default=None, metavar="TARGET",
+                      help="the stream, list, album or track")
+    boot.add_argument("strings", nargs="*", default=[], metavar="STRING",
+                      help="title, artist, album: what a track row shows once playing")
+
+    play = add("play", "play it now; the next boot is unchanged")
+    play.add_argument("what", nargs="?", default=None, metavar="WHAT",
+                      choices=("station", "playlist", "album", "track"),
+                      help="what to play; empty plays the source the record holds")
+    play.add_argument("target", nargs="?", default=None, metavar="TARGET")
+    play.add_argument("strings", nargs="*", default=[], metavar="STRING",
+                      help="title, artist, album: what the row shows once playing")
+
+    level = add("level", "cliamp's own dB, one control")
+    level.add_argument("value", nargs="?", default=None, metavar="VALUE",
+                       help="an absolute dB, now, up or down")
+    level.add_argument("amount", nargs="?", default=None, metavar="dB")
+
+    audio = add("audio", "show or switch the output")
+    audio.add_argument("want", nargs="?", default=None, choices=("jack", "dac"))
+
+    reset = add("reset", "/data back to what the build seeded")
+    reset.add_argument("--yes", action="store_true")
+    return parser
+
+
+def main(argv=None, out=None, conf_path=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    out = out or sys.stdout
+    parser = build_parser()
+    args = parser.parse_args(argv or ["status"])
+    command = args.command
+
+    if needs_root(command, getattr(args, "want", None)) and os.geteuid() != 0:
+        if not os.environ.get("STREAMER_SUDO"):
+            sys.stderr.write("%s needs root: re-running with sudo\n" % command)
+            env = dict(os.environ, STREAMER_SUDO="1")
+            os.execvpe("sudo", ["sudo", "-E", sys.argv[0]] + argv, env)
+
+    app = Appliance(conf_path)
+    show = Show(app, out)
+    play = Play(app, out)
+    level = Level(app, out)
+    boot = NextBoot(app, out)
+    box = Box(app, out)
+
+    if command == "status":
+        show.now()
+        return boot.show()
+    if command in ("now", "boots", "stations"):
+        return getattr(show, command)() or 0
+    if command == "boot":
+        if args.what is None:
+            return boot.show()
+        if args.what == "now":
+            return boot.now()
+        if args.what in ("on", "off"):
+            return boot.mode(args.what)
+        return boot.target(args.what, args.target, args.strings)
+    if command == "play":
+        if args.what is None:
+            return play.last()
+        return play.target(args.what, args.target, args.strings)
+    if command == "level":
+        if args.value in (None, "now"):
+            return level.now()
+        return level.set(args.value, args.amount)
+    if command == "audio":
+        return box.audio(args.want) or 0
+    if command == "reset":
+        return box.reset(args.yes) or 0
+    if command in ("restart", "reload", "rw", "ro"):
+        return getattr(box, command)() or 0
+    if command in TRANSPORT:
+        return play.transport(TRANSPORT[command])
+    if command == "log":
+        subprocess.run(("journalctl", "-u", "streamer-cliamp.service",
+                        "-u", "streamer-play.service",
+                        "-u", "streamer-http.service", "-b", "--no-pager"))
+        return 0
+    parser.print_help(out)
+    sys.stderr.write("unknown command: %s\n" % command)
+    return 2
+
+
+def needs_root(command, argument):
+    if command == "audio":
+        return bool(argument)
+    return command in NEEDS_ROOT
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (PlayerError, IpcError, NoTarget, KnobError, ValueError,
+            subprocess.CalledProcessError) as exc:
+        sys.stderr.write("%s\n" % exc)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)

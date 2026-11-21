@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""streamer-capture - hear the level a person sets outside the appliance.
+
+The Omarchy panel's volume slider sends the `volume` operation straight to the
+player's socket: no CLI verb runs on the card, and cliamp does not persist its
+dB, so a level this unit does not hear is a level the next boot loses. It
+subscribes to the daemon's `runtime.state` stream once and writes the record
+when the level it reports differs from the record's - on change, never on a
+timer.
+
+Exits non-zero when the stream ends: a daemon restarting or its socket going
+away is transient, and the unit's Restart=always reconnects.
+"""
+
+import sys
+
+from streamer.app import Appliance
+from streamer.capture import follow, level_events
+from streamer.conf import KnobError
+
+
+def main():
+    try:
+        app = Appliance()
+    except KnobError as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 1
+    follow(app, level_events(app.conf.cliamp))
+    sys.stderr.write("the player's event stream ended\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

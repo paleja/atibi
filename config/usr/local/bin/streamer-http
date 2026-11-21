@@ -9,10 +9,11 @@ Design rules this file keeps to, and why:
 
 - The server holds no state of its own: playback facts live in the cliamp
   daemon, read and written over its IPC socket; boot intent lives in the
-  appliance state file and is written ONLY by shelling out to `streamer
-  station|playlist|mode`, never by touching the file. That keeps one writer
-  for the file, keeps boot.log honest, and keeps streamer-play's floor and
-  ramp unbypassable from a phone.
+  appliance state file and is written through the shared library's intent
+  writers - the same two calls the command makes - never by the server touching
+  the file. That keeps one writer for the record, keeps boot.log honest, and
+  keeps the boot's floor and ramp unbypassable from a phone: nothing on the page
+  can start audio, and nothing on the page can decide a level on its own.
 - cliamp IPC version 2, newline-delimited JSON over the daemon's Unix socket:
   the same protocol `cliamp remote` uses. One connection per request under
   one lock keeps that traffic ordered with no reconnect logic, and requests
@@ -30,7 +31,6 @@ Environment overrides (used by the test suite; systemd sets none):
   STREAMER_HTTP_PORT  TCP port               (default streamer.conf, then 8077)
   STREAMER_HTTP_TOKEN token file path        (default streamer.conf, then <data>/streamer/http.token)
   STREAMER_CLIAMP_SOCKET  the daemon socket  (default $HOME/.config/cliamp/cliamp.sock)
-  STREAMER_EXECUTABLE the streamer command   (default /usr/local/bin/streamer)
   STREAMER_HTTP_PIDFILE   write our pid here (test harness only; setsid detaches)
   STREAMER_HTTP_TEST_NO_LISTEN  print the config and exit 0 (packaging checks)
   STREAMER_RADIO_SIZE     how many similar songs the radio offers (streamer.conf, then 50)
@@ -55,9 +55,18 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from streamer.app import Appliance
+from streamer.intent import (NoTarget, parse_target, record_level, record_mode,
+                             record_now, record_target)
+
 CONF_PATH_DEFAULT = "/etc/streamer.conf"
 IPC_LOCK = threading.Lock()
 PROVIDERS_CACHE = {"at": 0.0, "data": []}
+# The appliance this server writes through: knobs, record, log and player from
+# the library, built once at start. The three routes that decide anything reach
+# for this and nothing else: the record has one writer, and the page reaches it
+# the same way the command does, so neither can grow its own idea of the format.
+APP = None
 
 
 def read_conf(path):
@@ -97,8 +106,6 @@ class Config:
         self.socket_path = os.environ.get(
             "STREAMER_CLIAMP_SOCKET",
             os.path.join(home, ".config", "cliamp", "cliamp.sock"))
-        self.streamer = os.environ.get("STREAMER_EXECUTABLE",
-                                       "/usr/local/bin/streamer")
         # The player's own command, for the one thing the IPC snapshot cannot answer
         # (see live_volume). Absolute rather than looked up: this server should not
         # find a different cliamp than the daemon it is controlling.
@@ -239,55 +246,22 @@ def ipc_op(operation, params=None):
     return job.get("result", {})
 
 
-# --- the appliance side: boot intent goes through streamer, never around it ---
-
-def run_streamer(*args):
-    try:
-        out = subprocess.run([CFG.streamer, *args], capture_output=True,
-                             text=True, timeout=30)
-    except OSError as exc:
-        raise IpcError("streamer: %s" % exc) from exc
-    if out.returncode != 0:
-        raise IpcError((out.stderr or out.stdout or "streamer failed").strip())
-    return (out.stdout or "").strip()
-
-
-# The level the player is at, which the IPC snapshot cannot answer.
-VOLUME_KEY = re.compile(r'"volume": *(-?\d+(?:\.\d+)?)')
+# --- the appliance side: the record and the level, through the library -------
 
 
 def live_volume():
-    try:
-        out = subprocess.run([CFG.cliamp, "status", "--json"],
-                             capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    hit = VOLUME_KEY.findall(out.stdout or "")
-    if not hit:
-        return None
-    value = float(hit[-1])
-    # Whole numbers stay whole: they are printed next to the word dB, and
-    # "-12.0 dB" on a phone is a decimal nobody asked for.
-    return int(value) if value == int(value) else value
+    """The level the player is at, which the IPC snapshot cannot answer.
+
+    The library's reader: one json.loads on `cliamp status --json`, which
+    pretty-prints and repeats some keys - a line-based extractor that assumed
+    compact JSON was a known failure mode here, and it is gone.
+    """
+    return APP.player.level()
 
 
 def read_intent():
-    state_path = None
-    conf = read_conf(os.environ.get("STREAMER_CONF", CONF_PATH_DEFAULT))
-    data = conf.get("STREAMER_DATA", "/data")
-    state_path = conf.get("STREAMER_STATE", data + "/streamer/state")
-    state_path = state_path.replace("$STREAMER_DATA", data)
-    intent = {"mode": "", "kind": "", "target": "", "provider": "", "volume": "",
-              "title": ""}
-    try:
-        with open(state_path, encoding="utf-8") as f:
-            for line in f:
-                k, _, v = line.strip().partition("=")
-                if k in intent:
-                    intent[k] = v
-    except FileNotFoundError:
-        pass
-    return intent
+    """The record, with the shipped defaults filled in: what a reboot loads."""
+    return APP.read_record()
 
 
 # --- Tidal radio ---------------------------------------------------------------
@@ -503,54 +477,6 @@ def radio_of(snap):
     return ""
 
 
-def boot_target(snap):
-    """`streamer remember`'s own arguments, for whatever the player is on.
-
-    The list name wins when the player has one, because the thing a reboot
-    should bring back is the list, not the row it happens to have reached:
-    a list name is loadable, a row id in the middle of it is not. Only
-    names the streamer command can spell are accepted (CFG.providers), and
-    anything that has no such name falls back to the playing row: an album
-    or track row through its provider, a stream by its URL. Rows whose path
-    is a file on the card are refused outright — the boot cannot reach
-    anything by that path.
-    """
-    label = str(snap.get("playlist") or "")
-    hit = LIST_ALBUM.match(label)
-    if hit and hit.group(1) in CFG.providers:
-        return ["album", "%s:%s" % (hit.group(1), hit.group(2))]
-    hit = LIST_PROVIDER.match(label)
-    if hit and hit.group(1) in CFG.providers:
-        return ["playlist", "%s:%s" % (hit.group(1), hit.group(2))]
-    if label and ":" not in label:
-        # A playlist saved on the card: `streamer playlist <name>` and
-        # streamer-play's own playlist branch use that name as cliamp does.
-        return ["playlist", label]
-    for key in ("logical_track", "track"):
-        row = snap_row(snap, key)
-        path = str(row.get("path", ""))
-        hit = ALBUM_ROW.match(path)
-        if hit and hit.group(1) in CFG.providers:
-            meta = row.get("provider_meta") or {}
-            album = str(meta.get("albumID") or hit.group(2))
-            return ["album", "%s:%s" % (hit.group(1), album)]
-        hit = TRACK_ROW.match(path)
-        if hit and hit.group(1) in CFG.providers:
-            tid = str((row.get("provider_meta") or {}).get(
-                "%s.id" % hit.group(1)) or hit.group(2))
-            # The display strings come from the row the player is holding: cliamp 2.4.1
-            # has no fetch-a-track-by-id call, so they are all the boot will have. Empty
-            # ones are passed on purpose, so a row without an artist cannot inherit the
-            # previous track's.
-            return ["track", "%s:%s" % (hit.group(1), tid),
-                    str(row.get("title", "")),
-                    str(row.get("artist", "")),
-                    str(row.get("album", ""))]
-        if path.startswith("http://") or path.startswith("https://"):
-            return ["station", path]
-    raise IpcError("nothing playing that the next boot could reach")
-
-
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "streamer-http/1"
@@ -731,11 +657,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._json_out({"ok": False, "error": "value must be a dB number"}, 400)
                 return
-            # Not a bare volume call: the level is remembered as well as set, and
-            # only the streamer command may write that down. It reads the level back
-            # from the player, so a floor or ceiling the player enforces is what gets
-            # saved, not what the slider happened to show.
-            self._json_out({"ok": True, "streamer": run_streamer("vol", repr(db))})
+            # Set through the socket, remembered through the appliance, and read
+            # back rather than trusted: cliamp clamps to the volume_min in
+            # /data/cliamp/config.toml and to +6, and what it settled at is what
+            # the next boot aims at. A level at or below the boot floor is a
+            # parked control, so the saved level carries on instead.
+            ipc_op("volume", {"value": db})
+            record_level(APP)
+            self._json_out({"ok": True, "level": APP.player.level()})
             return
         if path == "/api/op/seek":
             try:
@@ -811,47 +740,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json_out({"ok": True})
             return
         if path == "/api/intent":
-            # Straight to the streamer command: the only sanctioned writer of
-            # the intent file, sudo escalation and boot.log entry included. The
-            # --save below is what makes a verb that plays also record: without
-            # it, it plays and says nothing about the next boot.
+            # The boot tab's decision: what plays next boot, and nothing about
+            # what is playing now. Written through the appliance, the same writer
+            # the command uses, which is also the only writer of boot.log: the
+            # page cannot grow its own idea of the record's shape, and a tapped
+            # row that already started its music is never restarted from here.
             kind = body.get("kind")
             target = str(body.get("target", ""))
-            if kind == "station":
-                if not target.startswith(("http://", "https://")):
-                    self._json_out({"ok": False,
-                                    "error": "station target must be http(s)"}, 400)
-                    return
-                out = run_streamer("station", "--save", target)
-            elif kind == "playlist":
-                if not target:
-                    self._json_out({"ok": False, "error": "playlist name required"}, 400)
-                    return
-                out = run_streamer("playlist", "--save", target)
-            elif kind == "mode":
-                if target not in ("last", "stop"):
-                    self._json_out({"ok": False, "error": "mode last|stop"}, 400)
-                    return
-                out = run_streamer("mode", target)
-            else:
-                self._json_out({"ok": False,
-                                "error": "kind station|playlist|mode required"}, 400)
+            try:
+                if kind == "mode":
+                    if target not in ("last", "stop"):
+                        raise ValueError("mode last|stop")
+                    saved = record_mode(APP, target == "last")
+                else:
+                    fields = parse_target(kind, target, APP.conf.providers)
+                    saved = record_target(APP, fields)
+            except (ValueError, NoTarget) as exc:
+                self._json_out({"ok": False, "error": str(exc)}, 400)
                 return
-            self._json_out({"ok": True, "streamer": out,
-                            "intent": read_intent()})
+            self._json_out({"ok": True, "intent": saved})
             return
         if path == "/api/boot/now":
-            # The page's "use the now playing" button: make what plays now what plays
-            # next boot. Nothing else on the page does that. The card works out the shape
-            # (see boot_target), so the page asks one dumb question instead of guessing
-            # whether the row on screen is a list, an album, a track or a stream. The
-            # answer goes to `streamer remember` - the verb that writes the boot intent
-            # without restarting playback, since restarting here would mean a second start
-            # and a trip back to the volume floor in the middle of a track.
-            argv = boot_target(ipc("state.get").get("snapshot", {}))
-            out = run_streamer("remember", *argv)
-            self._json_out({"ok": True, "streamer": out,
-                            "intent": read_intent()})
+            # The page's "use the now playing" button: next boot = what is playing
+            # now. The card works out the shape - the snapshot's playlist label
+            # decides whether that is a service list, an album, a list saved on
+            # the card or a single row - so the page asks one dumb question
+            # instead of guessing, and the level is captured in the same breath.
+            try:
+                saved = record_now(APP)
+            except NoTarget as exc:
+                self._json_out({"ok": False, "error": str(exc)}, 409)
+                return
+            self._json_out({"ok": True, "intent": saved})
             return
         if path == "/api/radio/queue":
             # Extend the live queue with the similar songs. Read from Tidal again
@@ -1333,15 +1253,17 @@ start();
 
 
 def main():
+    global APP
     if pidfile := os.environ.get("STREAMER_HTTP_PIDFILE"):
         # setsid detaches this process, and only its pid can kill it then. The
         # test harness asks for one; systemd never sets this knob.
         with open(pidfile, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()) + "\n")
     if os.environ.get("STREAMER_HTTP_TEST_NO_LISTEN"):
-        print("port=%d token=%s socket=%s streamer=%s" %
-              (CFG.port, CFG.token_path, CFG.socket_path, CFG.streamer))
+        print("port=%d token=%s socket=%s" %
+              (CFG.port, CFG.token_path, CFG.socket_path))
         return 0
+    APP = Appliance()
     CFG.token()   # makes the token on the first run, and says so in the journal
     server = http.server.ThreadingHTTPServer(("0.0.0.0", CFG.port), Handler)
     print("streamer-http: token-guarded, on :%d, player socket %s" %

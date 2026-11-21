@@ -17,16 +17,25 @@ resized or repaired on the card.
 - `image/fstab-ro.awk` — makes root and boot read-only in `/etc/fstab`. A
   separate file so the suite can run it against the fstab a real card shipped.
 - `config/` — the payload, in the shape of the root filesystem:
-  `etc/streamer.conf` (every knob, sourced by everything else),
+  `etc/streamer.conf` (every knob, sourced by `streamer-daemon` and parsed by
+  `streamer.conf`, which turns a missing or mistyped one into an error naming it),
   `etc/systemd/system/` (`streamer-cliamp` the player daemon, `streamer-play`
-  the boot-time play, `streamer-http` the LAN control server,
-  `streamer.target` tying them together), `etc/streamer/audio-{jack,dac}.txt`
+  the boot-time play, `streamer-capture` the level listener, `streamer-http` the
+  LAN control server, `streamer.target` tying them together), `etc/streamer/audio-{jack,dac}.txt`
   (the two audio setups, spliced into the marked block at the end of `config.txt`),
-  `boot/appliance-config.txt` (appended to `/boot/firmware/config.txt`), and
-  `usr/local/bin/`: `streamer` (the command people use over SSH, and the only
-  writer of what plays next boot and how loud), `streamer-daemon` (starts the
-  player, never playback), `streamer-play`, `streamer-bootlog` (the one durable
-  log-line writer), `streamer-http`.
+  `boot/appliance-config.txt` (appended to `/boot/firmware/config.txt`),
+  `usr/local/lib/python3.13/dist-packages/streamer/` — the shared library every
+  entry point uses: `conf` (the knobs), `state` (the boot record: read, atomic
+  commit), `app` (one run's knobs, record, log, player), `ipc` (the daemon's
+  socket, one implementation of version 2), `player` (the operations, one per
+  kind of target), `intent` (the record's only writers, and the snapshot-to-record
+  mapping), `net` + `boot` + `ramp` (the boot's waits, its floor and its climb),
+  `log` (boot.log, append-and-trim under a flock), `capture` (the daemon's event
+  stream, and the level the panel sets with it), and `usr/local/bin/`:
+  `streamer` (the command people use over SSH), `streamer-play` (the boot entry,
+  a thin call onto `streamer.boot`), `streamer-capture` (the level listener),
+  `streamer-daemon` (starts the player, never playback — still /bin/sh, it pins
+  the DAC's codec volume with `amixer`), `streamer-http`.
 - Things `build.sh` writes with no file here: fstab edits, volatile journald
   config, hostname/timezone, `authorized_keys`, a fresh machine-id and SSH host
   keys, the passwordless-sudoers drop-in, the NetworkManager resolv.conf hand-off,
@@ -92,27 +101,37 @@ listener last chose, at the level they last set.
 
 Break one of these and a test should say so.
 
-- `/data/streamer/state` (`mode`/`kind`/`target`, plus `provider=`/`volume=`)
-  has exactly one writer: the `streamer` command, when a person changes something.
-  What plays next boot is decided only by `streamer remember` — the page reaches
-  it through the boot tab's "use the now playing" button (`/api/boot/now` →
-  `streamer remember`) and through `/api/intent`, which passes `--save` — and by
-  `--save` on `station|playlist|album|track`. Without `--save` those four play and
-  write nothing to the card: the request rides in `$STREAMER_PLAY_NOW`, a
-  key=value file under `/run` (tmpfs), which the play unit reads, plays and
-  unlinks. Saved on change, never on a timer — that is what keeps it an intent,
-  and what keeps the floor, the ramp and boot.log unavoidable.
-- Only `streamer-play` starts audio, the saved record and the one-shot request
-  both included: the daemon holds the IPC socket and sits at the floor, and the
-  ramp and its three guards (a level that will not move, a step budget that fits
-  the boot budget, a level set elsewhere winning over the boot's own climb) live
-  in that script.
+- `/data/streamer/state` (`mode`/`kind`/`target`, plus `provider=`/`volume=` and
+  the track's `title`/`artist`/`album`) has exactly one writer: the library's
+  intent module — `streamer.intent.record_now|record_target|record_mode|record_level`,
+  which commit through `streamer.state.Record` (atomic replace, file and
+  directory fsync) and write boot.log in the same breath. The command's verbs
+  and the page's two write routes (`/api/boot/now`, `/api/intent`) call those
+  functions and nothing else, so there is one writer for the record without
+  the server having to shell out to the CLI. Written when a person changes
+  something, never on a timer — that is what keeps it an intent.
+- Playing and recording are separate verbs and neither implies the other:
+  `streamer play <what> <target>` plays through the daemon's socket and writes
+  nothing to the card; `streamer boot <what> <target>` writes the record and
+  touches nothing that is playing — a tapped playlist has already started its
+  music, and a start on top of it would mean a second start and a trip back to
+  the floor mid-track. `streamer stop` stops and says nothing about the next
+  boot; `streamer boot off` is the sentence that means quiet after a reboot.
+  The `/run` one-shot request file and the `--save` flag existed only to let a
+  play verb reach `streamer-play` without writing the record, and both are gone.
+- `streamer-play` is the only thing that starts audio at boot and the only thing
+  that ramps: the daemon holds the IPC socket and starts at `--vol=$STREAMER_VOL_FLOOR`,
+  and the waits, the floor, the ramp and its three guards (a level that will not
+  move, a step budget that fits the boot budget, a level set elsewhere winning
+  over the boot's own climb) live in `streamer.boot` and `streamer.ramp`, which
+  that unit calls and nothing else does.
 - The level is read back from the player, never recorded from what was asked
-  for: what cliamp settled at is what the next boot aims at. `streamer remember`
-  re-reads it along with the source.
-- `streamer remember <what> <target>` records intent without touching playback:
-  a tapped playlist has already started the music, and a plain play command on
-  top would mean a second start and a trip back to the floor mid-track.
+  for: cliamp clamps to its own `volume_min` and +6, and does not persist its
+  dB at all — `/data/cliamp/resume.json` holds path and position only (2026-11-21)
+  — so the record is the level's only home and `volume=` is a cache of the
+  player, refreshed whenever the appliance writes the record. A level at or below
+  the boot floor is a parked control, so it is not remembered: that is also how
+  a fresh daemon cannot pin the floor.
 - A streaming-service playlist is `kind=provider` and boots through
   `provider.load`; `cliamp load` only resolves lists saved on the card.
   `provider.load` starts playing, so the boot starts row 0 only if the player
@@ -124,16 +143,25 @@ Break one of these and a test should say so.
   NTP makes every TLS handshake fail as *certificate is not yet valid*.
   `Restart=on-failure` is the backstop for transients, not the designed path.
 - What a reboot should load is worked out on the card, not in the page:
-  `boot_target()` maps the snapshot's `playlist` label onto the right
-  `streamer remember` verb. A row's path is a fallback, never the first choice:
-  guessing here boots to silence.
+  `boot_fields()` in `streamer.intent` maps the snapshot's `playlist` label onto
+  the record's fields, and `streamer boot now` and `/api/boot/now` are that one
+  call. A row's path is a fallback, never the first choice: guessing here boots
+  to silence.
 - journald is volatile on purpose. `/data/streamer/boot.log` is the durable
-  record: `streamer-bootlog` is its only writer, append-and-trim under a flock
-  on the log file itself, and it keeps working when a boot loop retries over
-  its own earlier attempts. `streamer boots` reads it back.
+  record: `streamer.log.BootLog` is its only writer — no separate writer
+  executable any more — append-and-trim under a flock on the log file itself,
+  and it keeps working when a boot loop retries over its own earlier attempts.
+  `streamer boots` reads it back.
 - The payload ships its own tools and reaches for nothing else: every program a
   unit names and every interpreter a payload script declares is checked against
-  what the image actually ships.
+  what the image actually ships. The payload is python3 except `streamer-daemon`
+  (/bin/sh, it pins the DAC trim with `amixer`), and its shared library installs
+  in `/usr/local/lib/python3.13/dist-packages` — the directory the card's own
+  interpreter looks in first (checked 2026-11-21), and the build refuses a base
+  image whose stdlib is another minor version. Byte-code is baked only when the
+  build host has that same minor version: the root is read-only, so a card can
+  never write a `__pycache__`, and an unbaked tree pays the parse every boot —
+  measured at 100 ms for `import streamer.boot` on the card, inside the budget.
 - **The page has no sentences.** Grey means cannot act now (the radio tab for a
   row whose provider has no similar songs; its two actions before there is an
   answer), green means on (the open tab, a mode that is on). The only green row

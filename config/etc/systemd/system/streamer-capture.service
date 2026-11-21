@@ -1,0 +1,25 @@
+[Unit]
+Description=Remember a level set on the player outside the appliance
+Documentation=file:/etc/streamer.conf
+# Ordering, not a requirement: the subscription begins once this boot's play has
+# finished ramping, so the climb's own steps are not each remembered as a choice.
+After=streamer-play.service
+RequiresMountsFor=/data
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+Environment=HOME=/home/pi
+Environment=LANG=C.UTF-8
+ExecStart=/usr/local/bin/streamer-capture
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=streamer-capture
+
+[Install]
+WantedBy=streamer.target
