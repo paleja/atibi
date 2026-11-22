@@ -860,6 +860,17 @@ cat >"$R/etc/NetworkManager/conf.d/10-ro-root.conf" <<'EOF'
 rc-manager=symlink
 EOF
 ln -sfn /run/NetworkManager/resolv.conf "$R/etc/resolv.conf"
+#   timesyncd      the stock retry backoff lands the first sync at boot+35 s no
+#     matter how near the server is; and the Debian pool rotates regions boot to
+#     boot. The zoneless pool resolves to the client's own country zone, which
+#     is the right server wherever the card is; the short retry then makes the
+#     DHCP lease, not a timer, decide when the clock lands.
+install -d -m 755 "$R/etc/systemd/timesyncd.conf.d"
+cat >"$R/etc/systemd/timesyncd.conf.d/10-atibi.conf" <<'EOF'
+[Time]
+NTP=0.pool.ntp.org 1.pool.ntp.org 2.pool.ntp.org 3.pool.ntp.org
+ConnectionRetrySec=5
+EOF
 # Three vendor tmpfiles.d entries re-assert every boot rather than create when missing,
 # so they hit the read-only wall and log errors even though what they want is already
 # true on the card:
@@ -1080,7 +1091,10 @@ reslink=$(debugfs -R 'stat /etc/resolv.conf' "${LOOP}p2" 2>/dev/null || true)
     die "/etc/resolv.conf in the image is not a symlink: the vendor's static file survived, so NM's answer would never be read"
 [ "$(printf '%s\n' "$reslink" | grep -c 'Fast link dest: "/run/NetworkManager/resolv.conf"')" -eq 1 ] ||
     die "/etc/resolv.conf in the image does not point at NetworkManager's /run file"
-log "  vendor tmpfiles edits, logrotate off, NM hand-off: read back from the image"
+tconf=$(debugfs -R 'cat /etc/systemd/timesyncd.conf.d/10-atibi.conf' "${LOOP}p2" 2>/dev/null || true)
+printf '%s\n' "$tconf" | grep -q '^NTP=0.pool.ntp.org' ||
+    die "the image does not pin the timesyncd server pool"
+log "  vendor tmpfiles edits, logrotate off, NM hand-off, NTP pool: read back from the image"
 
 # The data partition's filesystem was made, seeded, checked and stamped a few minutes
 # ago; here it is only read back, to prove the splice landed where the partition table
