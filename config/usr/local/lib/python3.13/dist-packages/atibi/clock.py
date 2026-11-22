@@ -4,11 +4,10 @@
 date, so every boot starts months behind until NTP lands (ADR-000).
 """
 
-import os
 import subprocess
 import time
 
-from atibi import own
+from atibi import save
 
 
 def read(path):
@@ -35,28 +34,7 @@ def keep(path, user="", group="", now=None):
     """
     if now is None:
         now = time.time
-    directory = os.path.dirname(path)
-    try:
-        os.makedirs(directory, exist_ok=True)
-        tmp = "%s.tmp" % path
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write("%d\n" % int(now()))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, path)
-        try:
-            dirfd = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(dirfd)
-            finally:
-                os.close(dirfd)
-        except OSError:
-            pass
-        own(path, user, group)
-    except OSError:
-        return False
-    return True
+    return save(path, "%d\n" % int(now()), user, group)
 
 
 def set_epoch(epoch):

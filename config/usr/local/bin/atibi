@@ -27,6 +27,9 @@ LAN page. One verb per thing, and the verbs that decide do not overlap:
   atibi restart              the saved target again, from the floor, with the ramp
   atibi reload               the daemon and playback
   atibi audio [jack|dac]     show or switch the output, then reboot
+  atibi network [static|dhcp]
+                             hold eth0's address across reboots, or hand it
+                             back to DHCP; either way, then reboot
   atibi rw | ro              make / writable, then read-only again
   atibi reset --yes          /data back to what the card was built with
 
@@ -41,9 +44,10 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 
-from atibi import num, own
+from atibi import net, num, own
 from atibi.app import Appliance
 from atibi.conf import KnobError
 from atibi.ipc import IpcError
@@ -55,6 +59,8 @@ CONF_PATH = "/etc/atibi.conf"
 AUDIO_BEGIN = "# --- atibi audio begin ---"
 AUDIO_END = "# --- atibi audio end ---"
 BOOT_UNITS = ("atibi-cliamp.service", "atibi-play.service")
+# The pause a typed reboot is announced with: long enough to walk away from.
+REBOOT_SECONDS = 10
 
 # The transport verbs, spelled as the operations they send. `stop` stops and
 # says nothing about the next boot: staying quiet after a reboot is `boot off`.
@@ -334,6 +340,94 @@ class Box:
     def reload(self):
         self.systemctl("restart", *BOOT_UNITS)
 
+    def reboot_in(self, seconds):
+        """Count a reboot down, so Ctrl+C on the terminal is the way to say
+        no. The change is already written when the countdown starts, so
+        cancelling costs nothing but the reboot: it comes at the next one.
+        Without a terminal there is no one to cancel, so there is no reboot:
+        this box must not stop the music at a moment nobody chose.
+        """
+        try:
+            interruptible = self.out.isatty()
+        except AttributeError:
+            interruptible = False
+        if not interruptible:
+            self.out.write("takes effect at the next reboot\n")
+            return 0
+        try:
+            for left in range(seconds, 0, -1):
+                self.out.write("this box reboots in %d s "
+                               "(Ctrl+C to cancel: the change stays)\r" % left)
+                self.out.flush()
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.out.write("\ncountdown cancelled: the change stays and comes at"
+                           " the next reboot\n")
+            return 0
+        self.systemctl("--no-block", "reboot")
+        return 0
+
+    def network(self, want):
+        """eth0's address: DHCP's answer to a request, or the address this
+        appliance saved. Static is a promise about where the box lives, so it
+        is said by hand, and undoing it is one command back."""
+        path = self.app.conf.static_profile
+        numbers = net.lease()
+        if want is None:
+            if not numbers:
+                self.out.write("no route yet: nothing to say about eth0\n")
+                return 0
+            self.out.write("eth0 %s/%s via %s, resolving at %s: from %s\n"
+                           % (numbers["address"], numbers["prefix"],
+                              numbers["gateway"], numbers["dns"],
+                              numbers["source"]))
+            if os.path.exists(path):
+                self.out.write("saved in %s; back to DHCP: atibi network dhcp\n"
+                               % path)
+            else:
+                self.out.write("nothing saved; to hold this address:"
+                               " atibi network static\n")
+            return 0
+        if want == "dhcp":
+            saved = os.path.exists(path)
+            if not net.clear(path):
+                raise PlayerError("cannot remove %s" % path)
+            if not saved:
+                self.out.write("nothing was saved; eth0 answers to %s\n"
+                               % numbers.get("source", "unknown"))
+                return 0
+            self.app.bootlog.note("eth0 back to DHCP, rebooting")
+            self.out.write("%s is gone: DHCP answers for eth0 again\n" % path)
+            return self.reboot_in(REBOOT_SECONDS)
+        if want == "static":
+            if not numbers:
+                raise PlayerError("no address to save: this boot has no route yet")
+            body = net.profile(numbers)
+            if os.path.exists(path):
+                try:
+                    same = open(path, encoding="utf-8").read() == body
+                except OSError:
+                    same = False
+                if same:
+                    self.out.write("eth0 already holds that address: %s\n" % path)
+                    self.out.write("back to DHCP: atibi network dhcp\n")
+                    return 0
+            if not net.write(path, numbers, self.app.conf.user,
+                             self.app.conf.group):
+                raise PlayerError("cannot write %s: /data says no" % path)
+            self.app.bootlog.note("eth0 pinned to %s/%s via %s, rebooting"
+                                  % (numbers["address"], numbers["prefix"],
+                                     numbers["gateway"]))
+            self.out.write("eth0 will hold %s/%s, gateway %s, names at %s\n"
+                           % (numbers["address"], numbers["prefix"],
+                              numbers["gateway"], numbers["dns"]))
+            self.out.write("%s\n" % path)
+            self.out.write("back to DHCP: atibi network dhcp, or delete that file"
+                           " on the card\n")
+            self.out.write("the boot then waits for the kernel instead of your router's"
+                           " DHCP server\n")
+            return self.reboot_in(REBOOT_SECONDS)
+
     def rw(self):
         subprocess.run(("mount", "-o", "remount,rw", "/"), check=True)
         self.app.bootlog.note("/ made writable")
@@ -473,6 +567,10 @@ def build_parser():
     audio = add("audio", "show or switch the output")
     audio.add_argument("want", nargs="?", default=None, choices=("jack", "dac"))
 
+    network = add("network", "eth0's address: DHCP's answer, or one this box saved")
+    network.add_argument("want", nargs="?", default=None,
+                         choices=("static", "dhcp"))
+
     reset = add("reset", "/data back to what the build seeded")
     reset.add_argument("--yes", action="store_true")
     return parser
@@ -521,6 +619,8 @@ def main(argv=None, out=None, conf_path=None):
         return level.set(args.value, args.amount)
     if command == "audio":
         return box.audio(args.want) or 0
+    if command == "network":
+        return box.network(args.want) or 0
     if command == "reset":
         return box.reset(args.yes) or 0
     if command in ("restart", "reload", "rw", "ro"):
@@ -538,7 +638,7 @@ def main(argv=None, out=None, conf_path=None):
 
 
 def needs_root(command, argument):
-    if command == "audio":
+    if command in ("audio", "network"):
         return bool(argument)
     return command in NEEDS_ROOT
 

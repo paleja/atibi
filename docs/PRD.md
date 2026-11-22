@@ -146,6 +146,15 @@ RP-010196; gen4 has a shorter pre-Linux stage than gen5):
 | Headroom | 1.5 s |
 | **Total** | **≤ 10 s** |
 
+Measured, 2026-11-22 (journald monotonic, median of three cold boots, wired
+address held). Uptime, so add the ~2.5 s firmware stage above to get this
+section's power-on metric: the record is in play, at the floor, at +17.5 s
+held against +21.5 s with the lease, and at the level a person left it by
++21.1 s against +26.7 s. Not met; §13's ladder applies. The two floors found
+are the Pi's own device work (+10.6 s before an address exists at all) and
+the player daemon's own warm-up, which refuses a load asked 4 s after its
+socket answers and answers the same ask 2 s later.
+
 ### 6.1 EEPROM config
 - `BOOT_ORDER` restricted to the actual boot device only.
 - `NET_INSTALL_ENABLED=0`, `NET_INSTALL_AT_POWER_ON=0`.
@@ -163,10 +172,18 @@ RP-010196; gen4 has a shorter pre-Linux stage than gen5):
   appended. The `ro` here is intent, not the mechanism: fstab is the
   mechanism (§7).
 - No initramfs work: the image boots plain ext4, as the stock image does.
-- **Network units:** `atibi-cliamp` orders after `network-online.target`
-  (NetworkManager-wait-online is enabled, so this returns exactly when the
-  lease is in). A daemon started against plain `network.target` resolves
-  names before an address exists.
+- **Network units:** no payload unit orders on `network-online.target`:
+  that unit returns at the DHCP lease, measured at boot+18.8 s on the card's
+  LAN (and at +37 s once, when the router's server dawdled), and it cannot be
+  re-tuned. `atibi-play` waits for a route *and* a
+  resolver, bounded by `ATIBI_NET_WAIT`, and boot.log says which of the two
+  paths the boot used.
+- **The wired address can be held on the card.** `atibi network static`
+  saves the lease's four numbers as a NetworkManager profile at
+  `ATIBI_STATIC` on `/data`; atibi-static.service installs it where NetworkManager
+  reads it before it starts, so the boot meets the route at the interface's
+  own activation (+10.6 s) instead of the lease (+18.8 s). Absent profile:
+  DHCP, as above. docs/ADR-001-hold-the-wired-address-on-data.md.
 - **DNS follows the lease.** The vendor base image bakes a plain
   `/etc/resolv.conf` pointing at 8.8.8.8, which survives on a read-only root
   and breaks whenever that resolver is unreachable. The build replaces it

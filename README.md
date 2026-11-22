@@ -83,6 +83,7 @@ card you built.
     atibi stations            # what the built-in radio list offers
     atibi boot station <url>  # play this one from now on, next boot too
     atibi boot now            # next boot = what is playing now, level with it
+    atibi network static      # hold this box's wired address: no DHCP wait at boot
     atibi                     # status
 
 Transport, level, playlists and what to play next boot, the jack/dac audio

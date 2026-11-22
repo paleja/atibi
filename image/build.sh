@@ -618,6 +618,7 @@ enable() { # enable <unit> <target>
     log "  $1 -> $2"
 }
 enable atibi.target         multi-user.target
+enable atibi-static.service NetworkManager.service
 enable atibi-clock.service  atibi.target
 enable atibi-cliamp.service atibi.target
 enable atibi-play.service   atibi.target

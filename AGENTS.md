@@ -63,7 +63,10 @@ Pi 4 (Pi 5 bench-only: the DAC+ driver fails on Pi 5 kernels, Launchpad
 no Bluetooth. A `cliamp` daemon that comes up at every boot playing what the
 listener last chose, at the level they last set.
 
-- **Boot budget: 5 V applied → first audible sample ≤ 10 s.** 2.5 s firmware,
+- **Boot budget: 5 V applied → first audible sample ≤ 10 s.** Measure with
+  `journalctl -b -o short-monotonic` and `/proc/uptime` marks, not boot.log's
+  stamps: the carried clock lands and then NTP steps it, so a boot's own
+  timestamps can run backwards. 2.5 s firmware,
   1.5 s kernel+init, 2.5 s userspace to the play unit, 2.0 s cliamp ready plus
   buffer fill, 1.5 s headroom. Method: `systemd-analyze critical-chain`, one
   unit at a time, 5 cold boots per config, report the median. 
@@ -97,7 +100,24 @@ listener last chose, at the level they last set.
   `network-online.target`. On the card's LAN the lease is the floor — NM up
   +6.5 s, wired auto-activation +10.6 s, DHCP lease and routing +17.1 s
   (measured 2026-11-22) — so `ATIBI_NET_WAIT` has to exceed it, and the 10 s
-  budget is unreachable for a target that needs a route on that LAN.
+  budget is unreachable for a target that needs a route on that LAN. The
+  lease is the router's own latency and it varies boot to boot; the payload's
+  gate (a route AND a resolver) was seen opening at +17.9, +19.8 and +26.5 s
+  on three DHCP boots, which is what `atibi network static` removes.
+- **Two network paths, named in boot.log.** `atibi network static` writes the
+  live lease's numbers (`ATIBI_STATIC`, `/data/atibi/static-v4.conf`) as a
+  NetworkManager system-connection profile, and `atibi-static.service`
+  (`Before=`/`WantedBy=NetworkManager.service`) copies it to
+  `/run/NetworkManager/system-connections/atibi.nmconnection` at every boot, so
+  the interface comes up `proto static` and the boot's route wait costs nothing;
+  no file, exactly the DHCP path above. `atibi network dhcp` deletes it, `atibi
+  reset` clears it, and boot.log's `route from dhcp: ...` / `route from static:
+  ...` line is the durable record of which path played. Measured 2026-11-22
+  (three held boots, three DHCP, `/proc/uptime` marks): the gate opens at
+  +10.4-11.5 s held, +17.9-26.5 s on DHCP; the record is in play (at the
+  floor) at +17.5 s versus +21.5 s and at the saved level by +21.1 s versus
+  +26.7 s — a 4 s win at the first mark, not the 7 s the gate gap suggests,
+  because what is left is the daemon's warm-up and the provider list fetch.
 - `/data/bin` is first on the daemon's `PATH`, so a newer ffmpeg or cliamp can
   be dropped on the writable partition with the image copy as fallback.
   `atibi reset --yes` restores `/data` from `/usr/share/atibi/seed`, the
@@ -185,6 +205,22 @@ Break one of these and a test should say so.
   `atibi-http`, `json_num` in `atibi`, `pick` in `atibi-play`.
   `fake-ipc.py` leaves `volume` out of its snapshot for the same reason; put it
   back and the server is reading a key the card never sends.
+- `cliamp remote call provider.load --params '{"provider":…,"playlist":…,"index":0}'`
+  is refused **as bare `failed`, with nothing on `cliamp.log`**, ~4 s after the
+  daemon's socket first answers; the same ask 2 s later plays (2026-11-22).
+  Hence `ATIBI_LOAD_TRIES`/`ATIBI_LOAD_RETRY_AT` in `atibi.boot`, and why the
+  daemon must not wait for names itself: measured, that costs the DHCP path
+  7 s of first sound while gaining nothing on the static one.
+- NetworkManager 1.52.1 grammar, as the card accepts it (2026-11-22): a
+  conf.d `[connection-…]` section answers `unknown key` for `ipv4.method`
+  and friends; the file it reads is a **system-connection** file —
+  `[connection] id=… type=ethernet interface-name=eth0` then
+  `[ipv4] method=manual address=<a>/<len> gateway=<gw> dns=<ns>` — and it
+  must be mode 0600. `manual` is the word that stops the DHCP request
+  (`method=static` is not a method); a `[match]` section parses, loads, and
+  never binds: the profile shows in `nmcli connection show` with
+  `connection.interface-name: --`. `interface-name=` in `[connection]` is what
+  takes the device.
 - `cliamp status --json` pretty-prints with two-space indent and repeats some
   keys; fixtures answer the same way. Extractors that assume compact JSON are a
   known failure mode with a mutation entry guarding it.

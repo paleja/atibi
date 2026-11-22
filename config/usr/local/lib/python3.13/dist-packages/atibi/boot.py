@@ -98,9 +98,13 @@ class Boot:
             return FAILED
 
         # The route, not a unit's ordering: this is what the load call needs.
+        # A target with no hostname in it still gets fetched across DNS, so the
+        # wait is for a route AND a resolver: a route alone lets the load call
+        # off the card before names can be answered.
         host = net.host_of(target)
         if net.needs_network(kind, target):
-            ready = (lambda: net.resolved(host)) if host else net.routed
+            ready = (lambda: net.resolved(host)) if host else \
+                    (lambda: net.routed() and bool(net.resolver()))
             if not ready():
                 self.say("network not up yet, waiting up to %ss %s"
                          % (num(conf.net_wait),
@@ -117,6 +121,11 @@ class Boot:
                                  % num(conf.net_wait))
                         self.log("FAIL no network route for %s %s" % (kind, target))
                     return FAILED
+            answered = net.lease()
+            self.log("route from %s: %s/%s via %s, resolving at %s"
+                     % (answered.get("source", "unknown"),
+                        answered.get("address", ""), answered.get("prefix", ""),
+                        answered.get("gateway", ""), answered.get("dns", "nothing")))
 
         # The clock gates TLS, not the target's spelling: provider/album/track
         # rows are fetched over https too.
@@ -139,15 +148,29 @@ class Boot:
             self.log("FAIL volume floor %s" % num(conf.vol_floor))
             return FAILED
 
-        try:
-            self.app.player.start(kind, target, provider,
-                                   (fields.get("title", ""),
-                                    fields.get("artist", ""),
-                                    fields.get("album", "")))
-        except (PlayerError, ValueError) as exc:
-            self.say(str(exc))
-            self.log("FAIL %s" % exc)
-            return FAILED
+        # One ask is not the whole conversation: on the card, a load asked for
+        # 5 s after the daemon came up was refused with no reason in the daemon's
+        # log, while an ask 20 s after it was refused no more (checked 2026-11-22)
+        # -- what cleared in between is the daemon's own business. systemd's
+        # RestartSec would pay 15 s for the same second chance, so the boot
+        # takes it here.
+        tries = max(1, conf.load_tries)
+        while True:
+            try:
+                self.app.player.start(kind, target, provider,
+                                       (fields.get("title", ""),
+                                        fields.get("artist", ""),
+                                        fields.get("album", "")))
+                break
+            except (PlayerError, ValueError) as exc:
+                tries -= 1
+                if tries == 0:
+                    self.say("load failed: %s" % exc)
+                    self.log("FAIL %s" % exc)
+                    return FAILED
+                self.log("WARN load refused, %s tries left: %s"
+                         % (num(tries), exc))
+                self.sleep(conf.load_retry_at)
 
         if not wait_for(lambda: self.app.player.state() == "playing",
                         conf.play_wait, self.sleep, 0.5):
