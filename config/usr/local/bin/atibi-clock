@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""atibi-clock - set the clock forward to the stamp the last boot saved.
+
+A root unit, before the player units: atibi-play's account cannot set the
+clock, and by the time that account's boot entry runs, TLS has to be valid.
+"""
+
+import sys
+
+from atibi import clock
+from atibi.conf import Config, KnobError
+
+
+def main():
+    try:
+        conf = Config()
+    except KnobError as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 1
+    epoch = clock.hand_back(conf.clock_file)
+    if epoch is None:
+        print("nothing to restore: no saved clock ahead of this boot's")
+        return 0
+    print("boot clock set to the saved stamp (%s)" % epoch)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

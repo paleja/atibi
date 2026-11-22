@@ -89,8 +89,10 @@ class Config:
         self.play_wait = need("ATIBI_PLAY_WAIT", float)
         self.net_wait = need("ATIBI_NET_WAIT", float)
         self.sync_wait = need("ATIBI_SYNC_WAIT", float)
+        self.sync_hold = need("ATIBI_SYNC_HOLD", float)
         self.clock_flag = derived("ATIBI_TIME_SYNC_FLAG",
                                   "/run/systemd/timesync/synchronized")
+        self.clock_file = derived("ATIBI_CLOCK", self.data + "/atibi/clock")
         self.ramp_start = need("ATIBI_RAMP_START", float)
         self.ramp_step = need("ATIBI_RAMP_STEP", float)
         self.ramp_delay = need("ATIBI_RAMP_DELAY", float)

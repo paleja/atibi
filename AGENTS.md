@@ -29,13 +29,15 @@ resized or repaired on the card.
   commit), `app` (one run's knobs, record, log, player), `ipc` (the daemon's
   socket, one implementation of version 2), `player` (the operations, one per
   kind of target), `intent` (the record's only writers, and the snapshot-to-record
-  mapping), `net` + `boot` + `ramp` (the boot's waits, its floor and its climb),
+  mapping), `net` + `clock` + `boot` + `ramp` (the boot's waits, the clock
+  it carries across reboots, its floor and its climb),
   `log` (boot.log, append-and-trim under a flock), `capture` (the daemon's event
   stream, and the level the panel sets with it), and `usr/local/bin/`:
   `atibi` (the command people use over SSH), `atibi-play` (the boot entry,
   a thin call onto `atibi.boot`), `atibi-capture` (the level listener),
   `atibi-daemon` (starts the player, never playback — still /bin/sh, it pins
-  the DAC's codec volume with `amixer`), `atibi-http`.
+  the DAC's codec volume with `amixer`), `atibi-http`, `atibi-clock` (root,
+  hands the saved clock back before the player units).
 - Things `build.sh` writes with no file here: fstab edits, volatile journald
   config, hostname/timezone, `authorized_keys`, a fresh machine-id and SSH host
   keys, the passwordless-sudoers drop-in, the NetworkManager resolv.conf hand-off,

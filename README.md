@@ -55,7 +55,7 @@ sudo: start it from a terminal.
 
 Check the device name first; `dd` writes to whatever you give it.
 
-    sudo xz -dc output/atibi-jack-20261118.img.xz |
+    xz -dc output/atibi-jack-20261118.img.xz |
         sudo dd of=/dev/sdX bs=8M status=progress conv=fsync
 
 Raspberry Pi Imager works too: choose the `.xz` as a custom image.

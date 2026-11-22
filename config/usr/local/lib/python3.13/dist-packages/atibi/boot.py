@@ -12,7 +12,7 @@ by running into systemd's timeout.
 import sys
 import time
 
-from atibi import net, ramp
+from atibi import clock, net, ramp
 from atibi import num
 from atibi.ipc import IpcError
 from atibi.player import PlayerError
@@ -79,6 +79,8 @@ class Boot:
         fields = self.app.read_record()
         kind, target = fields["kind"], fields["target"]
         provider = fields.get("provider", "")
+        tls = target.startswith("https://") or kind in ("provider", "album",
+                                                        "track")
 
         if fields["mode"] == "stop":
             self.say("appliance is in stop mode, staying quiet")
@@ -117,12 +119,14 @@ class Boot:
                         self.log("FAIL no network route for %s %s" % (kind, target))
                     return FAILED
 
-        # An https target waits for the clock: a cold-boot clock behind NTP makes
-        # every TLS handshake fail as "certificate is not yet valid". Bounded,
-        # because with no NTP reachable the box should still try to play.
-        if target.startswith("https://"):
-            if not wait_for(lambda: net.clock_synced(conf.clock_flag),
-                            conf.sync_wait, self.sleep, 0.5):
+        # The clock gates TLS, not the target's spelling: provider/album/track
+        # rows are fetched over https too. The stamp the atibi-clock unit
+        # restored usually ends this wait at once; it stays bounded for the
+        # boot that has no stamp, or no NTP.
+        if tls:
+            trustworthy = lambda: (net.clock_synced(conf.clock_flag)
+                                   or clock.trusted(conf.clock_file))
+            if not wait_for(trustworthy, conf.sync_wait, self.sleep, 0.5):
                 self.say("clock not synchronized after %ss: https certificates"
                          " will be checked against the wrong date"
                          % num(conf.sync_wait))
@@ -155,7 +159,10 @@ class Boot:
             self.log("FAIL no playing state within %ss" % num(conf.play_wait))
             return FAILED
 
-        return self.ramp(fields, conf, kind, target)
+        status = self.ramp(fields, conf, kind, target)
+        if tls:
+            self.remember(conf)
+        return status
 
     def hello(self):
         try:
@@ -163,6 +170,15 @@ class Boot:
             return True
         except IpcError:
             return False
+
+    def remember(self, conf):
+        """Save the stamp in NTP's own words only, after the sound so it
+        costs the boot budget nothing: a stamp written from a merely restored
+        clock would rot by every gap between boots.
+        """
+        if wait_for(lambda: net.clock_synced(conf.clock_flag),
+                    conf.sync_hold, self.sleep, 0.5):
+            clock.keep(conf.clock_file, conf.user, conf.group)
 
     def ramp(self, fields, conf, kind, target):
         """Nothing jumps: the amp's relay is closed by now and a step is the one

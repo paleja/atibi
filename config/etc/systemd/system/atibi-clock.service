@@ -1,0 +1,15 @@
+[Unit]
+Description=Hand the saved wall clock back to the boot before NTP lands
+Documentation=file:/etc/atibi.conf
+RequiresMountsFor=/data
+Before=atibi-cliamp.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# No User=: setting the clock is beyond the appliance account.
+ExecStart=/usr/local/bin/atibi-clock
+TimeoutStartSec=10
+
+[Install]
+WantedBy=atibi.target
