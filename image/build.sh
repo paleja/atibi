@@ -860,11 +860,8 @@ cat >"$R/etc/NetworkManager/conf.d/10-ro-root.conf" <<'EOF'
 rc-manager=symlink
 EOF
 ln -sfn /run/NetworkManager/resolv.conf "$R/etc/resolv.conf"
-#   timesyncd      the stock retry backoff lands the first sync at boot+35 s no
-#     matter how near the server is; and the Debian pool rotates regions boot to
-#     boot. The zoneless pool resolves to the client's own country zone, which
-#     is the right server wherever the card is; the short retry then makes the
-#     DHCP lease, not a timer, decide when the clock lands.
+#   timesyncd      the zoneless pool resolves to the client's own country zone
+#     wherever the card is; the stock retry backoff outlasts the DHCP lease.
 install -d -m 755 "$R/etc/systemd/timesyncd.conf.d"
 cat >"$R/etc/systemd/timesyncd.conf.d/10-atibi.conf" <<'EOF'
 [Time]

@@ -1,28 +1,36 @@
 # atibi
 
-Purpose-built Raspberry Pi appliance image: a music streamer (cliamp on a Pi 4
-with an I2S DAC HAT) that comes back playing the chosen source, and survives 
-being unplugged without warning.
+A whole home music system you can build yourself, on one SD card: a
+Raspberry Pi image that is a finished appliance the moment you flash it
+— playing within seconds of power-on, and after any reboot back on its
+own with the source and the level you last saved, even when the power
+was pulled without warning.
 
-- Requirements and design decisions: [docs/PRD.md](docs/PRD.md)
+- **Streams** from Tidal, Qobuz and Spotify, from internet radio and from
+  your own files through cliamp — hi-res where the service has it — signed
+  in by you over SSH, because no password or token of yours is ever baked
+  into the image.
+- **Hi-Fi** out through an I2S DAC HAT (or the 3.5mm jack on the workbench),
+  rising from a quiet floor so a hard cut never wakes the amp at full volume.
+- **A control page** for anything on the LAN, and the **Omarchy bar
+  panel** (`omarchy-remote-cliamp`) on your desktop driving the same
+  appliance through one SSH tunnel.
+- **Reliable** by construction: root and boot are mounted read-only, and
+  the only partition ever written is `/data`.
+- **Yours to customise**: one config file of knobs, one command to build
+  your own card.
+
+- Requirements and design decisions, including how the desktop panel is
+  wired to the card: [docs/PRD.md](docs/PRD.md)
 - Repo layout and how to work on this codebase: [AGENTS.md](AGENTS.md)
 - License: MIT ([LICENSE](LICENSE)); what the finished card also carries from
   others: [docs/THIRD-PARTY.md](docs/THIRD-PARTY.md)
 
-Everything that has to be true when the card boots is written into the image at
-build time: no setup script, no resizing at boot, no first-run step. The card
-plays the first time it is powered on. The only thing you do after that is sign
-in to Tidal over SSH, because no password or token of yours ever goes into the
-image.
-
-Power-cut safety comes from the layout: the root and boot partitions are
-mounted read-only, and the only partition ever written is `/data`, which holds
-nothing but small files the player can do without. If the power goes out
-mid-write, the worst case is a dirty `/data` that fsck fixes at the next boot.
-
-On every boot music starts by itself, at a level that ramps up from a quiet
-floor so a hard power cut never wakes an amplifier at full volume, resuming
-whatever was playing when the power was last pulled.
+Everything that has to be true when the card boots is decided at build
+time: no setup script, no first-run step, nothing resized or repaired on
+the card. `/data` holds only what a person chose — the boot record, the
+log, credentials, playlists — so the worst a power cut can cost is a dirty
+`/data`, which the distro's own fsck repairs at the next boot.
 
 ## Build
 
@@ -70,28 +78,27 @@ card you built.
     ssh -i <key> pi@atibi.local
     cliamp --provider tidal   # first time only: visit the printed URL, enter the code
 
-Credentials land on `/data`.
-
 ## Using it
 
-    atibi stations           # what the built-in radio list offers
-    atibi station <url>      # play this one from now on, next boot too
-    atibi                    # status
+    atibi stations            # what the built-in radio list offers
+    atibi boot station <url>  # play this one from now on, next boot too
+    atibi boot now            # next boot = what is playing now, level with it
+    atibi                     # status
 
 Transport, level, playlists and what to play next boot, the jack/dac audio
 output switch, diagnostics and a factory reset all hang off this one command;
 `atibi help` is the reference.
 
-The card also serves a control page to anything on the LAN: open
-`http://atibi.local:8077/` and the page asks for the token, made once at
-first boot and kept at `/data/atibi/http.token` (owner-readable only, and
-printed once to the journal, so `atibi log` shows the full signed-in URL for
-the first phone that connects). From that page: transport, volume, shuffle and
-repeat, the queue, the radio list, and browsing, playlists and search on every
-provider the player has, Tidal included.
+Open the page on any device on the LAN: `http://atibi.local:8077/`. It
+asks for the token, made once at first boot and kept at `/data/atibi/http.token`
+(owner-readable only, and printed once to the journal, so `atibi log` shows
+the full signed-in URL for the first phone that connects). From that page:
+transport, volume, shuffle and repeat, the queue, the radio list, and browsing,
+playlists and search on every provider the player has.
 
-Whatever route a change takes — SSH or the web page — the volume floor, the
-boot ramp and the boot log always apply: boot intent goes through one command.
+Play and boot are separate verbs on both routes: `play` is what sounds
+now, `boot` is what sounds next boot, and it is the saving that carries
+over a reboot.
 
 `atibi reset --yes` wipes `/data` and puts back exactly the tree a fresh
 card ships with.

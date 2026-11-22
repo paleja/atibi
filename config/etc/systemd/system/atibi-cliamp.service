@@ -1,11 +1,7 @@
 [Unit]
 Description=cliamp headless player daemon
 Documentation=file:/data/cliamp/cliamp.log
-# network.target is up before any address exists; online.target returns once
-# the DHCP lease is in (without it, the first m3u fetch is
-# "network is unreachable").
-Wants=network-online.target
-After=network-online.target
+# A player needs no address to start; the boot waits for the route itself.
 RequiresMountsFor=/data
 
 [Service]

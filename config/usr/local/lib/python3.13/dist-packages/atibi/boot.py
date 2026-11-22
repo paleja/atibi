@@ -97,8 +97,7 @@ class Boot:
             self.log("FAIL no cliamp socket after %ss" % num(conf.socket_wait))
             return FAILED
 
-        # A stream needs name resolution. Rather than pulling in network-online
-        # target and its two-second stall, check the one thing the target needs.
+        # The route, not a unit's ordering: this is what the load call needs.
         host = net.host_of(target)
         if net.needs_network(kind, target):
             ready = (lambda: net.resolved(host)) if host else net.routed
@@ -120,9 +119,7 @@ class Boot:
                     return FAILED
 
         # The clock gates TLS, not the target's spelling: provider/album/track
-        # rows are fetched over https too. The stamp the atibi-clock unit
-        # restored usually ends this wait at once; it stays bounded for the
-        # boot that has no stamp, or no NTP.
+        # rows are fetched over https too.
         if tls:
             trustworthy = lambda: (net.clock_synced(conf.clock_flag)
                                    or clock.trusted(conf.clock_file))

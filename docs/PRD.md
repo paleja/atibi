@@ -32,9 +32,10 @@ A reproducible custom Raspberry Pi OS image containing:
 - Read-only root + a separate writable `/data` partition (§7) — safe to pull
   the plug at any moment.
 - `cliamp` in headless daemon mode, autostarted via systemd, auto-play of
-  whatever source the listener last chose at the level they last set; no
-  service credentials in the image — providers are logged in on first use
-  over SSH (§8.2).
+  the source the listener last saved at the level the player was at when
+  they saved it — nothing is captured on its own, only a person's verbs
+  write it (§8.3); no service credentials in the image, providers are
+  logged in on first use over SSH (§8.2).
 - Correct audio bring-up for the IQaudIO Pi-DAC+ HAT (§5, §6.4), with the
   3.5mm jack as a build-time alternative and a runtime switch between the two.
 - Wired Ethernet only, SSH enabled for maintenance, key-only login: no
@@ -49,12 +50,14 @@ A reproducible custom Raspberry Pi OS image containing:
 
 ## 3. Goals
 
-- Power-on → audio playing (last-played source resumed) in **≤ 10 s wall
+- Power-on → audio playing (the saved source) in **≤ 10 s wall
   clock**, measured from 5V applied, median of ≥5 cold boots.
-- On every boot the atibi auto-plays the source the listener last chose
-  (radio station, saved playlist, or streaming-service playlist) at the level
-  they last set. Position is not resumed: a live stream has none, and coming
-  up mid-playlist is a detail rather than a feature (§8.3).
+- On every boot the atibi starts by itself what the listener last saved
+  (radio station, saved playlist, or streaming-service playlist), at the
+  level remembered when they saved it. Nothing is remembered on its own:
+  only a person's verbs write the record (§8.3). Position is not resumed:
+  a live stream has none, and coming up mid-playlist is a detail rather
+  than a feature (§8.3).
 - Survive unlimited hard power-cuts with zero manual recovery.
 - Sources: internet radio (Radio Browser + custom stations), Tidal (OAuth
   device-code login), local files on a USB stick (optional).
@@ -210,7 +213,7 @@ RP-010196; gen4 has a shorter pre-Linux stage than gen5):
     move volume into the codec's own digital engine (≥32-bit, dithered) and
     leave cliamp at 0 dB — still one path, different control at its end.
 - **Boot volume floor: −30 dBFS**, applied before the stream starts, then
-  ramped in steps toward the resumed level (§8.3). The math behind the
+  ramped in steps toward the saved level (§8.3). The math behind the
   numbers lives in the comments in `atibi.conf`; the decision is: a boot
   can never produce a full-power first sample, and the cost — a quiet first
   second — is the accepted trade. The floor is not bypassable: only
@@ -222,7 +225,7 @@ RP-010196; gen4 has a shorter pre-Linux stage than gen5):
   elsewhere (bar panel or SSH wins over the boot's own climb).
 - **A saved level at or below the floor counts as a parked control, not a
   preference**: it is replaced by the configured default, in boot.log.
-  Deliberately quiet is `atibi stop`, a different thing.
+  Deliberately quiet after a reboot is `atibi boot off`, a different thing.
 - **Pi 5 note:** the DAC+ driver had a real Pi 5 bug on non-Raspberry-Pi-OS
   kernels (LP #2060240); Pi 5 stays bench-only, so this is gated behind the
   Pi 5 image decision.
@@ -315,8 +318,8 @@ gets corruptable itself mid-overlay-writeback):
 ### 8.1 Radio
 - Radio Browser directory + custom stations. Nothing baked: the box starts
   from one default station (`ATIBI_START_TARGET` in `/etc/atibi.conf`)
-  and `atibi station <url> --save` records what you actually want, on `/data`;
-  without `--save` that command only plays.
+  and `atibi boot station <url>` records what you actually want, on `/data`;
+  `atibi play station <url>` only plays.
   The built-in list is fetched, not duplicated in the image, so the two
   cannot drift.
 - `yt-dlp` is **excluded from the Pi 4 image**: slow on Cortex-A72, the
@@ -340,8 +343,8 @@ gets corruptable itself mid-overlay-writeback):
   a `client_id`/`client_secret` override as escape hatch.
 
 ### 8.3 Auto-play & resume policy (implemented)
-- Requirement: every cold boot starts what the listener last chose, at the
-  level they last set — station, saved playlist, or streaming-service
+- Requirement: every cold boot starts what the listener last saved, at the
+  level remembered then — station, saved playlist, or streaming-service
   playlist, with provider context, plus the listening level. Position
   inside a playlist or track is deliberately **not** part of it: this is a
   radio; a boot that came up three rows into a Tuesday playlist is
@@ -350,20 +353,23 @@ gets corruptable itself mid-overlay-writeback):
 - cliamp's own resume state is not enough: a headless radio start bypasses
   it, so the appliance keeps its own record on `/data` and replays it
   through IPC.
-- **Saved on change, not on a timer.** The surfaces that decide what plays next
-  boot — `atibi remember`, `--save` on `play/station/playlist/album/track`,
-  `atibi mode/stop`, the level commands `vol`/`up`/`down`, and the web page's
-  boot tab — rewrite the whole record, carrying over arguments they were not
-  given: turning the level down cannot forget the station, choosing a station
-  cannot forget the level. A play command without `--save` plays and writes
-  nothing: its target rides in `/run/atibi/play-now` (tmpfs), which the play
-  unit reads, plays and unlinks. The old periodic
-  writer (one-minute timer, position and index) is gone: it bought a detail
-  nobody asked for at the cost of a unit, a timer and a boot that resumed
-  in the middle of things.
+- **Saved on change, never on a timer.** The surfaces that decide what plays
+  next boot — `atibi boot now` and the page's "use the now playing", `atibi
+  boot station|playlist|album|track`, `atibi boot on|off`, the level commands
+  `atibi level <dB>`, `level up|down <N>` and the page's two write routes
+  (`/api/boot/now`, `/api/intent`) — rewrite the whole record, carrying over
+  fields they were not given: turning the level down cannot forget the station,
+  choosing a station cannot forget the level. Playing and saving are separate
+  verbs and neither implies the other: `atibi play <what> <target>` plays and
+  writes nothing to the card, `atibi boot <what> <target>` writes the record
+  and touches nothing that is playing. `atibi stop` stops and says nothing
+  about the next boot; `atibi boot off` is the sentence that means quiet
+  after a reboot. The old periodic writer (one-minute timer, position and index)
+  is gone: it bought a detail nobody asked for at the cost of a unit, a timer
+  and a boot that resumed in the middle of things.
 - The level is read back **from the player**, not recorded from what was
   asked for: the value cliamp settled at is the one the next boot should
-  aim at. `atibi remember` re-reads it together with the source — the
+  aim at. `atibi boot now` re-reads it together with the source — the
   Omarchy panel sets cliamp's dB over the socket, outside the appliance — and
   a level at or below the boot floor counts as parked, so the saved one
   carries on.
@@ -382,13 +388,13 @@ gets corruptable itself mid-overlay-writeback):
   target likewise waits for clock sync first (`ATIBI_SYNC_WAIT`): a
   cold-boot clock behind NTP makes every TLS handshake fail as
   "certificate is not yet valid".
-- `atibi remember <what> <target>` records intent without touching
+- `atibi boot <what> <target>` records intent without touching
   playback. The web page needs it: a tapped playlist has already started
   the music, and the plain play command on top would restart the boot
   sequence — a second start and a trip back to the volume floor — in the
   middle of a track.
 - **The player's name for what is loaded is loadable, its rows are not.**
-  The snapshot's `playlist` key is what the "use at boot" control reads, and
+  The snapshot's `playlist` key is what the "use the now playing" control reads, and
   it comes back in four shapes, verified on the card 2026-11-21: `tidal:<list
   id>` for a service playlist, `tidal:album:<album id>` for an album (a
   spelling `provider.load` itself refuses, so the word `album` is taken back
@@ -407,14 +413,15 @@ gets corruptable itself mid-overlay-writeback):
 ### 9.1 On the box (`atibi`, over SSH)
 
 One command, its own help text is the reference. Groups: transport
-(`play/pause/toggle/next/prev/stop`); level (`vol <dB>`, `up/down <N>` — all
-through cliamp's dB, all recorded for the next boot); what to play
-(`station <url>`, `playlist <name>` or `<provider>:<id>`, `album`, `track` —
-each with `--save` to make it next boot's too — `stations`, `last`, `mode
-last|stop`, `remember <what> <target>`); diagnostics (`status`, `log`,
-`boots`); maintenance (`reload`, `audio [jack|dac]`, `rw`/`ro`,
-`reset --yes`). The privileged ones re-run under sudo via a passwordless
-sudoers drop-in the build ships.
+(`resume|pause|toggle|next|prev|stop`); level (`level <dB>`, `level up|down
+<N>` — all through cliamp's dB, all recorded for the next boot, `level now`
+only reads it); what to play, in two verbs that do not overlap, `play …`
+now and `boot …` next boot, each taking `station <url>`, `playlist <name>`
+or `<provider>:<id>`, `album` or `track`, `boot` additionally `now` (what
+is playing now) and `on|off`; `stations` lists the built-in endpoints;
+diagnostics (bare `atibi`, `now`, `log`, `boots`); maintenance (`restart`,
+`reload`, `audio [jack|dac]`, `rw`/`ro`, `reset --yes`). The privileged
+ones re-run under sudo via a passwordless sudoers drop-in the build ships.
 
 ### 9.2 From the desktop
 
@@ -468,11 +475,12 @@ policy instead of a dumb strip (§12).
    `systemd-analyze` + firmware timestamps as evidence). There is no setup
    boot: the first time this box is powered on is a runtime boot like every
    other one.
-2. 20 consecutive hard power-cuts: the 21st boot succeeds, **auto-plays the
-   source that was playing before the first cut**, at the level it was at,
-   credentials intact. A missing or unusable saved level falls back to the
-   configured default — never silence — and `atibi boots` says which
-   happened.
+2. 20 consecutive hard power-cuts: the 21st boot succeeds, **plays the
+   source saved before the first cut** at the level saved with it — the
+   sequence saves with `atibi boot now` before cut 1, since nothing is
+   captured on its own — credentials intact. A missing or unusable saved
+   level falls back to the configured default — never silence — and
+   `atibi boots` says which happened.
 3. `atibi toggle` over SSH works from the desktop with no interactive
    prompts, and the bar panel drives the Pi instance.
 4. Bar panel controls the Pi instance (search + transport + volume).
@@ -550,7 +558,8 @@ A green result means different things at different tiers:
   confirm the HAT in the device tree and `aplay -l`, check the case fit.
 - **M3 — Boot tuning (Pi 4)**: §6 applied one unit at a time, 5 cold boots
   per config, median ≤10s; decide SD vs SSD on that number (§12.1).
-- **M4 — Appliance hardening**: power-cut torture test incl. resume-last,
+- **M4 — Appliance hardening**: power-cut torture test incl. the saved
+  source and level,
   `atibi reset --yes` on hardware, the `config.txt` recovery path, the
   first-boot provider login flow.
 - **M5 — Control**: bar panel wired up; stretch: `yt-dlp` on `/data`

@@ -92,8 +92,12 @@ listener last chose, at the level they last set.
   and the filesystem UUID are shared by the stock image and leak into DHCP,
   mDNS and the first SSH session, so the build regenerates all three.
 - **DNS follows the lease:** the base image bakes `/etc/resolv.conf`, the build
-  points it at  `/run/NetworkManager/resolv.conf` with `rc-manager=symlink`, 
-  and `atibi-cliamp` orders after `network-online.target`.
+  points it at `/run/NetworkManager/resolv.conf` with `rc-manager=symlink`, and
+  the boot waits for a route in `atibi.net`: no payload unit orders on
+  `network-online.target`. On the card's LAN the lease is the floor — NM up
+  +6.5 s, wired auto-activation +10.6 s, DHCP lease and routing +17.1 s
+  (measured 2026-11-22) — so `ATIBI_NET_WAIT` has to exceed it, and the 10 s
+  budget is unreachable for a target that needs a route on that LAN.
 - `/data/bin` is first on the daemon's `PATH`, so a newer ffmpeg or cliamp can
   be dropped on the writable partition with the image copy as fallback.
   `atibi reset --yes` restores `/data` from `/usr/share/atibi/seed`, the
