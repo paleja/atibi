@@ -17,35 +17,6 @@ def num(value):
     return "%g" % value
 
 
-def save(path, text, user="", group=""):
-    """Write text to path whole, or not at all, and reach the platter.
-
-    The rename is what a cut leaves intact: the old file or the new one, never
-    a half-written belief. The directory's own fsync is what makes the name
-    survive the cut, so a change a person made cannot be lost because the
-    inode arrived and the entry did not.
-    """
-    directory = os.path.dirname(path)
-    try:
-        os.makedirs(directory, exist_ok=True)
-        tmp = "%s.tmp" % path
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, path)
-        dirfd = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(dirfd)
-        finally:
-            os.close(dirfd)
-    except OSError:
-        return False
-    own(path, user, group)
-    return True
-
-
 def own(path, user, group):
     """Hand a file back to the appliance account.
 
