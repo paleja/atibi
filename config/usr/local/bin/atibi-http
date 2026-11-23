@@ -928,7 +928,15 @@ button:active{background:#2e3c50}
 /* Grey is what cannot be acted on now - the radio tab when the provider has no similar
    songs, or an action with no list yet. Green, below, is what is on. */
 button[disabled]{opacity:.45;cursor:default}
-button.big{font-size:26px;flex:1;padding:16px}
+/* Transport buttons are all the same box, and every icon inside them the same
+   size: the control is the icon, not the button, so a row of five reads as one
+   row. Icons are inline SVG with fill:currentColor, so they are white like the
+   text and green when the mode is on - never the coloured emoji a browser
+   draws for U+1F500 and friends. */
+button.big{flex:1;min-width:0;aspect-ratio:1;display:flex;align-items:center;
+justify-content:center;padding:10px}
+button.big svg{width:26px;height:26px;fill:currentColor}
+button.big svg g.s{fill:none;stroke:currentColor;stroke-linecap:round;stroke-linejoin:round}
 input[type=range]{flex:1;accent-color:var(--acc)}
 .tabs{display:flex;gap:8px;margin-bottom:12px}
 .tabs button{flex:1}
@@ -963,11 +971,11 @@ a{color:var(--acc)}
  <div class="sub" id="s"></div>
  <div class="bar"><i id="p" style="width:0"></i></div>
  <div class="row">
-  <button class="big" onclick="op('prev')">⏮</button>
-  <button class="big" id="pp" onclick="op('toggle')">⏯</button>
-  <button class="big" onclick="op('next')">⏭</button>
-  <button class="big" id="shuffle" onclick="op('shuffle')">🔀</button>
-  <button class="big" id="repeat" onclick="op('repeat')">🔁</button>
+  <button class="big" onclick="op('prev')"><svg viewBox="0 0 24 24"><path d="M5 5h2.6v14H5zM20 5v14l-10.6-7z"/></svg></button>
+  <button class="big" id="pp" onclick="op('toggle')"><svg viewBox="0 0 24 24"><path id="ppi" d="M7 5h3.4v14H7zM13.6 5H17v14h-3.4z"/></svg></button>
+  <button class="big" onclick="op('next')"><svg viewBox="0 0 24 24"><path d="M16.4 5H19v14h-2.6zM4 5l10.6 7L4 19z"/></svg></button>
+  <button class="big" id="shuffle" onclick="op('shuffle')"><svg viewBox="0 0 24 24"><g class="s" stroke-width="2"><path d="M3 7h3.6L18 17.4h3"/><path d="M3 17h3.6L18 6.6h3"/><path d="M18.4 3.4 21.6 6.6 18.4 9.8M18.4 14.2 21.6 17.4 18.4 20.6"/></g></svg></button>
+  <button class="big" id="repeat" onclick="op('repeat')"><svg viewBox="0 0 24 24"><g class="s" stroke-width="2"><path d="M6 9V7.6Q6 6 7.6 6H18"/><path d="M18 15v1.4Q18 18 16.4 18H6"/><path d="M15.4 3.4 18.6 6 15.4 8.6M8.6 15.4 5.4 18 8.6 20.6"/></g></svg></button>
  </div>
  <div class="row" style="margin-top:10px">
   <span class="dim">vol</span>
@@ -1086,7 +1094,10 @@ function render(s){
   const lname=s.playlist_name||s.playlist;
   $('t').textContent=t.title||'nothing playing';
   $('s').textContent=[t.artist,t.station&&('· '+t.station),lname&&('· '+lname)].filter(Boolean).join(' ');
-  playing=s.state==='playing';$('pp').textContent=playing?'⏸':'▶';
+  // The play/pause icon is the one path that changes: both shapes live in the same
+  // 24-unit box, so the swap cannot move or resize the icon.
+  playing=s.state==='playing';
+  $('ppi').setAttribute('d',playing?'M7 5h3.4v14H7zM13.6 5H17v14h-3.4z':'M7 5l11 7-11 7z');
   // The mode icons carry their own state in the page's one green. The player answers
   // shuffle as a flag and repeat as Off/all/one, which one button cycles, so any repeat
   // at all lights the icon and which of all or one it is stays on the player rather
