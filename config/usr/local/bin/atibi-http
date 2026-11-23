@@ -22,7 +22,10 @@ Design rules this file keeps to, and why:
   With a token in hand the root URL redirects to the app with it in the URL,
   because typing a 32-character secret on a phone is not a plan; from there
   the page keeps it in localStorage and sends it as an X-Token header, which
-  a cross-site form cannot set - that is also the CSRF defence.
+  a cross-site form cannot set - that is also the CSRF defence. Once a token
+  is accepted the page drops it from its own address, and the shell is served
+  with no token at all: that is what lets a saved shortcut or a home-screen
+  icon reopen the page on the token the browser already remembers.
 - Python 3 stdlib only: the card has python3 because RasPiOS Lite ships it,
   and nothing here may assume a package install on a read-only root.
 
@@ -540,9 +543,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path, query = parsed.path, urllib.parse.parse_qs(parsed.query)
-        if path == "/":
+        if path in ("/", "/app", "/app/"):
             token = query.get("token", [""])[0]
-            if token and CFG.check_token(token):
+            if path == "/" and token and CFG.check_token(token):
                 # A 302 with no body: Location goes out before _send ends the
                 # headers, because end_headers must run exactly once.
                 self.send_response(302)
@@ -577,9 +580,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json_out({"ok": False, "error": str(exc)}, 502)
 
     def _route_get(self, path, query):
-        if path in ("/app", "/app/"):
-            self._send(200, PAGE, "text/html; charset=utf-8")
-            return
+        # No page route here: do_GET serves the shell before the token guard,
+        # so everything below this line is API.
         if path == "/api/status":
             snap = ipc("state.get").get("snapshot", {})
             keep = ("state", "track", "logical_track", "position", "duration",
@@ -1032,6 +1034,9 @@ function setToken(t){
   TOKEN=t||'';
   if(TOKEN)localStorage.setItem('atibi-token',TOKEN);
   else localStorage.removeItem('atibi-token');
+  if(TOKEN&&new URLSearchParams(location.search).get('token'))
+    // A scanned token gets in through the URL; it has no business staying there.
+    history.replaceState(null,'',location.pathname);
 }
 async function tokenOk(t){
   // The cheapest question the card answers with the token: its own status.
